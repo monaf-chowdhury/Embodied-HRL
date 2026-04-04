@@ -9,6 +9,7 @@ Pipeline: image (224x224x3) -> R3M_frozen (2048-d) -> projection_head (64-d)
 import torch
 import torch.nn as nn
 import torchvision.transforms as T
+import torch.nn.functional as F
 import numpy as np
 from config import EncoderConfig
 
@@ -101,34 +102,29 @@ class VisualEncoder(nn.Module):
     
     def encode_raw(self, images: torch.Tensor) -> torch.Tensor:
         """
-        Get raw backbone features (before projection).
         images: (B, 3, H, W) float tensor in [0, 1]
         Returns: (B, raw_dim) tensor
         """
-        # Preprocess
-        x = self.preprocess(images)
-        
-        # Forward through frozen backbone
         with torch.no_grad():
             if self.config.name == "r3m":
-                # R3M expects (B, 3, 224, 224) tensors normalized to [0,1]*255
-                # Actually, R3M's load_r3m returns a model that expects [0,255] input
-                # Check R3M docs — their forward expects unnormalized images * 255
-                # We undo our normalization and pass raw:
-                # Actually, R3M's internal preprocessing handles this.
-                # The safest approach: pass the preprocessed tensor.
-                features = self.backbone(x * 255.0)  # R3M expects [0, 255]
+                # R3M handles its own normalization internally.
+                # It expects pixel values in [0, 255].
+                x = F.interpolate(images, size=(self.config.img_size, self.config.img_size),
+                                mode='bilinear', align_corners=False)
+                x = x * 255.0  # [0,1] -> [0,255], no further normalization
+                features = self.backbone(x)
                 if isinstance(features, dict):
                     features = features['embedding']
                 if isinstance(features, tuple):
                     features = features[0]
             elif self.config.name == "dinov2":
+                x = self.preprocess(images)  # ImageNet normalization for DINOv2
                 features = self.backbone(x)
             else:
+                x = self.preprocess(images)
                 features = self.backbone(x)
-        
         return features.detach()
-    
+
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         """
         Full pipeline: image -> frozen backbone -> projection head -> z
