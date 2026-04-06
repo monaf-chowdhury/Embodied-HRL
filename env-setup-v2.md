@@ -7,7 +7,7 @@
 - OS: Ubuntu 24.04 LTS
 - NVIDIA Driver: 580.x, CUDA 13.0 (max supported)
 
-**Note:** All `torch` installs use CUDA 12.1 binaries (`cu121`). These run fine on any driver that supports CUDA 12.x or higher. Do NOT try to install CUDA 13.x torch builds — they don't exist in stable form.
+**Note:** All `torch` installs use CUDA 12.1 binaries (`cu121`). These run fine on any driver that supports CUDA 12.x or higher.
 
 ---
 
@@ -47,10 +47,9 @@ python -c "import torch; print(torch.__version__); print(torch.cuda.is_available
 
 ## Step 4: Set MuJoCo rendering backend permanently
 
-On Ubuntu 24.04, `libgl1-mesa-glx` is no longer available. Use EGL instead (works with NVIDIA GPUs).
+On Ubuntu 24.04, `libgl1-mesa-glx` no longer exists. Use EGL instead (works with NVIDIA GPUs). Do not include `libgl1-mesa-glx` in the apt command — it will cause an error.
 
 ```bash
-# Install available GL libraries (skip libgl1-mesa-glx — it doesn't exist on Ubuntu 24)
 sudo apt-get install -y \
     libgl1-mesa-dev \
     libglew-dev \
@@ -67,7 +66,7 @@ export MUJOCO_GL=egl
 export PYOPENGL_PLATFORM=egl
 EOF
 
-# Reload the env so vars take effect
+# Reload env so vars take effect
 conda deactivate
 conda activate hrl
 echo $MUJOCO_GL
@@ -76,9 +75,9 @@ echo $MUJOCO_GL
 
 ---
 
-## Step 5: Install MuJoCo and core dependencies
+## Step 5: Install core Python dependencies
 
-**Critical:** Install `mujoco==2.3.7`. The D4RL kitchen XML uses MuJoCo 2.x syntax that MuJoCo 3.x rejects with `ValueError: XML Error: top-level default class 'main' cannot be renamed`.
+**Critical:** Pin `mujoco==2.3.7`. The D4RL kitchen XML uses MuJoCo 2.x syntax that MuJoCo 3.x rejects with `ValueError: XML Error: top-level default class 'main' cannot be renamed`.
 
 ```bash
 pip install mujoco==2.3.7
@@ -90,25 +89,42 @@ pip install gym==0.26.2
 
 ---
 
-## Step 6: Install D4RL (kitchen only, no mujoco_py)
+## Step 6: Install D4RL (kitchen only, without mujoco_py)
 
-The standard D4RL install pulls in `mujoco_py` (requires MuJoCo 2.1 binary) and downgrades gym. Avoid this by installing with `--no-deps` and patching the `__init__.py`.
+This is the most complex step. The standard D4RL install pulls in `mujoco_py` (requires a MuJoCo 2.1 binary installation) and downgrades gym. We avoid this by installing D4RL with `--no-deps`, then manually installing all the deps it actually needs.
 
+**6a. Install all dm_control dependencies explicitly first:**
 ```bash
-# Install D4RL without letting it clobber your packages
-pip install git+https://github.com/Farama-Foundation/D4RL@master#egg=d4rl --no-deps
-
-# Install only the deps we actually need (NOT mujoco_py)
-pip install dm_control==1.0.3 pybullet termcolor click dm_env dm-tree --no-deps
-pip install mujoco==2.3.7
-
-# dm_control 1.0.3 needs mujoco>=3.1.4 as its own dep, but we need 2.3.7
-# So install dm_control's actual runtime deps manually and keep mujoco pinned:
-pip install dm_control==1.0.3 --no-deps
-pip install mujoco==2.3.7  # re-pin after dm_control tries to upgrade it
+pip install \
+    tqdm==4.67.3 \
+    lxml==6.0.2 \
+    protobuf==7.34.1 \
+    pyparsing==3.3.2 \
+    requests==2.33.1 \
+    labmaze==1.0.6 \
+    dm_env==1.6 \
+    dm-tree==0.1.10 \
+    pybullet==3.2.7 \
+    termcolor==3.3.0 \
+    click==8.3.2
 ```
 
-Now patch D4RL's `__init__.py` to only load the kitchen env (removes all the broken locomotion/bullet/flow imports):
+**6b. Install dm_control 1.0.3 without deps (to avoid mujoco 3.x being pulled in):**
+```bash
+pip install dm_control==1.0.3 --no-deps
+```
+
+**6c. Re-pin mujoco to 2.3.7 (dm_control may have upgraded it):**
+```bash
+pip install mujoco==2.3.7
+```
+
+**6d. Install D4RL without deps:**
+```bash
+pip install git+https://github.com/Farama-Foundation/D4RL@master#egg=d4rl --no-deps
+```
+
+**6e. Patch D4RL's `__init__.py`** to only load the kitchen env (removes all broken locomotion/bullet/flow imports that require mujoco_py):
 
 ```bash
 python - << 'EOF'
@@ -128,7 +144,7 @@ print("Patched successfully.")
 EOF
 ```
 
-Verify kitchen works:
+**6f. Verify kitchen works:**
 ```bash
 python -c "
 import gym, d4rl
@@ -151,7 +167,7 @@ All the gym deprecation warnings are harmless. Only worry if you see a traceback
 pip install git+https://github.com/facebookresearch/r3m.git
 ```
 
-Pre-download the R3M weights now (do this before training — weights download from Google Drive on first call, ~100MB, goes to `~/.r3m/`):
+Pre-download the R3M weights now (weights download from Google Drive on first call, ~100MB, saved to `~/.r3m/`):
 
 ```bash
 python -c "from r3m import load_r3m; model = load_r3m('resnet50'); print('R3M weights ready.')"
@@ -166,7 +182,6 @@ pip install \
     opencv-python==4.10.0.84 \
     matplotlib==3.9.2 \
     tensorboard==2.17.1 \
-    tqdm==4.66.5 \
     scikit-learn==1.5.1
 ```
 
@@ -174,7 +189,7 @@ pip install \
 
 ## Step 9: Full sanity check
 
-Run this entire block. Every line must succeed before starting training.
+Run this entire block. Every section must succeed before starting training.
 
 ```bash
 python -c "
@@ -279,7 +294,7 @@ Phase 2: Hierarchical training loop...
 Monitor training in a separate terminal:
 ```bash
 tensorboard --logdir logs/ --port 6006
-# Then open http://localhost:6006
+# Open http://localhost:6006 in browser
 ```
 
 Monitor GPU usage:
@@ -291,19 +306,17 @@ watch -n 2 nvidia-smi
 
 ## Running multiple seeds / ablations
 
-Each run is single-GPU. Use `CUDA_VISIBLE_DEVICES` to assign runs to GPUs:
+Each run is single-GPU. Use `CUDA_VISIBLE_DEVICES` to assign:
 
 ```bash
-# Seed 1
-CUDA_VISIBLE_DEVICES=0 python train.py --seed 42 --log_dir logs/seed42/ &
-
-# Seed 2 (only if you have a second GPU)
+CUDA_VISIBLE_DEVICES=0 python train.py --seed 42  --log_dir logs/seed42/  &
 CUDA_VISIBLE_DEVICES=1 python train.py --seed 123 --log_dir logs/seed123/ &
+CUDA_VISIBLE_DEVICES=2 python train.py --seed 456 --log_dir logs/seed456/ &
 ```
 
 ---
 
-## Known warnings (all harmless, ignore them)
+## Known warnings (all harmless)
 
 | Warning | Why it appears | Action |
 |---|---|---|
@@ -318,22 +331,25 @@ CUDA_VISIBLE_DEVICES=1 python train.py --seed 123 --log_dir logs/seed123/ &
 ## Troubleshooting
 
 **`ValueError: XML Error: top-level default class 'main' cannot be renamed`**
-MuJoCo version is 3.x. Force reinstall: `pip install mujoco==2.3.7`
+MuJoCo version got upgraded to 3.x. Force reinstall: `pip install mujoco==2.3.7`
 
 **`ValueError: not enough values to unpack (expected 5, got 4)`**
-gym's `TimeLimit` wrapper is intercepting the step call. The `env_wrapper.py` in the repo uses `_env.unwrapped` to bypass this. Make sure you have the latest code from the repo.
+gym's `TimeLimit` wrapper is intercepting the step call. The `env_wrapper.py` in the repo uses `_env.unwrapped` to bypass this. Make sure you have the latest code: `git pull`
 
 **`gym.error.NameNotFound: Environment kitchen-complete doesn't exist`**
-`d4rl` was not imported before `gym.make`. Make sure `import d4rl` appears in `train.py` before any `gym.make` call.
+`d4rl` was not imported before `gym.make`. Make sure `import d4rl` appears in `train.py`.
 
 **`No module named 'mujoco_py'`**
-D4RL's `__init__.py` was not patched. Re-run the patch command from Step 6.
+D4RL's `__init__.py` was not patched. Re-run the patch command from Step 6e.
+
+**`ModuleNotFoundError: No module named 'tqdm'` (or lxml, protobuf, dm_env, etc.)**
+Some dm_control dependencies are missing. Re-run the full install block from Step 6a — it is safe to re-run.
 
 **`AttributeError: 'list' object has no attribute 'shape'` in rendering**
-Old `env_wrapper.py`. Pull latest from repo — the `_render_image` method uses `self._env.sim.render()` directly.
-
-**R3M weights download fails**
-Weights download from Google Drive to `~/.r3m/`. If behind a firewall, download manually from the R3M GitHub repo and place at `~/.r3m/r3m_50/model.pt`.
+Old `env_wrapper.py`. Pull latest: `git pull`
 
 **`libgl1-mesa-glx` not found on Ubuntu 24**
-This package was removed in Ubuntu 24. It is not needed — EGL rendering works without it. The apt commands in Step 4 already skip it.
+This package was removed in Ubuntu 24. It is not needed — skip it. The apt commands in Step 4 already exclude it.
+
+**R3M weights download fails**
+Weights download from Google Drive to `~/.r3m/`. If behind a firewall, download manually from the R3M GitHub and place at `~/.r3m/r3m_50/model.pt`.

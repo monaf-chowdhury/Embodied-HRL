@@ -94,7 +94,7 @@ class BufferConfig:
 
 @dataclass
 class TrainingConfig:
-    total_timesteps: int = 2_000_000
+    total_timesteps: int = 1_000_000
     # How often to do things
     manager_update_freq: int = 1  # Update manager every N high-level steps
     worker_updates_per_step: int = 1  # Gradient steps per env step
