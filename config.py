@@ -3,7 +3,7 @@ Configuration for Visual HRL on Franka Kitchen.
 All hyperparameters in one place for easy tuning.
 """
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, List
 
 
 @dataclass
@@ -106,6 +106,10 @@ class TrainingConfig:
     seed: int = 42
     device: str = "cuda"  # "cuda" or "cpu"
 
+    # Tasks to complete — configurable for curriculum / ablations
+    tasks_to_complete: List[str] = field(default_factory=lambda: [
+        'microwave', 'kettle', 'light switch', 'slide cabinet'
+    ])
 
 @dataclass
 class Config:
