@@ -1,8 +1,18 @@
 """
 Main Training Loop: Visual HRL for FrankaKitchen-v1.
 
-Run: python train.py [--seed 42] [--device cuda]
+Run: python train.py [--seed 42] [--device cuda] [--tasks microwave]
+
+Key changes vs original:
+  - z_goal / goal image REMOVED everywhere.
+  - Warmup and Phase 2 both pass proprio to the worker and buffer.
+  - Demo landmark seeding after Phase 1 warmup.
+  - Hindsight injection on every task-completion event.
+  - Landmark update passes z_goal=None (no goal image).
+  - Episode video recording at every checkpoint save.
+  - evaluate() updated: no z_goal, passes proprio.
 """
+
 import os
 import sys
 import time
@@ -16,11 +26,11 @@ from tqdm import tqdm
 from config import Config
 from env_wrapper import FrankaKitchenImageWrapper, HierarchicalKitchenWrapper
 from agent import VisualHRLAgent
-from utils import get_goal_image_and_encoding, save_goal_image
+from utils import save_image, save_video
 
 
 # =============================================================================
-# Logger: tees stdout to file + terminal simultaneously
+# Logger
 # =============================================================================
 
 class Logger:
@@ -47,7 +57,7 @@ class Logger:
 
 
 # =============================================================================
-# Checkpoint scheduler: exactly 10 evenly-spaced saves
+# Checkpoint scheduler
 # =============================================================================
 
 class CheckpointScheduler:
@@ -71,10 +81,67 @@ class CheckpointScheduler:
 
 
 # =============================================================================
+# Video recording
+# =============================================================================
+
+def record_episode_videos(agent, config, label: str, n_episodes: int = 3):
+    """
+    Run n_episodes deterministically and save each as an MP4 in
+    logs/videos/<label>/.
+    """
+    if not config.training.record_video:
+        return
+
+    video_dir = os.path.join(config.training.log_dir, 'videos', label)
+    os.makedirs(video_dir, exist_ok=True)
+
+    record_env = FrankaKitchenImageWrapper(
+        tasks_to_complete=config.training.tasks_to_complete,
+        img_size=config.encoder.img_size,
+    )
+
+    for ep_i in range(n_episodes):
+        frames    = []
+        obs_img   = record_env.reset()
+        z_current = agent.encoder.encode_numpy(obs_img).squeeze()
+        proprio   = record_env.get_state()
+        frames.append(obs_img)
+        done       = False
+        high_steps = 0
+
+        while not done and high_steps < 15:
+            if not agent.landmarks.is_ready:
+                break
+            landmark_idx = agent.select_subgoal(z_current)
+            z_subgoal    = agent.landmarks.get(landmark_idx)
+
+            for _ in range(config.manager.subgoal_horizon):
+                action   = agent.get_worker_action(
+                    z_current, z_subgoal, proprio, deterministic=True)
+                next_img, _, done, info = record_env.step(action)
+                proprio  = info['state']
+                frames.append(next_img)
+                z_next   = agent.encoder.encode_numpy(next_img).squeeze()
+                z_current = z_next
+                if done:
+                    break
+                if np.linalg.norm(z_current - z_subgoal) < agent.success_threshold:
+                    break
+
+            high_steps += 1
+
+        video_path = os.path.join(video_dir, f'ep_{ep_i:03d}.mp4')
+        save_video(frames, video_path, fps=15)
+
+    record_env.close()
+    print(f"  [Video] {n_episodes} episodes saved to {video_dir}/")
+
+
+# =============================================================================
 # Evaluation
 # =============================================================================
 
-def evaluate(agent, config, z_goal, n_episodes=None):
+def evaluate(agent, config, n_episodes=None):
     """Evaluate agent deterministically. Returns dict of metrics."""
     n_episodes = n_episodes or config.training.n_eval_episodes
 
@@ -88,6 +155,7 @@ def evaluate(agent, config, z_goal, n_episodes=None):
     for _ in range(n_episodes):
         obs_img   = eval_env.reset()
         z_current = agent.encoder.encode_numpy(obs_img).squeeze()
+        proprio   = eval_env.get_state()
         ep_reward = 0.0
         done      = False
         high_steps = 0
@@ -97,47 +165,43 @@ def evaluate(agent, config, z_goal, n_episodes=None):
             if not agent.landmarks.is_ready:
                 break
             with torch.no_grad():
-                z_c = torch.from_numpy(z_current).float().unsqueeze(0).to(agent.device)
-                z_g = torch.from_numpy(z_goal).float().unsqueeze(0).to(agent.device)
-                lm  = torch.from_numpy(agent.landmarks.get_all()).float().to(agent.device)
-                q_vals = agent.manager_q.evaluate_all_landmarks(z_c, z_g, lm)
-                landmark_idx = q_vals.argmax(dim=1).item()
+                landmark_idx = agent.select_subgoal(z_current)
             z_subgoal = agent.landmarks.get(landmark_idx)
 
-            subgoal_reached = False
             for _ in range(config.manager.subgoal_horizon):
-                action = agent.get_worker_action(z_current, z_subgoal, deterministic=True)
+                action   = agent.get_worker_action(
+                    z_current, z_subgoal, proprio, deterministic=True)
                 next_img, reward, done, info = eval_env.step(action)
-                z_next = agent.encoder.encode_numpy(next_img).squeeze()
+                proprio  = info['state']
+                z_next   = agent.encoder.encode_numpy(next_img).squeeze()
                 ep_reward += reward
                 z_current  = z_next
                 max_tasks_completed = max(
                     max_tasks_completed, info.get('n_tasks_completed', 0))
 
                 if np.linalg.norm(z_current - z_subgoal) < agent.success_threshold:
-                    subgoal_reached = True
                     break
                 if done:
                     break
 
             high_steps += 1
-            if not subgoal_reached:
-                break  # Strict execution
+            # Strict execution: if subgoal not reached, stop
+            if np.linalg.norm(z_current - z_subgoal) >= agent.success_threshold:
+                break
 
         rewards.append(ep_reward)
         high_steps_list.append(high_steps)
         tasks_completed_list.append(max_tasks_completed)
-        # Success = at least 1 subtask completed (reward > 0)
         successes.append(ep_reward > 0)
 
     eval_env.close()
     return {
-        'success_rate':       float(np.mean(successes)),
-        'mean_reward':        float(np.mean(rewards)),
-        'std_reward':         float(np.std(rewards)),
-        'mean_high_steps':    float(np.mean(high_steps_list)),
+        'success_rate':         float(np.mean(successes)),
+        'mean_reward':          float(np.mean(rewards)),
+        'std_reward':           float(np.std(rewards)),
+        'mean_high_steps':      float(np.mean(high_steps_list)),
         'mean_tasks_completed': float(np.mean(tasks_completed_list)),
-        'n_episodes':         n_episodes,
+        'n_episodes':           n_episodes,
     }
 
 
@@ -148,17 +212,21 @@ def evaluate(agent, config, z_goal, n_episodes=None):
 def save_checkpoint(agent, config, name: str):
     path = os.path.join(config.training.log_dir, f'checkpoint_{name}.pt')
     torch.save({
-        'encoder_projection':  agent.encoder.projection.state_dict(),
-        'manager_q':           agent.manager_q.state_dict(),
-        'manager_q_target':    agent.manager_q_target.state_dict(),
-        'worker_actor':        agent.worker_actor.state_dict(),
-        'worker_critic':       agent.worker_critic.state_dict(),
+        'encoder_projection':   agent.encoder.projection.state_dict(),
+        'manager_q':            agent.manager_q.state_dict(),
+        'manager_q_target':     agent.manager_q_target.state_dict(),
+        'worker_actor':         agent.worker_actor.state_dict(),
+        'worker_critic':        agent.worker_critic.state_dict(),
         'worker_critic_target': agent.worker_critic_target.state_dict(),
-        'reachability':        agent.reachability.state_dict(),
-        'total_steps':         agent.total_steps,
-        'total_episodes':      agent.total_episodes,
-        'success_threshold':   agent.success_threshold,
-        'epsilon':             agent.epsilon,
+        'reachability':         agent.reachability.state_dict(),
+        'total_steps':          agent.total_steps,
+        'total_episodes':       agent.total_episodes,
+        'success_threshold':    agent.success_threshold,
+        'epsilon':              agent.epsilon,
+        # Save proprio running stats for reproducibility
+        'proprio_mean':         agent.low_buffer._p_mean,
+        'proprio_m2':           agent.low_buffer._p_M2,
+        'proprio_n':            agent.low_buffer._p_n,
     }, path)
     print(f"  [Checkpoint] Saved: {os.path.basename(path)}")
 
@@ -177,8 +245,8 @@ def train(config: Config):
         torch.cuda.manual_seed(config.training.seed)
 
     os.makedirs(config.training.log_dir, exist_ok=True)
-    writer      = SummaryWriter(config.training.log_dir)
-    ckpt_sched  = CheckpointScheduler(config.training.total_timesteps, n_checkpoints=10)
+    writer     = SummaryWriter(config.training.log_dir)
+    ckpt_sched = CheckpointScheduler(config.training.total_timesteps, n_checkpoints=10)
 
     # ---- Environment ----
     env = FrankaKitchenImageWrapper(
@@ -187,7 +255,6 @@ def train(config: Config):
         seed=config.training.seed,
         terminate_on_tasks_completed=False,
     )
-    hier_env = HierarchicalKitchenWrapper(env, subgoal_horizon=config.manager.subgoal_horizon)
 
     # ---- Agent ----
     agent = VisualHRLAgent(config)
@@ -207,54 +274,101 @@ def train(config: Config):
     print(f"  Encoder:       {config.encoder.name} (proj_dim={config.encoder.proj_dim})")
     print(f"  Tasks:         {config.training.tasks_to_complete}")
     print(f"  Landmarks:     {config.landmarks.n_landmarks}")
+    print(f"    use_demo:     {config.landmarks.use_demo_landmarks}")
+    print(f"    use_hindsight:{config.landmarks.use_hindsight_landmarks}")
+    print(f"    use_curriculum:{config.landmarks.use_curriculum_landmarks}")
     print(f"  Subgoal K:     {config.manager.subgoal_horizon}")
+    print(f"  Reward weights: sparse={config.reward.sparse_weight}  "
+          f"task_prog={config.reward.task_progress_weight}  "
+          f"latent={config.reward.latent_weight}")
     print(f"  Total steps:   {config.training.total_timesteps:,}")
-    print(f"  Checkpoints:   10 periodic + best")
+    print(f"  Record video:  {config.training.record_video}")
     print(f"  Log dir:       {config.training.log_dir}")
     print(sep)
 
     # =========================================================================
-    # Phase 1: Random exploration
+    # Phase 1: Random exploration with K-step future subgoals
     # =========================================================================
-    print("\n[Phase 1] Random exploration for initial data...")
+    print("\n[Phase 1] Random exploration with K-step future subgoals...")
     p1_start = time.time()
+    K_future = config.training.warmup_future_k
 
     n_warmup = 50
     for ep_i in range(n_warmup):
-        obs_img = hier_env.reset()
-        done    = False
+
+        obs_img    = env.reset()
+        ep_imgs    = [obs_img]
+        ep_proprios = [env.get_state()]
+        ep_actions = []
+        ep_rewards = []
+        ep_dones   = []
+        ep_n_tasks = []
+        done = False
         while not done:
-            action               = env.action_space.sample()
+            action = env.action_space.sample()
             next_img, reward, done, info = env.step(action)
-            z_t    = agent.encoder.encode_numpy(obs_img).squeeze()
-            z_next = agent.encoder.encode_numpy(next_img).squeeze()
-            z_sub  = z_next
-            shaped = agent.compute_shaped_reward(z_t, z_next, z_sub, reward)
-            agent.low_buffer.add(z_t, z_sub, action, shaped, z_next, done)
+            ep_imgs.append(next_img)
+            ep_proprios.append(info['state'])
+            ep_actions.append(action)
+            ep_rewards.append(reward)
+            ep_dones.append(done)
+            ep_n_tasks.append(info.get('n_tasks_completed', 0))
+
+        T = len(ep_actions)
+
+        # Encode all frames at once
+        all_z = np.stack([
+            agent.encoder.encode_numpy(img).squeeze()
+            for img in ep_imgs
+        ])  # (T+1, z_dim)
+
+        # Store transitions with K-step future subgoal
+        for t in range(T):
+            z_t       = all_z[t]
+            z_next    = all_z[t + 1]
+            proprio_t = ep_proprios[t]
+            proprio_n = ep_proprios[t + 1]
+            future_idx = min(t + K_future, T)
+            z_sub     = all_z[future_idx]
+            # Initial dist for normalised shaping
+            init_dist  = np.linalg.norm(z_t - z_sub)
+
+            shaped = agent.compute_shaped_reward(
+                z_t, z_next, z_sub, ep_rewards[t],
+                proprio_t, proprio_n, initial_dist=init_dist,
+            )
+            agent.low_buffer.add(z_t, proprio_t, z_sub, ep_actions[t],
+                                  shaped, z_next, proprio_n, ep_dones[t])
             agent._latent_dists.append(np.linalg.norm(z_next - z_t))
-            obs_img = next_img
+
+            # Hindsight injection during warmup too
+            if ep_n_tasks[t] > (ep_n_tasks[t - 1] if t > 0 else 0):
+                agent.landmarks.add_success_state(z_next)
 
         if (ep_i + 1) % 10 == 0:
-            print(f"  Warmup {ep_i+1}/{n_warmup} | buffer: {len(agent.low_buffer):,}")
+            print(f"  Warmup {ep_i+1}/{n_warmup} | buffer: {len(agent.low_buffer):,} "
+                  f"| last ep len: {T} steps")
 
     print(f"  Phase 1 done in {(time.time()-p1_start)/60:.1f} min")
-    print(f"  Collected {len(agent.low_buffer):,} transitions")
+    print(f"  Collected {len(agent.low_buffer):,} transitions (K_future={K_future})")
 
+    # ---- Initial landmark computation ----
     all_z = agent.low_buffer.get_all_z()
-    agent.landmarks.update(all_z)
+    agent.landmarks.update(all_z, z_goal=None)
     print(f"  Computed {agent.landmarks.n_active} landmarks via FPS")
 
-    agent.calibrate_success_threshold()
+    # ---- Demo landmark seeding ----
+    if config.landmarks.use_demo_landmarks:
+        agent.landmarks.seed_from_demo(
+            agent.encoder,
+            gif_path=config.landmarks.demo_gif_path,
+            max_frames=config.landmarks.demo_max_frames,
+        )
+        # Recompute landmarks now that demo latents are loaded
+        agent.landmarks.update(all_z, z_goal=None)
+        print(f"  Re-computed {agent.landmarks.n_active} landmarks (demo + replay)")
 
-    # ---- Goal encoding ----
-    print("\nRendering goal state image...")
-    z_goal, goal_img = get_goal_image_and_encoding(
-        agent.encoder,
-        tasks=config.training.tasks_to_complete,
-        img_size=config.encoder.img_size,
-        device=config.training.device,
-    )
-    save_goal_image(goal_img, os.path.join(config.training.log_dir, 'goal_image.png'))
+    agent.calibrate_success_threshold()
 
     # =========================================================================
     # Phase 2: Hierarchical training
@@ -270,35 +384,54 @@ def train(config: Config):
 
     while agent.total_steps < config.training.total_timesteps:
 
-        obs_img       = hier_env.reset()
-        z_current     = agent.encoder.encode_numpy(obs_img).squeeze()
-        ep_reward     = 0.0
+        obs_img      = env.reset()
+        z_current    = agent.encoder.encode_numpy(obs_img).squeeze()
+        proprio      = env.get_state()
+        ep_reward    = 0.0
         ep_high_steps = 0
         ep_successes  = 0
         ep_attempts   = 0
         episode_done  = False
+        agent._prev_n_tasks = 0
 
         while not episode_done:
-            landmark_idx = agent.select_subgoal(z_current, z_goal)
+
+            # ---- Manager selects subgoal ----
+            landmark_idx = agent.select_subgoal(z_current)
             z_subgoal    = agent.landmarks.get(landmark_idx)
 
             z_start           = z_current.copy()
+            proprio_start     = proprio.copy()
             cumulative_reward = 0.0
             subgoal_reached   = False
             ep_attempts      += 1
+            initial_dist      = np.linalg.norm(z_current - z_subgoal)
 
             for _ in range(config.manager.subgoal_horizon):
-                action = agent.get_worker_action(z_current, z_subgoal)
+                action   = agent.get_worker_action(z_current, z_subgoal, proprio)
                 next_img, env_reward, env_done, info = env.step(action)
-                z_next = agent.encoder.encode_numpy(next_img).squeeze()
+                z_next    = agent.encoder.encode_numpy(next_img).squeeze()
+                proprio_n = info['state']
 
-                shaped = agent.compute_shaped_reward(z_current, z_next, z_subgoal, env_reward)
-                agent.low_buffer.add(z_current, z_subgoal, action, shaped, z_next, env_done)
+                n_tasks = info.get('n_tasks_completed', 0)
+
+                # Hindsight landmark injection
+                agent.maybe_inject_hindsight(z_next, n_tasks)
+
+                shaped = agent.compute_shaped_reward(
+                    z_current, z_next, z_subgoal, env_reward,
+                    proprio, proprio_n, initial_dist=initial_dist,
+                )
+                agent.low_buffer.add(
+                    z_current, proprio, z_subgoal, action,
+                    shaped, z_next, proprio_n, env_done,
+                )
 
                 cumulative_reward += env_reward
                 agent.total_steps += 1
                 pbar.update(1)
                 z_current = z_next
+                proprio   = proprio_n
                 obs_img   = next_img
 
                 if np.linalg.norm(z_current - z_subgoal) < agent.success_threshold:
@@ -312,17 +445,29 @@ def train(config: Config):
                         and agent.low_buffer.size > config.buffer.batch_size):
                     last_worker = agent.update_worker()
 
+            # ---- High-level bookkeeping ----
             ep_high_steps += 1
             agent.reach_buffer.add(z_start, z_subgoal, subgoal_reached)
             agent.landmarks.record_visit(landmark_idx, success=subgoal_reached)
 
             if subgoal_reached:
                 agent.high_buffer.add_success(
-                    z_start, z_goal, z_subgoal, cumulative_reward, z_current, landmark_idx)
+                    z_start, z_start,    # z_goal field unused by manager now, reuse z_start
+                    z_subgoal, cumulative_reward, z_current, landmark_idx)
                 ep_successes += 1
                 ep_reward    += cumulative_reward
             else:
-                agent.high_buffer.add_failure(z_start, z_goal, z_subgoal, landmark_idx)
+                delta = (np.linalg.norm(z_start - z_subgoal)
+                         - np.linalg.norm(z_current - z_subgoal))
+                if delta > 0.05:
+                    agent.high_buffer.add_partial(
+                        z_start, z_start,
+                        z_current,
+                        cumulative_reward * 0.5,
+                        z_current, landmark_idx,
+                    )
+                else:
+                    agent.high_buffer.add_failure(z_start, z_start, z_subgoal, landmark_idx)
                 episode_done = True
 
             if env_done:
@@ -347,23 +492,26 @@ def train(config: Config):
         if agent.total_episodes % config.landmarks.update_freq == 0:
             all_z = agent.low_buffer.get_all_z()
             if len(all_z) > config.landmarks.min_observations:
-                agent.landmarks.update(all_z)
+                agent.landmarks.update(all_z, z_goal=None)
 
         # TensorBoard
         if agent.total_episodes % 10 == 0:
-            writer.add_scalar('train/episode_reward',    ep_reward,    agent.total_steps)
-            writer.add_scalar('train/high_level_steps',  ep_high_steps, agent.total_steps)
+            writer.add_scalar('train/episode_reward',       ep_reward,     agent.total_steps)
+            writer.add_scalar('train/high_level_steps',     ep_high_steps, agent.total_steps)
             writer.add_scalar('train/subgoal_success_rate',
                               ep_successes / max(ep_attempts, 1), agent.total_steps)
-            writer.add_scalar('train/epsilon',           agent.epsilon, agent.total_steps)
-            writer.add_scalar('train/low_buffer_size',   len(agent.low_buffer), agent.total_steps)
-            writer.add_scalar('train/high_buffer_size',  len(agent.high_buffer), agent.total_steps)
+            writer.add_scalar('train/epsilon',              agent.epsilon, agent.total_steps)
+            writer.add_scalar('train/low_buffer_size',      len(agent.low_buffer), agent.total_steps)
+            writer.add_scalar('train/high_buffer_size',     len(agent.high_buffer), agent.total_steps)
+            writer.add_scalar('train/success_threshold',    agent.success_threshold, agent.total_steps)
+            writer.add_scalar('train/hindsight_pool_size',
+                              agent.landmarks._success_pool_size, agent.total_steps)
             for k, v in last_worker.items():
-                writer.add_scalar(f'worker/{k}',      v, agent.total_steps)
+                writer.add_scalar(f'worker/{k}',        v, agent.total_steps)
             for k, v in last_manager.items():
-                writer.add_scalar(f'manager/{k}',     v, agent.total_steps)
+                writer.add_scalar(f'manager/{k}',       v, agent.total_steps)
             for k, v in last_reach.items():
-                writer.add_scalar(f'reachability/{k}', v, agent.total_steps)
+                writer.add_scalar(f'reachability/{k}',  v, agent.total_steps)
 
         # Rich terminal log every 50 episodes
         if agent.total_episodes % 50 == 0 and run_rewards:
@@ -389,6 +537,7 @@ def train(config: Config):
             print(f"  [Exploration]")
             print(f"    Epsilon:          {agent.epsilon:.4f}")
             print(f"    Landmarks:        {agent.landmarks.n_active}")
+            print(f"    Hindsight pool:   {agent.landmarks._success_pool_size}")
             print(f"    Success thresh:   {agent.success_threshold:.4f}")
             print(f"  [Buffers]")
             print(f"    Low-level:        {len(agent.low_buffer):,}")
@@ -413,11 +562,13 @@ def train(config: Config):
         # Evaluation
         if agent.total_steps % config.training.eval_freq < config.manager.subgoal_horizon * 20:
             t0     = time.time()
-            result = evaluate(agent, config, z_goal)
+            result = evaluate(agent, config)
             is_best = result['success_rate'] > best_eval
             if is_best:
                 best_eval = result['success_rate']
                 save_checkpoint(agent, config, 'best')
+                record_episode_videos(agent, config, 'best',
+                                      config.training.video_n_episodes)
             for k, v in result.items():
                 if isinstance(v, float):
                     writer.add_scalar(f'eval/{k}', v, agent.total_steps)
@@ -433,9 +584,12 @@ def train(config: Config):
             print(f"    Mean high steps:    {result['mean_high_steps']:.1f}")
             print(f"{'='*70}")
 
-        # Periodic checkpoint
+        # Periodic checkpoint + video
         if ckpt_sched.should_save(agent.total_steps):
-            save_checkpoint(agent, config, ckpt_sched.label(agent.total_steps))
+            label = ckpt_sched.label(agent.total_steps)
+            save_checkpoint(agent, config, label)
+            record_episode_videos(agent, config, label,
+                                  config.training.video_n_episodes)
 
     pbar.close()
     writer.close()
@@ -457,17 +611,29 @@ def train(config: Config):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--seed',         type=int,   default=42)
-    parser.add_argument('--device',       type=str,   default='cuda')
-    parser.add_argument('--total_steps',  type=int,   default=1_000_000)
-    parser.add_argument('--encoder',      type=str,   default='r3m',
+    parser.add_argument('--seed',              type=int,  default=42)
+    parser.add_argument('--device',            type=str,  default='cuda')
+    parser.add_argument('--total_steps',       type=int,  default=1_000_000)
+    parser.add_argument('--encoder',           type=str,  default='r3m',
                         choices=['r3m', 'dinov2'])
-    parser.add_argument('--n_landmarks',  type=int,   default=100)
-    parser.add_argument('--subgoal_horizon', type=int, default=20)
-    parser.add_argument('--log_dir',      type=str,   default='logs/')
-    parser.add_argument('--tasks',        type=str,   nargs='+',
-                        default=['microwave', 'kettle', 'light switch', 'slide cabinet'],
-                        help='Tasks to complete. E.g. --tasks microwave kettle')
+    parser.add_argument('--n_landmarks',       type=int,  default=100)
+    parser.add_argument('--subgoal_horizon',   type=int,  default=20)
+    parser.add_argument('--log_dir',           type=str,  default='logs/')
+    parser.add_argument('--warmup_k',          type=int,  default=10)
+    parser.add_argument('--tasks',             type=str,  nargs='+',
+                        default=['microwave'],
+                        help='Tasks to complete. Start with microwave alone.')
+    parser.add_argument('--no_demo_landmarks', action='store_true',
+                        help='Disable demo landmark seeding (ablation).')
+    parser.add_argument('--no_hindsight',      action='store_true',
+                        help='Disable hindsight landmark injection (ablation).')
+    parser.add_argument('--no_curriculum',     action='store_true',
+                        help='Disable curriculum landmark filtering (ablation).')
+    parser.add_argument('--no_video',          action='store_true',
+                        help='Disable episode video recording.')
+    parser.add_argument('--demo_gif',          type=str,
+                        default='demo/franka_kitchen/demo.gif',
+                        help='Path to demo GIF for landmark seeding.')
     args = parser.parse_args()
 
     config = Config()
@@ -476,8 +642,14 @@ if __name__ == "__main__":
     config.training.total_timesteps   = args.total_steps
     config.training.log_dir           = args.log_dir
     config.training.tasks_to_complete = args.tasks
+    config.training.warmup_future_k   = args.warmup_k
+    config.training.record_video      = not args.no_video
     config.encoder.name               = args.encoder
     config.landmarks.n_landmarks      = args.n_landmarks
+    config.landmarks.use_demo_landmarks    = not args.no_demo_landmarks
+    config.landmarks.use_hindsight_landmarks = not args.no_hindsight
+    config.landmarks.use_curriculum_landmarks = not args.no_curriculum
+    config.landmarks.demo_gif_path    = args.demo_gif
     config.manager.subgoal_horizon    = args.subgoal_horizon
 
     if args.device == 'cuda':

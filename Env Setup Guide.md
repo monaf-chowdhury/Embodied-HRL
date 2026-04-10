@@ -47,6 +47,11 @@ Works on RTX 3090 Ti (sm_86), 4090 (sm_89), 5090 (sm_100) — any driver ≥ 525
 pip install torch==2.3.1 torchvision==0.18.1 --index-url https://download.pytorch.org/whl/cu121
 ```
 
+For RTX 5090 Ti (sm_120) 
+```bash
+pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cu128
+```
+
 Verify:
 ```bash
 python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
@@ -84,8 +89,8 @@ echo $MUJOCO_GL   # Must print: egl
 
 ```bash
 pip install gymnasium==1.0.0
-pip install gymnasium-robotics
-pip install mujoco
+pip install gymnasium-robotics==1.4.2
+pip install mujoco==3.6.0
 ```
 
 Verify:
@@ -116,13 +121,14 @@ print('FrankaKitchen-v1: OK')
 ## Step 6: Install remaining dependencies
 
 ```bash
-pip install numpy==1.26.4
-pip install scipy==1.13.1
-pip install opencv-python==4.10.0.84
-pip install matplotlib==3.9.2
-pip install tensorboard==2.17.1
-pip install tqdm==4.66.5
-pip install scikit-learn==1.5.1
+pip install \
+    numpy==1.26.4 \
+    scipy==1.13.1 \
+    opencv-python==4.10.0.84 \
+    matplotlib==3.9.2 \
+    tensorboard==2.17.1 \
+    tqdm==4.66.5 \
+    scikit-learn==1.5.1
 ```
 
 ---

@@ -8,85 +8,107 @@ from typing import Optional, List
 
 @dataclass
 class EncoderConfig:
-    name: str = "r3m"  # "r3m" or "dinov2"
+    name: str = "r3m"          # "r3m" or "dinov2"
     freeze: bool = True
-    # R3M outputs 2048-d; DINOv2-ViT-S outputs 384-d
-    raw_dim: int = 2048  # set automatically based on name
-    # Projection head output dimension (the actual subgoal space)
-    proj_dim: int = 64
+    raw_dim: int = 2048         # R3M=2048, DINOv2-ViT-S=384 (auto-set below)
+    proj_dim: int = 64          # Projection head output (subgoal space)
     proj_hidden: int = 256
-    # Image preprocessing
-    img_size: int = 224  # R3M expects 224x224
-    
+    img_size: int = 224         # R3M expects 224x224
+
 
 @dataclass
 class ManagerConfig:
-    """High-level policy: selects landmarks as subgoals."""
+    """High-level policy: selects landmarks as subgoals (image latent only)."""
     hidden_dim: int = 256
     n_layers: int = 3
     lr: float = 3e-4
-    gamma: float = 0.4  # Low gamma like SSE — sharpens credit assignment
-    tau: float = 0.005  # Target network EMA
+    gamma: float = 0.4          # Low gamma (SSE): sharpens credit assignment
+    tau: float = 0.005
     # Exploration
     epsilon_start: float = 1.0
     epsilon_end: float = 0.05
     epsilon_decay_steps: int = 200_000
-    # Subgoal budget: how many low-level steps per subgoal
-    subgoal_horizon: int = 20  # K in the paper
-    
+    # Subgoal budget
+    subgoal_horizon: int = 20   # K low-level steps per subgoal
+
 
 @dataclass
 class WorkerConfig:
-    """Low-level policy: goal-conditioned SAC."""
+    """
+    Low-level policy: goal-conditioned SAC.
+    Input: image latent (64d) + proprio (59d) + subgoal latent (64d) = 187d
+    """
     hidden_dim: int = 256
     n_layers: int = 3
     actor_lr: float = 3e-4
     critic_lr: float = 3e-4
-    alpha_lr: float = 3e-4  # SAC entropy temperature
+    alpha_lr: float = 3e-4
     gamma: float = 0.99
     tau: float = 0.005
-    init_alpha: float = 0.2  # Initial entropy coefficient
-    auto_alpha: bool = True  # Automatically tune alpha
+    init_alpha: float = 0.5
+    auto_alpha: bool = True
+    # Proprio normalisation — running stats tracked during warmup
+    proprio_dim: int = 59
 
 
 @dataclass
 class ReachabilityConfig:
-    """Learned reachability predictor f(z_curr, z_subgoal) -> [0,1]."""
     hidden_dim: int = 256
     n_layers: int = 3
     lr: float = 1e-3
-    # Thresholds for labeling (set after measuring latent scale)
-    # These are relative to the latent space scale — calibrate in first 10K steps
-    success_threshold: float = 0.0  # auto-calibrated
-    failure_threshold: float = 0.0  # auto-calibrated
+    success_threshold: float = 0.0   # auto-calibrated
+    failure_threshold: float = 0.0   # auto-calibrated
     auto_calibrate: bool = True
-    # Training
     batch_size: int = 256
-    min_buffer_size: int = 1000  # Don't train until this many transitions
-    update_freq: int = 5  # Update every N episodes
-    # Filtering
-    reject_threshold: float = 0.3  # Reject subgoals with f < this
+    min_buffer_size: int = 5000
+    update_freq: int = 5
+    reject_threshold: float = 0.3
 
 
 @dataclass
 class LandmarkConfig:
-    """FPS landmark buffer for grounded subgoal selection."""
-    n_landmarks: int = 100  # Number of landmarks to maintain
-    update_freq: int = 20  # Re-compute landmarks every N episodes
-    min_observations: int = 500  # Min replay size before computing landmarks
-    # Exploration: fraction of time to select least-visited landmark
+    """FPS landmark buffer with demo seeding and quality improvements."""
+    n_landmarks: int = 100
+    update_freq: int = 20
+    min_observations: int = 500
+
+    # ---- Demo landmark seeding ----
+    use_demo_landmarks: bool = True         # ablation flag
+    demo_gif_path: str = "demo/franka_kitchen/demo.gif"
+    demo_landmark_ratio: float = 0.3        # fraction of landmarks from demo
+    # How many frames to subsample from the GIF (None = all)
+    demo_max_frames: int = 60
+
+    # ---- Hindsight landmark injection ----
+    use_hindsight_landmarks: bool = True    # add accidental task-completion states
+    hindsight_pool_size: int = 500          # max latents in the success pool
+
+    # ---- Curriculum / approach states ----
+    use_curriculum_landmarks: bool = True   # prioritise approach states
+    curriculum_top_k: float = 0.3          # fraction of replay to consider
+
+    # ---- Recent replay bias ----
+    recent_replay_fraction: float = 0.7    # fraction from recent half of buffer
+
+    # Exploration
     explore_ratio: float = 0.2
 
 
 @dataclass
 class RewardConfig:
-    """Dense reward shaping for the worker."""
-    # L2 delta-progress in latent space (potential-based shaping)
-    shaping_weight: float = 1.0  # alpha in: r = r_sparse + alpha * delta_progress
+    """
+    Reward shaping for the worker.
+    r = sparse_weight * r_sparse
+        + task_progress_weight * task_progress
+        + latent_weight * normalised_latent_progress
+    """
+    sparse_weight: float = 5.0           # dominant signal
+    task_progress_weight: float = 0.5    # proprioceptive task-progress (secondary)
+    latent_weight: float = 0.1           # normalised delta-progress (tertiary)
     sparse_success_reward: float = 1.0
 
 
-@dataclass 
+@dataclass
 class BufferConfig:
     capacity: int = 1_000_000
     batch_size: int = 1024
@@ -95,21 +117,24 @@ class BufferConfig:
 @dataclass
 class TrainingConfig:
     total_timesteps: int = 1_000_000
-    # How often to do things
-    manager_update_freq: int = 1  # Update manager every N high-level steps
-    worker_updates_per_step: int = 1  # Gradient steps per env step
-    eval_freq: int = 10_000  # Evaluate every N timesteps
+    manager_update_freq: int = 1
+    worker_updates_per_step: int = 1
+    eval_freq: int = 10_000
     n_eval_episodes: int = 10
-    # Logging
     log_dir: str = "logs/"
-    save_freq: int = 100_000  # Save checkpoint every N steps
+    save_freq: int = 100_000
     seed: int = 42
-    device: str = "cuda"  # "cuda" or "cpu"
+    device: str = "cuda"
+    warmup_future_k: int = 10          # K-step lookahead during warmup
 
-    # Tasks to complete — configurable for curriculum / ablations
+    # Episode video recording at every checkpoint
+    record_video: bool = True
+    video_n_episodes: int = 3          # episodes to record per checkpoint
+
     tasks_to_complete: List[str] = field(default_factory=lambda: [
         'microwave', 'kettle', 'light switch', 'slide cabinet'
     ])
+
 
 @dataclass
 class Config:
@@ -121,9 +146,8 @@ class Config:
     reward: RewardConfig = field(default_factory=RewardConfig)
     buffer: BufferConfig = field(default_factory=BufferConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
-    
+
     def __post_init__(self):
-        # Auto-set encoder raw dim
         if self.encoder.name == "r3m":
             self.encoder.raw_dim = 2048
         elif self.encoder.name == "dinov2":

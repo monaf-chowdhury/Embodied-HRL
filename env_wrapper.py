@@ -6,10 +6,10 @@ Uses FrankaKitchen-v1 from gymnasium-robotics (NOT the legacy D4RL v0).
 Key design decisions:
 - render_mode="rgb_array" is passed at make() time — this is the v1 API.
   env.render() then returns a numpy array directly.
-- The camera is overridden at runtime via mujoco.MjvCamera to use the
-  Q10 viewpoint found via systematic sweep: pos=[0,-1.5,3.2] looking at
-  [-0.3,0.7,1.9]. This gives a full workspace view showing microwave,
-  stovetop, kettle, robot arm, and cabinets simultaneously.
+- The camera matches the original relay-policy-learning demo camera:
+  distance=4.5, azimuth=-66°, elevation=-65°, lookat=[-0.1, 0.75, 1.6].
+  Set directly via MuJoCo's spherical parameterisation (no Cartesian
+  conversion) to exactly reproduce the demo_relay_cam viewpoint.
 - obs from v1 is a dict: obs['observation'] is the 59-d state vector.
   We only use images as observations; the state vector is kept in info
   for debugging only.
@@ -30,45 +30,37 @@ gym.register_envs(gymnasium_robotics)
 
 
 # =============================================================================
-# Camera: Q10 viewpoint — same as found in v0 via body position sweep.
-# pos=[0.0, -1.5, 3.2] looking at [-0.3, 0.7, 1.9]
-# Shows: microwave (left), stovetop (center), kettle, robot arm, cabinets.
+# Camera: demo_relay_cam — from relay-policy-learning source XML.
+# distance=4.5, azimuth=-66°, elevation=-65°, lookat=[-0.1, 0.75, 1.6]
+# Set using MuJoCo's native spherical params — no Cartesian conversion.
 # =============================================================================
 
-_CAM_POS    = np.array([ 0.0, -1.5,  3.2])
-_CAM_TARGET = np.array([-0.3,  0.7,  1.9])
+_CAM_DISTANCE  = 4.5
+_CAM_AZIMUTH   = -66.0   # degrees
+_CAM_ELEVATION = -65.0   # degrees
+_CAM_LOOKAT    = np.array([-0.1, 0.75, 1.6])
 
 # Default 4-task complete set (equivalent to kitchen-complete-v0)
 _DEFAULT_TASKS = ['microwave', 'kettle', 'light switch', 'slide cabinet']
 
 
-def _apply_camera(env, cam_pos: np.ndarray, cam_target: np.ndarray):
+def _apply_camera(env):
     """
-    Override the renderer camera to use our custom viewpoint.
-    In v1 / gymnasium-robotics, the mujoco model is accessed via
-    env.unwrapped.model and env.unwrapped.data (new mujoco bindings).
-    We set the camera via mujoco.MjvCamera on the renderer.
+    Override the renderer camera to use the relay-policy-learning demo viewpoint.
+    Uses MuJoCo's native spherical parameterisation (distance/azimuth/elevation)
+    directly — no Cartesian conversion needed or performed.
     """
     try:
-        import mujoco
-        # Access the mujoco renderer directly
         renderer = env.unwrapped.mujoco_renderer
         if renderer is None:
             return
 
-        # Set a free camera tracking the scene
         cam = renderer.viewer.cam if hasattr(renderer, 'viewer') else None
         if cam is not None:
-            # lookat = target point the camera orbits around
-            cam.lookat[:] = cam_target
-            # distance from lookat
-            diff = cam_pos - cam_target
-            cam.distance = float(np.linalg.norm(diff))
-            # azimuth: angle in XY plane from +Y axis (degrees)
-            cam.azimuth = float(np.degrees(np.arctan2(diff[0], -diff[1])))
-            # elevation: angle above XY plane (degrees, negative = looking down)
-            horiz = np.sqrt(diff[0]**2 + diff[1]**2)
-            cam.elevation = float(np.degrees(np.arctan2(diff[2], horiz)) - 90)
+            cam.lookat[:]  = _CAM_LOOKAT
+            cam.distance   = _CAM_DISTANCE
+            cam.azimuth    = _CAM_AZIMUTH
+            cam.elevation  = _CAM_ELEVATION
     except Exception:
         pass  # Renderer not yet initialised — will be called again after reset
 
@@ -125,8 +117,10 @@ class FrankaKitchenImageWrapper:
     def _render_image(self) -> np.ndarray:
         """
         Render using env.render() — the v1 / gymnasium API.
+        Applies the demo camera before each render.
         Returns (img_size, img_size, 3) uint8 array.
         """
+        _apply_camera(self._env)
         try:
             img = self._env.render()  # returns numpy array in rgb_array mode
             if img is None:
