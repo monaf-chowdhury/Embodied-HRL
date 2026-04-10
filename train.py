@@ -632,7 +632,7 @@ if __name__ == "__main__":
     parser.add_argument('--no_video',          action='store_true',
                         help='Disable episode video recording.')
     parser.add_argument('--demo_gif',          type=str,
-                        default='demo/franka_kitchen/demo.gif',
+                        default='demo/franka_kitchen.gif',
                         help='Path to demo GIF for landmark seeding.')
     args = parser.parse_args()
 
