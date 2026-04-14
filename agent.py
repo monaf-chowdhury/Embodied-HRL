@@ -26,6 +26,7 @@ Key changes:
 import numpy as np
 import torch
 import torch.nn.functional as F
+from typing import Tuple as Tuple_
 
 from config import Config
 from encoder import VisualEncoder
@@ -87,9 +88,6 @@ def compute_task_progress_focused(
     nearest = min(dists, key=dists.get)
     return nearest, _task_progress(proprio, nearest)
 
-
-# Python typing helper (avoid importing Tuple from typing at module level)
-from typing import Tuple as Tuple_
 
 
 class VisualHRLAgent:
