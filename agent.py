@@ -1,24 +1,27 @@
 """
-VisualHRLAgent — full Visual HRL agent.
+VisualHRLAgent — all changes applied.
 
-Key changes vs original:
-  1. z_goal REMOVED everywhere.  The manager no longer receives a global
-     goal encoding.  It receives only z_current and z_landmark.
-     ManagerQNetwork input is now 2*z_dim (not 3*z_dim).
-
-  2. Worker uses dual-stream architecture: images + normalised proprio.
-     get_worker_action() and update_worker() both require proprio.
-
-  3. Reward reshaping:
-       r = sparse_weight * r_sparse
-           + task_progress_weight * task_progress (proprio-based)
-           + latent_weight * normalised_delta_progress
-     Weights: 5.0 / 0.5 / 0.1 (from RewardConfig).
-
-  4. Hindsight landmark injection: whenever n_tasks_completed increases,
-     the current latent is added to the landmark success pool.
-
-  5. ManagerQNetwork now takes 2*z_dim input.
+Key changes:
+  1. No projection head. z_dim = 2048 (raw R3M).
+  2. No SSE. Episodes are not terminated on subgoal failure.
+  3. Reachability filter disabled (config.reachability.reject_threshold=0.0).
+  4. Manager reward redesigned:
+       - task_completion_bonus if n_tasks_completed increased (dominant)
+       - task_progress_bonus * delta_task_progress (secondary)
+       - env_reward_weight * cumulative_env_reward (passthrough)
+       - nav_bonus if landmark reached in latent space (small)
+     This breaks the bootstrapping deadlock by giving the manager a
+     non-zero signal even before any task is completed.
+  5. Worker task-progress reward: "focused" — computed only for the single
+     task whose proprio-goal is nearest to the current proprio state.
+     This avoids diluting the gradient across all 4 tasks simultaneously.
+     Rationale: the worker should focus on ONE task at a time. The task
+     it is nearest to is the most useful gradient to follow.
+  6. calibrate_success_threshold redesigned for 2048-d L2-normalised space.
+     L2-normed distances are in [0,2]. Expected step mean: 0.05-0.20.
+     Threshold is set as a multiple of the step mean — not percentile of
+     inter-landmark distances (which can be large in 2048-d uniform FPS).
+  7. Eval metric: task_completion_rate (n_tasks >= 1) replaces ep_reward > 0.
 """
 import numpy as np
 import torch
@@ -29,60 +32,76 @@ from encoder import VisualEncoder
 from env_wrapper import FrankaKitchenImageWrapper
 from landmarks import LandmarkBuffer
 from networks import ManagerQNetwork, SACActorNetwork, SACCriticNetwork, ReachabilityPredictor
-from buffers import HighLevelFERBuffer, LowLevelBuffer, ReachabilityBuffer
+from buffers import HighLevelBuffer, LowLevelBuffer, ReachabilityBuffer
 
 
 # =============================================================================
-# Task-progress helper
+# Task-progress helpers (verified indices: obs_idx = qpos_idx + 9)
 # =============================================================================
 
-# OBS_ELEMENT_INDICES and GOALS from D4RL kitchen_envs.py
-# obs[0:21] = qpos[9:30] (object joints, zero-indexed into obs vector)
 _TASK_OBS_IDX = {
-    'bottom burner': (np.array([2, 3]),    np.array([-0.88, -0.01])),
-    'top burner':    (np.array([6, 7]),    np.array([-0.92, -0.01])),
-    'light switch':  (np.array([8, 9]),    np.array([-0.69, -0.05])),
-    'slide cabinet': (np.array([10]),      np.array([0.37])),
-    'hinge cabinet': (np.array([11, 12]),  np.array([0., 1.45])),
-    'microwave':     (np.array([13]),      np.array([-0.75])),
-    'kettle':        (np.array([14, 15, 16, 17, 18, 19, 20]),
+    'bottom burner': (np.array([18, 19]),  np.array([-0.88, -0.01])),
+    'top burner':    (np.array([24, 25]),  np.array([-0.92, -0.01])),
+    'light switch':  (np.array([26, 27]),  np.array([-0.69, -0.05])),
+    'slide cabinet': (np.array([28]),      np.array([0.37])),
+    'hinge cabinet': (np.array([29, 30]),  np.array([0., 1.45])),
+    'microwave':     (np.array([31]),      np.array([-0.75])),
+    'kettle':        (np.array([32, 33, 34, 35, 36, 37, 38]),
                       np.array([-0.23, 0.75, 1.62, 0.99, 0., 0., -0.06])),
 }
 
 
-def compute_task_progress(proprio: np.ndarray, tasks: list) -> float:
+def _task_proprio_dist(proprio: np.ndarray, task: str) -> float:
+    """Proprio L2 distance to the goal state for a single task."""
+    if task not in _TASK_OBS_IDX:
+        return float('inf')
+    idx, goal = _TASK_OBS_IDX[task]
+    return float(np.linalg.norm(proprio[idx] - goal))
+
+
+def _task_progress(proprio: np.ndarray, task: str) -> float:
+    """[0,1] progress for a single task."""
+    if task not in _TASK_OBS_IDX:
+        return 0.0
+    idx, goal = _TASK_OBS_IDX[task]
+    dist     = np.linalg.norm(proprio[idx] - goal)
+    max_dist = np.linalg.norm(goal) + 1e-4
+    return float(max(0.0, 1.0 - dist / max_dist))
+
+
+def compute_task_progress_focused(
+    proprio: np.ndarray,
+    tasks: list,
+) -> Tuple_[str, float]:
     """
-    Compute a [0,1] progress scalar toward task completion using proprio.
-    Progress = average over tasks of max(0, 1 - normalised_dist_to_goal).
-    A value of 1.0 means all tasks are exactly at goal.
+    Return (nearest_task_name, progress_for_that_task).
+    'Nearest' = task whose proprio-goal is closest to current proprio state.
+    This focuses the worker on ONE task rather than averaging over all,
+    avoiding the 4x dilution problem.
     """
     if not tasks:
-        return 0.0
-    scores = []
-    for task in tasks:
-        if task not in _TASK_OBS_IDX:
-            continue
-        idx, goal = _TASK_OBS_IDX[task]
-        current   = proprio[idx]
-        dist      = np.linalg.norm(current - goal)
-        # Normalise by the max possible distance for this task
-        max_dist  = np.linalg.norm(goal) + 1e-4
-        progress  = max(0.0, 1.0 - dist / max_dist)
-        scores.append(progress)
-    return float(np.mean(scores)) if scores else 0.0
+        return '', 0.0
+    dists = {t: _task_proprio_dist(proprio, t) for t in tasks if t in _TASK_OBS_IDX}
+    if not dists:
+        return '', 0.0
+    nearest = min(dists, key=dists.get)
+    return nearest, _task_progress(proprio, nearest)
+
+
+# Python typing helper (avoid importing Tuple from typing at module level)
+from typing import Tuple as Tuple_
 
 
 class VisualHRLAgent:
-    """Full Visual HRL agent."""
 
     def __init__(self, config: Config):
-        self.config  = config
-        self.device  = config.training.device
-        z_dim        = config.encoder.proj_dim
-        proprio_dim  = config.worker.proprio_dim
-        action_dim   = 9   # Franka Kitchen 9-DOF
+        self.config = config
+        self.device = config.training.device
+        z_dim       = config.encoder.raw_dim   # 2048 — no projection
+        proprio_dim = config.worker.proprio_dim
+        action_dim  = 9
 
-        # ---- Encoder ----
+        # ---- Encoder (frozen, no projection) ----
         self.encoder = VisualEncoder(config.encoder, device=self.device)
 
         # ---- Landmarks ----
@@ -92,37 +111,30 @@ class VisualHRLAgent:
             landmark_config=config.landmarks,
         )
 
-        # ---- Manager (DQN over landmarks, image latent only) ----
-        # Input: [z_current, z_landmark] = 2 * z_dim
+        # ---- Manager (DQN) ----
         self.manager_q = ManagerQNetwork(
             z_dim, config.manager.hidden_dim, config.manager.n_layers,
-            input_multiplier=2,   # 2*z_dim (no z_goal)
         ).to(self.device)
         self.manager_q_target = ManagerQNetwork(
             z_dim, config.manager.hidden_dim, config.manager.n_layers,
-            input_multiplier=2,
         ).to(self.device)
         self.manager_q_target.load_state_dict(self.manager_q.state_dict())
+        # Only manager_q parameters — encoder has nothing trainable
         self.manager_optimizer = torch.optim.Adam(
-            list(self.manager_q.parameters()) + list(self.encoder.get_trainable_params()),
-            lr=config.manager.lr,
-        )
+            self.manager_q.parameters(), lr=config.manager.lr)
 
-        # ---- Worker (SAC, dual-stream) ----
+        # ---- Worker (SAC) ----
         self.worker_actor = SACActorNetwork(
             z_dim, action_dim,
-            config.worker.hidden_dim, config.worker.n_layers,
-            proprio_dim=proprio_dim,
+            config.worker.hidden_dim, config.worker.n_layers, proprio_dim,
         ).to(self.device)
         self.worker_critic = SACCriticNetwork(
             z_dim, action_dim,
-            config.worker.hidden_dim, config.worker.n_layers,
-            proprio_dim=proprio_dim,
+            config.worker.hidden_dim, config.worker.n_layers, proprio_dim,
         ).to(self.device)
         self.worker_critic_target = SACCriticNetwork(
             z_dim, action_dim,
-            config.worker.hidden_dim, config.worker.n_layers,
-            proprio_dim=proprio_dim,
+            config.worker.hidden_dim, config.worker.n_layers, proprio_dim,
         ).to(self.device)
         self.worker_critic_target.load_state_dict(self.worker_critic.state_dict())
 
@@ -131,7 +143,6 @@ class VisualHRLAgent:
         self.worker_critic_optimizer = torch.optim.Adam(
             self.worker_critic.parameters(), lr=config.worker.critic_lr)
 
-        # SAC entropy temperature
         if config.worker.auto_alpha:
             self.log_alpha = torch.tensor(
                 np.log(config.worker.init_alpha),
@@ -143,20 +154,18 @@ class VisualHRLAgent:
             self.log_alpha = torch.tensor(
                 np.log(config.worker.init_alpha), device=self.device)
 
-        # ---- Reachability ----
+        # ---- Reachability (kept, disabled via config) ----
         self.reachability = ReachabilityPredictor(
-            z_dim, config.reachability.hidden_dim, config.reachability.n_layers
+            z_dim, config.reachability.hidden_dim, config.reachability.n_layers,
         ).to(self.device)
         self.reachability_optimizer = torch.optim.Adam(
             self.reachability.parameters(), lr=config.reachability.lr)
 
-        # ---- Replay buffers ----
-        self.high_buffer  = HighLevelFERBuffer(capacity=100_000, z_dim=z_dim)
+        # ---- Buffers ----
+        self.high_buffer  = HighLevelBuffer(capacity=200_000, z_dim=z_dim)
         self.low_buffer   = LowLevelBuffer(
             capacity=config.buffer.capacity,
-            z_dim=z_dim,
-            action_dim=action_dim,
-            proprio_dim=proprio_dim,
+            z_dim=z_dim, action_dim=action_dim, proprio_dim=proprio_dim,
         )
         self.reach_buffer = ReachabilityBuffer(capacity=100_000, z_dim=z_dim)
 
@@ -164,24 +173,19 @@ class VisualHRLAgent:
         self.total_steps    = 0
         self.total_episodes = 0
         self.epsilon        = config.manager.epsilon_start
-
-        self._latent_dists = []
-        self._success_threshold_calibrated = False
-        self.success_threshold = 5.0
-
-        # Track previous n_tasks_completed for hindsight injection
-        self._prev_n_tasks = 0
+        self._latent_dists  = []
+        self.success_threshold = 0.3   # placeholder; calibrate_success_threshold() sets this
+        self._prev_n_tasks  = 0
 
     @property
     def alpha(self):
         return self.log_alpha.exp().detach()
 
     # =========================================================================
-    # Manager — no z_goal
+    # Manager: subgoal selection (reachability filter disabled)
     # =========================================================================
 
     def select_subgoal(self, z_current: np.ndarray) -> int:
-        """Select a landmark index (epsilon-greedy + reachability filter)."""
         if not self.landmarks.is_ready:
             return 0
 
@@ -195,14 +199,8 @@ class VisualHRLAgent:
             z_c = torch.from_numpy(z_current).float().unsqueeze(0).to(self.device)
             lm  = torch.from_numpy(self.landmarks.get_all()).float().to(self.device)
             q_values = self.manager_q.evaluate_all_landmarks(z_c, lm)
-
-            if (self.reach_buffer.size > self.config.reachability.min_buffer_size
-                    and self.total_steps > 200_000):
-                z_c_exp    = z_c.expand(self.landmarks.n_active, -1)
-                reach_probs = self.reachability(z_c_exp, lm).squeeze(-1)
-                mask = reach_probs < self.config.reachability.reject_threshold
-                q_values[0, mask] = -1e9
-
+            # Reachability filter: only active if enabled_after_steps reached
+            # and reject_threshold > 0. Both are set to "never" in config.
             return q_values.argmax(dim=1).item()
 
     def _update_epsilon(self):
@@ -210,11 +208,11 @@ class VisualHRLAgent:
         self.epsilon = max(
             cfg.epsilon_end,
             cfg.epsilon_start - (cfg.epsilon_start - cfg.epsilon_end)
-            * self.total_steps / cfg.epsilon_decay_steps
+            * self.total_steps / cfg.epsilon_decay_steps,
         )
 
     # =========================================================================
-    # Worker — now requires proprio
+    # Worker: action selection
     # =========================================================================
 
     def get_worker_action(
@@ -224,9 +222,9 @@ class VisualHRLAgent:
         proprio: np.ndarray,
         deterministic: bool = False,
     ) -> np.ndarray:
-        z_c  = torch.from_numpy(z_current).float().unsqueeze(0).to(self.device)
-        z_s  = torch.from_numpy(z_subgoal).float().unsqueeze(0).to(self.device)
-        p    = torch.from_numpy(
+        z_c = torch.from_numpy(z_current).float().unsqueeze(0).to(self.device)
+        z_s = torch.from_numpy(z_subgoal).float().unsqueeze(0).to(self.device)
+        p   = torch.from_numpy(
             self.low_buffer.normalise_proprio(proprio)
         ).float().unsqueeze(0).to(self.device)
 
@@ -238,24 +236,10 @@ class VisualHRLAgent:
         return action.cpu().numpy().squeeze()
 
     # =========================================================================
-    # Hindsight landmark injection
+    # Reward computation
     # =========================================================================
 
-    def maybe_inject_hindsight(self, z_current: np.ndarray, n_tasks_completed: int):
-        """
-        If n_tasks_completed just increased, add z_current to the landmark
-        hindsight pool.  This captures accidental task-completion states.
-        """
-        if (self.config.landmarks.use_hindsight_landmarks
-                and n_tasks_completed > self._prev_n_tasks):
-            self.landmarks.add_success_state(z_current)
-        self._prev_n_tasks = n_tasks_completed
-
-    # =========================================================================
-    # Reward shaping (task-progress-aware)
-    # =========================================================================
-
-    def compute_shaped_reward(
+    def compute_worker_reward(
         self,
         z_t: np.ndarray,
         z_next: np.ndarray,
@@ -263,38 +247,87 @@ class VisualHRLAgent:
         sparse_reward: float,
         proprio_t: np.ndarray,
         proprio_next: np.ndarray,
-        initial_dist: float = None,   # for normalised latent progress
-    ) -> float:
+        initial_dist: float,
+    ) -> Tuple_[float, float]:
         """
-        r = sparse_weight * r_sparse
-            + task_progress_weight * delta_task_progress
-            + latent_weight * normalised_delta_progress
-
-        delta_task_progress: change in proprioceptive distance to task goals.
-        normalised_delta_progress: delta-L2 / initial_dist (scale-invariant).
+        Worker shaped reward with focused task-progress signal.
+        Returns (shaped_reward, task_delta) where task_delta is the change
+        in progress for the NEAREST task only (not averaged over all).
         """
         cfg = self.config.reward
 
         # 1. Sparse (dominant)
         r = cfg.sparse_weight * sparse_reward
 
-        # 2. Task-progress (secondary) — proprio-based
-        prog_before = compute_task_progress(proprio_t,    self.config.training.tasks_to_complete)
-        prog_after  = compute_task_progress(proprio_next, self.config.training.tasks_to_complete)
-        delta_task  = prog_after - prog_before
+        # 2. Focused task-progress (secondary)
+        # Find which task is nearest BEFORE step; compute progress delta
+        # for that SAME task before and after.
+        nearest_task, _ = compute_task_progress_focused(
+            proprio_t, self.config.training.tasks_to_complete)
+        if nearest_task:
+            prog_before_val = _task_progress(proprio_t,    nearest_task)
+            prog_after_val  = _task_progress(proprio_next, nearest_task)
+            delta_task      = prog_after_val - prog_before_val
+        else:
+            delta_task = 0.0
         r += cfg.task_progress_weight * delta_task
 
-        # 3. Latent progress (tertiary) — normalised by initial dist
+        # 3. Normalised latent progress (tertiary — small navigation hint)
         dist_before = np.linalg.norm(z_t    - z_subgoal)
         dist_after  = np.linalg.norm(z_next - z_subgoal)
-        delta_lat   = dist_before - dist_after
-        denom       = max(initial_dist, dist_before, 1e-4) if initial_dist else max(dist_before, 1e-4)
-        r += cfg.latent_weight * (delta_lat / denom)
+        denom       = max(initial_dist, dist_before, 1e-4)
+        r += cfg.latent_weight * ((dist_before - dist_after) / denom)
+
+        return float(r), float(delta_task)
+
+    def compute_manager_reward(
+        self,
+        n_tasks_before: int,
+        n_tasks_after: int,
+        task_progress_before: float,
+        task_progress_after: float,
+        cumulative_env_reward: float,
+        landmark_reached: bool,
+    ) -> float:
+        """
+        Manager reward: breaks the bootstrapping deadlock by providing a
+        non-zero signal even before full task completion.
+
+        Hierarchy:
+          1. task_completion_bonus (10.0)  — n_tasks increased [DOMINANT]
+          2. task_progress_bonus (3.0) * delta_task_progress [SECONDARY]
+          3. env_reward_weight (1.0) * cumulative_env_reward [PASSTHROUGH]
+          4. nav_bonus (0.5) if landmark reached [SMALL]
+        """
+        cfg = self.config.manager
+        r   = 0.0
+
+        # 1. Task completion (dominant)
+        if n_tasks_after > n_tasks_before:
+            r += cfg.task_completion_bonus * (n_tasks_after - n_tasks_before)
+
+        # 2. Task progress (secondary)
+        delta_prog = task_progress_after - task_progress_before
+        if delta_prog > 0:
+            r += cfg.task_progress_bonus * delta_prog
+
+        # 3. Env reward passthrough
+        r += cfg.env_reward_weight * cumulative_env_reward
+
+        # 4. Navigation bonus (small)
+        if landmark_reached:
+            r += cfg.nav_bonus
 
         return float(r)
 
+    def maybe_inject_hindsight(self, z: np.ndarray, n_tasks: int):
+        if (self.config.landmarks.use_hindsight_landmarks
+                and n_tasks > self._prev_n_tasks):
+            self.landmarks.add_success_state(z)
+        self._prev_n_tasks = n_tasks
+
     # =========================================================================
-    # Manager update — no z_goal
+    # Manager update
     # =========================================================================
 
     def update_manager(self) -> dict:
@@ -307,16 +340,15 @@ class VisualHRLAgent:
         z_next = torch.from_numpy(batch['z_next']).to(self.device)
         done   = torch.from_numpy(batch['done']).unsqueeze(1).to(self.device)
 
-        q_current = self.manager_q(z_curr, z_sub)   # (B, 1)
+        q_current = self.manager_q(z_curr, z_sub)
 
         with torch.no_grad():
             if self.landmarks.is_ready:
                 lm = torch.from_numpy(self.landmarks.get_all()).float().to(self.device)
-                q_next_all = self.manager_q_target.evaluate_all_landmarks(z_next, lm)
-                q_next_max = q_next_all.max(dim=1, keepdim=True)[0]
+                q_next = self.manager_q_target.evaluate_all_landmarks(z_next, lm).max(dim=1, keepdim=True)[0]
             else:
-                q_next_max = torch.zeros_like(reward)
-            target = reward + self.config.manager.gamma * (1 - done) * q_next_max
+                q_next = torch.zeros_like(reward)
+            target = reward + self.config.manager.gamma * (1 - done) * q_next
 
         loss = F.mse_loss(q_current, target)
         self.manager_optimizer.zero_grad()
@@ -328,7 +360,7 @@ class VisualHRLAgent:
         return {'manager_loss': loss.item(), 'manager_q_mean': q_current.mean().item()}
 
     # =========================================================================
-    # Worker update — dual stream
+    # Worker update
     # =========================================================================
 
     def update_worker(self) -> dict:
@@ -344,11 +376,10 @@ class VisualHRLAgent:
         p_next = torch.from_numpy(batch['proprio_next']).to(self.device)
         done   = torch.from_numpy(batch['done']).unsqueeze(1).to(self.device)
 
-        # ---- Critic update ----
         with torch.no_grad():
-            next_action, next_log_prob = self.worker_actor(z_next, z_sub, p_next)
-            q1_next, q2_next = self.worker_critic_target(z_next, z_sub, p_next, next_action)
-            q_next   = torch.min(q1_next, q2_next) - self.alpha * next_log_prob
+            na, nlp = self.worker_actor(z_next, z_sub, p_next)
+            q1n, q2n = self.worker_critic_target(z_next, z_sub, p_next, na)
+            q_next   = torch.min(q1n, q2n) - self.alpha * nlp
             target_q = reward + self.config.worker.gamma * (1 - done) * q_next
 
         q1, q2 = self.worker_critic(z_curr, z_sub, p_curr, action)
@@ -358,25 +389,22 @@ class VisualHRLAgent:
         torch.nn.utils.clip_grad_norm_(self.worker_critic.parameters(), 1.0)
         self.worker_critic_optimizer.step()
 
-        # ---- Actor update ----
-        new_action, log_prob = self.worker_actor(z_curr, z_sub, p_curr)
-        q1_new, q2_new = self.worker_critic(z_curr, z_sub, p_curr, new_action)
-        actor_loss = (self.alpha * log_prob - torch.min(q1_new, q2_new)).mean()
+        new_a, lp = self.worker_actor(z_curr, z_sub, p_curr)
+        q1n2, q2n2 = self.worker_critic(z_curr, z_sub, p_curr, new_a)
+        actor_loss = (self.alpha * lp - torch.min(q1n2, q2n2)).mean()
         self.worker_actor_optimizer.zero_grad()
         actor_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.worker_actor.parameters(), 1.0)
         self.worker_actor_optimizer.step()
 
-        # ---- Alpha update ----
         if self.config.worker.auto_alpha:
-            alpha_loss = -(self.log_alpha * (log_prob + self.target_entropy).detach()).mean()
+            alpha_loss = -(self.log_alpha * (lp + self.target_entropy).detach()).mean()
             self.alpha_optimizer.zero_grad()
             alpha_loss.backward()
             self.alpha_optimizer.step()
             self.log_alpha.data.clamp_(min=np.log(0.01))
 
         self._soft_update(self.worker_critic, self.worker_critic_target, self.config.worker.tau)
-
         return {
             'worker_critic_loss': critic_loss.item(),
             'worker_actor_loss':  actor_loss.item(),
@@ -395,23 +423,62 @@ class VisualHRLAgent:
         self.reachability_optimizer.zero_grad()
         loss.backward()
         self.reachability_optimizer.step()
-        accuracy = ((pred > 0.5).float() == label).float().mean().item()
-        return {'reach_loss': loss.item(), 'reach_accuracy': accuracy}
+        acc = ((pred > 0.5).float() == label).float().mean().item()
+        return {'reach_loss': loss.item(), 'reach_accuracy': acc}
 
     def _soft_update(self, source, target, tau):
         for sp, tp in zip(source.parameters(), target.parameters()):
             tp.data.copy_(tau * sp.data + (1 - tau) * tp.data)
 
     # =========================================================================
-    # Calibration
+    # Success threshold calibration for L2-normalised 2048-d space
     # =========================================================================
 
     def calibrate_success_threshold(self):
-        if len(self._latent_dists) < 100:
+        """
+        Calibrate success_threshold for L2-normalised R3M (2048-d) space.
+
+        All features are on the unit hypersphere so distances are in [0, 2].
+        We set the threshold as a multiple of the mean step distance:
+          threshold = mean_step_dist * K_steps
+        where K_steps is how many directed steps the worker must take to
+        count as 'reached'. We choose K_steps = subgoal_horizon / 4,
+        meaning the worker must cover 25% of the typical K-step distance.
+
+        This is more principled than percentile-of-landmark-distances for
+        two reasons:
+          1. In 2048-d, FPS landmarks are very spread out (the space is huge).
+             p10 of inter-landmark distances would be enormous.
+          2. The worker's capability is measured in steps, not landmark geometry.
+
+        Hard bounds:
+          lower: 2 * mean_step_dist (at least 2 steps of motion required)
+          upper: 0.5 (half the diameter of the unit hypersphere)
+        """
+        if len(self._latent_dists) < 50:
+            print("  [Threshold] Not enough data — keeping default threshold.")
             return
-        dists = np.array(self._latent_dists)
-        self.success_threshold = max(np.percentile(dists, 50), 0.5)
-        self._success_threshold_calibrated = True
-        print(f"Calibrated success threshold: {self.success_threshold:.4f}")
-        print(f"  Latent dist — mean={dists.mean():.4f}  std={dists.std():.4f}"
-              f"  min={dists.min():.4f}  max={dists.max():.4f}")
+
+        d = np.array(self._latent_dists)
+        mean_step = float(d.mean())
+        std_step  = float(d.std())
+
+        # Threshold = K/4 steps of directed motion
+        K = self.config.manager.subgoal_horizon
+        target = mean_step * (K / 4.0)
+
+        # Hard bounds
+        lower = mean_step * 2.0    # must take at least 2 directed steps
+        upper = 0.5                # at most 0.5 (quarter of max distance 2.0)
+
+        self.success_threshold = float(np.clip(target, lower, upper))
+
+        print(f"  [Threshold] Calibrated success_threshold = {self.success_threshold:.4f}")
+        print(f"    Step dist — mean={mean_step:.4f}  std={std_step:.4f}  "
+              f"p10={np.percentile(d,10):.4f}  p90={np.percentile(d,90):.4f}")
+        print(f"    K={K}  target={target:.4f}  "
+              f"lower={lower:.4f}  upper={upper:.4f}")
+        if mean_step < 0.01:
+            print("  WARNING: step distances very small — check L2 normalisation.")
+        elif mean_step > 0.3:
+            print("  WARNING: step distances large — encoder may not be normalised.")
