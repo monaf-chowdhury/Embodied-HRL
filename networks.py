@@ -1,7 +1,8 @@
+from typing import Optional, Tuple
+
 import torch
 import torch.nn as nn
 from torch.distributions import Normal
-from typing import Tuple
 
 
 def build_mlp(input_dim: int, hidden_dim: int, output_dim: int, n_layers: int = 3) -> nn.Sequential:
@@ -15,47 +16,117 @@ def build_mlp(input_dim: int, hidden_dim: int, output_dim: int, n_layers: int = 
 
 
 class ManagerQNetwork(nn.Module):
-    def __init__(self, z_dim: int, n_tasks: int, hidden_dim: int = 512, n_layers: int = 3):
+    def __init__(self, z_dim: int, proprio_dim: int, n_tasks: int, task_lang_dim: int, task_goal_dim: int, hidden_dim: int = 384, n_layers: int = 3):
         super().__init__()
         self.n_tasks = n_tasks
-        self.net = build_mlp(2 * z_dim + n_tasks, hidden_dim, 1, n_layers)
+        self.state_stream = build_mlp(
+            z_dim + proprio_dim + 5 * n_tasks + (n_tasks + 1),
+            hidden_dim,
+            hidden_dim,
+            3,
+        )
+        token_dim = task_lang_dim + task_goal_dim + 6
+        self.score_net = build_mlp(hidden_dim + token_dim, hidden_dim, 1, n_layers)
 
-    def forward(self, z_current: torch.Tensor, z_landmark: torch.Tensor, task_onehot: torch.Tensor) -> torch.Tensor:
-        x = torch.cat([z_current, z_landmark, task_onehot], dim=-1)
-        return self.net(x)
+    def _prev_task_onehot(self, prev_task: torch.Tensor) -> torch.Tensor:
+        prev = torch.full((prev_task.shape[0], self.n_tasks + 1), 0.0, device=prev_task.device)
+        clamped = prev_task.long().clamp(min=-1, max=self.n_tasks - 1)
+        none_mask = clamped < 0
+        prev[none_mask, self.n_tasks] = 1.0
+        idx = (~none_mask).nonzero(as_tuple=False).flatten()
+        if len(idx) > 0:
+            prev[idx, clamped[idx]] = 1.0
+        return prev
 
-    def evaluate_all_landmarks(self, z_current: torch.Tensor, landmarks: torch.Tensor, task_onehots: torch.Tensor) -> torch.Tensor:
-        B, N = z_current.shape[0], landmarks.shape[0]
-        zc = z_current.unsqueeze(1).expand(B, N, -1)
-        lm = landmarks.unsqueeze(0).expand(B, N, -1)
-        to = task_onehots.unsqueeze(0).expand(B, N, -1)
-        x = torch.cat([zc, lm, to], dim=-1).reshape(B * N, -1)
-        return self.net(x).reshape(B, N)
+    def encode_state(
+        self,
+        z: torch.Tensor,
+        proprio: torch.Tensor,
+        progress: torch.Tensor,
+        errors: torch.Tensor,
+        completion: torch.Tensor,
+        remaining: torch.Tensor,
+        prototype_sims: torch.Tensor,
+        prev_task: torch.Tensor,
+    ) -> torch.Tensor:
+        prev_oh = self._prev_task_onehot(prev_task)
+        x = torch.cat([z, proprio, progress, errors, completion, remaining, prototype_sims, prev_oh], dim=-1)
+        return self.state_stream(x)
+
+    def evaluate_all_tasks(
+        self,
+        z: torch.Tensor,
+        proprio: torch.Tensor,
+        progress: torch.Tensor,
+        errors: torch.Tensor,
+        completion: torch.Tensor,
+        remaining: torch.Tensor,
+        prototype_sims: torch.Tensor,
+        prev_task: torch.Tensor,
+        task_lang: torch.Tensor,
+        task_goals: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        B = z.shape[0]
+        state_h = self.encode_state(z, proprio, progress, errors, completion, remaining, prototype_sims, prev_task)
+        per_task = torch.stack([
+            progress,
+            errors,
+            completion,
+            remaining,
+            prototype_sims,
+            (prev_task.unsqueeze(1) == torch.arange(self.n_tasks, device=z.device).view(1, -1)).float(),
+        ], dim=-1)
+        lang = task_lang.unsqueeze(0).expand(B, -1, -1)
+        goals = task_goals.unsqueeze(0).expand(B, -1, -1)
+        state_expand = state_h.unsqueeze(1).expand(B, self.n_tasks, -1)
+        token = torch.cat([lang, goals, per_task], dim=-1)
+        q = self.score_net(torch.cat([state_expand, token], dim=-1)).squeeze(-1)
+        if valid_mask is not None:
+            q = q.masked_fill(valid_mask <= 0.5, -1e9)
+        return q
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        proprio: torch.Tensor,
+        progress: torch.Tensor,
+        errors: torch.Tensor,
+        completion: torch.Tensor,
+        remaining: torch.Tensor,
+        prototype_sims: torch.Tensor,
+        prev_task: torch.Tensor,
+        task_lang: torch.Tensor,
+        task_goals: torch.Tensor,
+        task_id: torch.Tensor,
+    ) -> torch.Tensor:
+        q_all = self.evaluate_all_tasks(z, proprio, progress, errors, completion, remaining, prototype_sims, prev_task, task_lang, task_goals)
+        return q_all.gather(1, task_id.long().unsqueeze(1))
 
 
 LOG_STD_MIN = -20
 LOG_STD_MAX = 2
 
 
-class SACActorNetwork(nn.Module):
-    def __init__(self, z_dim: int, action_dim: int, n_tasks: int, hidden_dim: int = 384, n_layers: int = 3, proprio_dim: int = 59):
+class WorkerActorNetwork(nn.Module):
+    def __init__(self, z_dim: int, action_dim: int, n_tasks: int, task_lang_dim: int, task_goal_dim: int, proprio_dim: int = 59, hidden_dim: int = 384, n_layers: int = 3):
         super().__init__()
-        self.img_stream = build_mlp(2 * z_dim, hidden_dim, hidden_dim, 2)
-        self.proprio_stream = build_mlp(proprio_dim, hidden_dim // 2, hidden_dim // 2, 2)
-        self.task_stream = build_mlp(n_tasks, 32, 32, 2)
-        trunk_in = hidden_dim + hidden_dim // 2 + 32
-        self.trunk = build_mlp(trunk_in, hidden_dim, hidden_dim, max(n_layers - 1, 2))
+        self.visual = build_mlp(z_dim, hidden_dim, hidden_dim // 2, 2)
+        self.proprio = build_mlp(proprio_dim, hidden_dim // 2, hidden_dim // 2, 2)
+        cond_dim = task_lang_dim + 3 * task_goal_dim + 1 + n_tasks
+        self.cond = build_mlp(cond_dim, hidden_dim // 2, hidden_dim // 2, 2)
+        self.trunk = build_mlp(hidden_dim + hidden_dim // 2, hidden_dim, hidden_dim, max(n_layers - 1, 2))
         self.mean_head = nn.Linear(hidden_dim, action_dim)
         self.log_std_head = nn.Linear(hidden_dim, action_dim)
 
-    def _encode(self, z_current, z_subgoal, proprio, task_onehot):
-        img = self.img_stream(torch.cat([z_current, z_subgoal], dim=-1))
-        prop = self.proprio_stream(proprio)
-        task = self.task_stream(task_onehot)
-        return self.trunk(torch.cat([img, prop, task], dim=-1))
+    def _encode(self, z, proprio, task_lang, target, value, error_vec, progress, completion):
+        zv = self.visual(z)
+        pv = self.proprio(proprio)
+        cond = self.cond(torch.cat([task_lang, target, value, error_vec, progress.unsqueeze(-1), completion], dim=-1))
+        return self.trunk(torch.cat([zv, pv, cond], dim=-1))
 
-    def forward(self, z_current, z_subgoal, proprio, task_onehot) -> Tuple[torch.Tensor, torch.Tensor]:
-        h = self._encode(z_current, z_subgoal, proprio, task_onehot)
+    def forward(self, z, proprio, task_lang, target, value, error_vec, progress, completion) -> Tuple[torch.Tensor, torch.Tensor]:
+        h = self._encode(z, proprio, task_lang, target, value, error_vec, progress, completion)
         mean = self.mean_head(h)
         log_std = torch.clamp(self.log_std_head(h), LOG_STD_MIN, LOG_STD_MAX)
         std = log_std.exp()
@@ -66,26 +137,28 @@ class SACActorNetwork(nn.Module):
         log_prob -= torch.log(1 - action.pow(2) + 1e-6)
         return action, log_prob.sum(-1, keepdim=True)
 
-    def get_action_deterministic(self, z_current, z_subgoal, proprio, task_onehot):
-        h = self._encode(z_current, z_subgoal, proprio, task_onehot)
+    def get_action_deterministic(self, z, proprio, task_lang, target, value, error_vec, progress, completion):
+        h = self._encode(z, proprio, task_lang, target, value, error_vec, progress, completion)
         return torch.tanh(self.mean_head(h))
 
 
-class SACCriticNetwork(nn.Module):
-    def __init__(self, z_dim: int, action_dim: int, n_tasks: int, hidden_dim: int = 384, n_layers: int = 3, proprio_dim: int = 59):
+class WorkerCriticNetwork(nn.Module):
+    def __init__(self, z_dim: int, action_dim: int, n_tasks: int, task_lang_dim: int, task_goal_dim: int, proprio_dim: int = 59, hidden_dim: int = 384, n_layers: int = 3):
         super().__init__()
-        self.img_stream_1 = build_mlp(2 * z_dim, hidden_dim, hidden_dim, 2)
-        self.prop_stream_1 = build_mlp(proprio_dim, hidden_dim // 2, hidden_dim // 2, 2)
-        self.task_stream_1 = build_mlp(n_tasks, 32, 32, 2)
-        self.q1 = build_mlp(hidden_dim + hidden_dim // 2 + 32 + action_dim, hidden_dim, 1, n_layers)
+        cond_dim = task_lang_dim + 3 * task_goal_dim + 1 + n_tasks
 
-        self.img_stream_2 = build_mlp(2 * z_dim, hidden_dim, hidden_dim, 2)
-        self.prop_stream_2 = build_mlp(proprio_dim, hidden_dim // 2, hidden_dim // 2, 2)
-        self.task_stream_2 = build_mlp(n_tasks, 32, 32, 2)
-        self.q2 = build_mlp(hidden_dim + hidden_dim // 2 + 32 + action_dim, hidden_dim, 1, n_layers)
+        self.z1 = build_mlp(z_dim, hidden_dim, hidden_dim // 2, 2)
+        self.p1 = build_mlp(proprio_dim, hidden_dim // 2, hidden_dim // 2, 2)
+        self.c1 = build_mlp(cond_dim, hidden_dim // 2, hidden_dim // 2, 2)
+        self.q1 = build_mlp(hidden_dim + hidden_dim // 2 + action_dim, hidden_dim, 1, n_layers)
 
-    def forward(self, z_current, z_subgoal, proprio, task_onehot, action):
-        img = torch.cat([z_current, z_subgoal], dim=-1)
-        f1 = torch.cat([self.img_stream_1(img), self.prop_stream_1(proprio), self.task_stream_1(task_onehot), action], dim=-1)
-        f2 = torch.cat([self.img_stream_2(img), self.prop_stream_2(proprio), self.task_stream_2(task_onehot), action], dim=-1)
+        self.z2 = build_mlp(z_dim, hidden_dim, hidden_dim // 2, 2)
+        self.p2 = build_mlp(proprio_dim, hidden_dim // 2, hidden_dim // 2, 2)
+        self.c2 = build_mlp(cond_dim, hidden_dim // 2, hidden_dim // 2, 2)
+        self.q2 = build_mlp(hidden_dim + hidden_dim // 2 + action_dim, hidden_dim, 1, n_layers)
+
+    def forward(self, z, proprio, task_lang, target, value, error_vec, progress, completion, action):
+        cond = torch.cat([task_lang, target, value, error_vec, progress.unsqueeze(-1), completion], dim=-1)
+        f1 = torch.cat([self.z1(z), self.p1(proprio), self.c1(cond), action], dim=-1)
+        f2 = torch.cat([self.z2(z), self.p2(proprio), self.c2(cond), action], dim=-1)
         return self.q1(f1), self.q2(f2)

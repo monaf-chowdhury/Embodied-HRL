@@ -7,9 +7,9 @@ from config import EncoderConfig
 
 
 class VisualEncoder(nn.Module):
-    """Frozen visual backbone used directly as the latent space."""
+    """Frozen visual backbone used as semantic visual context."""
 
-    def __init__(self, config: EncoderConfig, device: str = "cuda"):
+    def __init__(self, config: EncoderConfig, device: str = 'cuda'):
         super().__init__()
         self.config = config
         self.device = device
@@ -18,12 +18,12 @@ class VisualEncoder(nn.Module):
             T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
 
-        if config.name == "r3m":
+        if config.name == 'r3m':
             self.backbone = self._load_r3m()
-        elif config.name == "dinov2":
+        elif config.name == 'dinov2':
             self.backbone = self._load_dinov2()
         else:
-            raise ValueError(f"Unknown encoder: {config.name}")
+            raise ValueError(f'Unknown encoder: {config.name}')
 
         if config.freeze:
             for p in self.backbone.parameters():
@@ -35,13 +35,14 @@ class VisualEncoder(nn.Module):
     def _load_r3m(self) -> nn.Module:
         try:
             from r3m import load_r3m
-            model = load_r3m("resnet50")
+            model = load_r3m('resnet50')
             model.eval()
             return model
-        except ImportError:
-            print("WARNING: R3M not installed. Using pretrained ResNet-50 as placeholder.")
+        except Exception:
+            print('WARNING: R3M not available. Falling back to torchvision ResNet-50 features.')
             import torchvision.models as models
-            resnet = models.resnet50(pretrained=True)
+            weights = models.ResNet50_Weights.IMAGENET1K_V2
+            resnet = models.resnet50(weights=weights)
             return nn.Sequential(*list(resnet.children())[:-1], nn.Flatten())
 
     def _load_dinov2(self) -> nn.Module:
@@ -51,12 +52,12 @@ class VisualEncoder(nn.Module):
 
     def encode_raw(self, images: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
-            if self.config.name == "r3m":
+            if self.config.name == 'r3m':
                 x = F.interpolate(images, size=(self.config.img_size, self.config.img_size), mode='bilinear', align_corners=False)
                 x = x * 255.0
                 feats = self.backbone(x)
                 if isinstance(feats, dict):
-                    feats = feats['embedding']
+                    feats = feats.get('embedding', next(iter(feats.values())))
                 if isinstance(feats, tuple):
                     feats = feats[0]
             else:

@@ -1,61 +1,109 @@
+from typing import Dict, Optional, Tuple
+
 import numpy as np
 import torch
 import torch.nn.functional as F
 
+from buffers import ManagerReplayBuffer, WorkerReplayBuffer
 from config import Config
 from encoder import VisualEncoder
-from landmarks import LandmarkBuffer
-from networks import ManagerQNetwork, SACActorNetwork, SACCriticNetwork
-from buffers import HighLevelBuffer, LowLevelBuffer
-
-_TASK_OBS_IDX = {
-    'bottom burner': (np.array([18, 19]),   np.array([-0.88, -0.01])),
-    'top burner':    (np.array([24, 25]),   np.array([-0.92, -0.01])),
-    'light switch':  (np.array([26, 27]),   np.array([-0.69, -0.05])),
-    'slide cabinet': (np.array([28]),       np.array([0.37])),
-    'hinge cabinet': (np.array([29, 30]),   np.array([0., 1.45])),
-    'microwave':     (np.array([31]),       np.array([-0.75])),
-    'kettle':        (np.array([32, 33, 34, 35, 36, 37, 38]),
-                      np.array([-0.23, 0.75, 1.62, 0.99, 0., 0., -0.06])),
-}
-
-
-def per_task_progress(proprio: np.ndarray, tasks: list[str]) -> np.ndarray:
-    vals = []
-    for task in tasks:
-        idx, goal = _TASK_OBS_IDX[task]
-        cur = proprio[idx]
-        dist = np.linalg.norm(cur - goal)
-        norm = np.linalg.norm(goal) + 1e-4
-        vals.append(max(0.0, 1.0 - dist / norm))
-    return np.asarray(vals, dtype=np.float32)
+from networks import ManagerQNetwork, WorkerActorNetwork, WorkerCriticNetwork
+from utils import (
+    MAX_TASK_GOAL_DIM,
+    all_task_goal_matrix,
+    build_demo_task_prototypes,
+    build_task_language_embeddings,
+    heuristic_task_choice,
+    newly_completed_count,
+    per_task_errors,
+    per_task_progress,
+    remaining_mask,
+    task_structured_vectors,
+    task_transition_completed,
+)
+# Avoid circular import at function definition time.
+from utils import task_success_tolerance as task_success_threshold
 
 
-class VisualHRLAgent:
+class TaskGroundedHRLAgent:
     def __init__(self, config: Config):
         self.config = config
         self.device = config.training.device
         self.tasks = config.training.tasks_to_complete
         self.n_tasks = len(self.tasks)
-        z_dim = config.encoder.raw_dim
-        action_dim = 9
+        self.z_dim = config.encoder.raw_dim
+        self.action_dim = 9
 
         self.encoder = VisualEncoder(config.encoder, device=self.device)
-        self.landmarks = LandmarkBuffer(
-            n_landmarks=config.landmarks.n_landmarks,
-            z_dim=z_dim,
-            landmark_config=config.landmarks,
-            task_names=self.tasks,
-        )
 
-        self.manager_q = ManagerQNetwork(z_dim, self.n_tasks, config.manager.hidden_dim, config.manager.n_layers).to(self.device)
-        self.manager_q_target = ManagerQNetwork(z_dim, self.n_tasks, config.manager.hidden_dim, config.manager.n_layers).to(self.device)
+        task_lang_np = build_task_language_embeddings(self.tasks, dim=config.semantic.task_language_dim)
+        task_goals_np = all_task_goal_matrix(self.tasks, max_dim=config.worker.task_goal_dim)
+        self.task_lang_np = task_lang_np.astype(np.float32)
+        self.task_goals_np = task_goals_np.astype(np.float32)
+        self.task_lang = torch.from_numpy(self.task_lang_np).float().to(self.device)
+        self.task_goals = torch.from_numpy(self.task_goals_np).float().to(self.device)
+
+        if config.semantic.use_demo_prototypes:
+            self.demo_prototypes = build_demo_task_prototypes(
+                gif_path=config.semantic.demo_gif_path,
+                encoder=self.encoder,
+                tasks=self.tasks,
+                max_frames=config.semantic.demo_max_frames,
+            )
+        else:
+            self.demo_prototypes = build_demo_task_prototypes('', self.encoder, [], 0)
+
+        self.manager_q = ManagerQNetwork(
+            z_dim=self.z_dim,
+            proprio_dim=config.worker.proprio_dim,
+            n_tasks=self.n_tasks,
+            task_lang_dim=config.semantic.task_language_dim,
+            task_goal_dim=config.worker.task_goal_dim,
+            hidden_dim=config.manager.hidden_dim,
+            n_layers=config.manager.n_layers,
+        ).to(self.device)
+        self.manager_q_target = ManagerQNetwork(
+            z_dim=self.z_dim,
+            proprio_dim=config.worker.proprio_dim,
+            n_tasks=self.n_tasks,
+            task_lang_dim=config.semantic.task_language_dim,
+            task_goal_dim=config.worker.task_goal_dim,
+            hidden_dim=config.manager.hidden_dim,
+            n_layers=config.manager.n_layers,
+        ).to(self.device)
         self.manager_q_target.load_state_dict(self.manager_q.state_dict())
         self.manager_optimizer = torch.optim.Adam(self.manager_q.parameters(), lr=config.manager.lr)
 
-        self.worker_actor = SACActorNetwork(z_dim, action_dim, self.n_tasks, config.worker.hidden_dim, config.worker.n_layers, config.worker.proprio_dim).to(self.device)
-        self.worker_critic = SACCriticNetwork(z_dim, action_dim, self.n_tasks, config.worker.hidden_dim, config.worker.n_layers, config.worker.proprio_dim).to(self.device)
-        self.worker_critic_target = SACCriticNetwork(z_dim, action_dim, self.n_tasks, config.worker.hidden_dim, config.worker.n_layers, config.worker.proprio_dim).to(self.device)
+        self.worker_actor = WorkerActorNetwork(
+            z_dim=self.z_dim,
+            action_dim=self.action_dim,
+            n_tasks=self.n_tasks,
+            task_lang_dim=config.semantic.task_language_dim,
+            task_goal_dim=config.worker.task_goal_dim,
+            proprio_dim=config.worker.proprio_dim,
+            hidden_dim=config.worker.hidden_dim,
+            n_layers=config.worker.n_layers,
+        ).to(self.device)
+        self.worker_critic = WorkerCriticNetwork(
+            z_dim=self.z_dim,
+            action_dim=self.action_dim,
+            n_tasks=self.n_tasks,
+            task_lang_dim=config.semantic.task_language_dim,
+            task_goal_dim=config.worker.task_goal_dim,
+            proprio_dim=config.worker.proprio_dim,
+            hidden_dim=config.worker.hidden_dim,
+            n_layers=config.worker.n_layers,
+        ).to(self.device)
+        self.worker_critic_target = WorkerCriticNetwork(
+            z_dim=self.z_dim,
+            action_dim=self.action_dim,
+            n_tasks=self.n_tasks,
+            task_lang_dim=config.semantic.task_language_dim,
+            task_goal_dim=config.worker.task_goal_dim,
+            proprio_dim=config.worker.proprio_dim,
+            hidden_dim=config.worker.hidden_dim,
+            n_layers=config.worker.n_layers,
+        ).to(self.device)
         self.worker_critic_target.load_state_dict(self.worker_critic.state_dict())
         self.worker_actor_optimizer = torch.optim.Adam(self.worker_actor.parameters(), lr=config.worker.actor_lr)
         self.worker_critic_optimizer = torch.optim.Adam(self.worker_critic.parameters(), lr=config.worker.critic_lr)
@@ -63,164 +111,288 @@ class VisualHRLAgent:
         if config.worker.auto_alpha:
             self.log_alpha = torch.tensor(np.log(config.worker.init_alpha), requires_grad=True, device=self.device)
             self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=config.worker.alpha_lr)
-            self.target_entropy = -action_dim
+            self.target_entropy = -self.action_dim
         else:
             self.log_alpha = torch.tensor(np.log(config.worker.init_alpha), device=self.device)
+            self.alpha_optimizer = None
+            self.target_entropy = -self.action_dim
 
         z_dtype = np.float16 if config.buffer.z_storage_dtype == 'float16' else np.float32
-        self.high_buffer = HighLevelBuffer(config.buffer.high_capacity, z_dim=z_dim, n_tasks=self.n_tasks, z_dtype=z_dtype)
-        self.low_buffer = LowLevelBuffer(config.buffer.capacity, z_dim=z_dim, action_dim=action_dim,
-                                         proprio_dim=config.worker.proprio_dim, n_tasks=self.n_tasks, z_dtype=z_dtype)
+        self.manager_buffer = ManagerReplayBuffer(
+            capacity=config.buffer.manager_capacity,
+            z_dim=self.z_dim,
+            proprio_dim=config.worker.proprio_dim,
+            n_tasks=self.n_tasks,
+            z_dtype=z_dtype,
+        )
+        self.worker_buffer = WorkerReplayBuffer(
+            capacity=config.buffer.worker_capacity,
+            z_dim=self.z_dim,
+            action_dim=self.action_dim,
+            proprio_dim=config.worker.proprio_dim,
+            n_tasks=self.n_tasks,
+            task_goal_dim=config.worker.task_goal_dim,
+            z_dtype=z_dtype,
+        )
 
         self.total_steps = 0
         self.total_episodes = 0
-        self.epsilon = config.manager.epsilon_start
-        self._latent_dists = []
-        self.success_threshold = 10.0
-        self._prev_n_tasks = 0
+        self.total_options = 0
+        self.manager_epsilon = config.manager.epsilon_start
 
     @property
     def alpha(self):
         return self.log_alpha.exp().detach()
 
-    def task_onehot(self, task_ids: np.ndarray | torch.Tensor):
-        if isinstance(task_ids, np.ndarray):
-            ids = torch.from_numpy(task_ids).long().to(self.device)
-        elif isinstance(task_ids, torch.Tensor):
-            ids = task_ids.long().to(self.device)
-        else:
-            ids = torch.tensor(task_ids, dtype=torch.long, device=self.device)
-        return F.one_hot(ids, num_classes=self.n_tasks).float()
+    def prototype_similarities(self, z_current: np.ndarray) -> np.ndarray:
+        sims = self.demo_prototypes.similarities(z_current)
+        if sims.size == 0:
+            return np.zeros(self.n_tasks, dtype=np.float32)
+        if len(sims) != self.n_tasks:
+            return np.zeros(self.n_tasks, dtype=np.float32)
+        return sims.astype(np.float32)
 
-    def choose_task_from_state(self, proprio: np.ndarray, incomplete_only: bool = False, completed_tasks=None) -> int:
-        candidate_tasks = self.tasks
-        if incomplete_only and completed_tasks is not None:
-            candidate_tasks = [t for t in self.tasks if t not in completed_tasks] or self.tasks
-        progresses = per_task_progress(proprio, candidate_tasks)
-        chosen_name = candidate_tasks[int(np.argmin(progresses))]
-        return self.tasks.index(chosen_name)
+    def build_manager_state(self, proprio: np.ndarray, completion_mask: np.ndarray, prev_task: int, z_current: Optional[np.ndarray] = None) -> Dict[str, np.ndarray]:
+        progress = per_task_progress(proprio, self.tasks)
+        errors = per_task_errors(proprio, self.tasks)
+        remain = remaining_mask(completion_mask)
+        sims = np.zeros(self.n_tasks, dtype=np.float32) if z_current is None else self.prototype_similarities(z_current)
+        return {
+            'progress': progress.astype(np.float32),
+            'errors': errors.astype(np.float32),
+            'completion': np.asarray(completion_mask, dtype=np.float32),
+            'remaining': remain.astype(np.float32),
+            'prototype_sims': sims.astype(np.float32),
+            'prev_task': int(prev_task),
+        }
 
-    def select_subgoal(self, z_current: np.ndarray) -> int:
-        if not self.landmarks.is_ready:
-            return 0
-        if np.random.random() < self.config.landmarks.explore_ratio:
-            return self.landmarks.select_explore()
-        if np.random.random() < self.epsilon:
-            return np.random.randint(0, self.landmarks.n_active)
-        with torch.no_grad():
-            zc = torch.from_numpy(z_current).float().unsqueeze(0).to(self.device)
-            lms = torch.from_numpy(self.landmarks.get_all()).float().to(self.device)
-            task_oh = self.task_onehot(self.landmarks.get_all_task_ids())
-            q = self.manager_q.evaluate_all_landmarks(zc, lms, task_oh)
-            return int(q.argmax(dim=1).item())
+    def current_worker_random_prob(self) -> float:
+        cfg = self.config.worker
+        frac = self.total_steps / max(cfg.random_action_prob_decay_steps, 1)
+        return float(max(cfg.random_action_prob_end, cfg.random_action_prob_start - (cfg.random_action_prob_start - cfg.random_action_prob_end) * frac))
 
-    def _update_epsilon(self):
+    def update_manager_epsilon(self):
         cfg = self.config.manager
         frac = self.total_steps / max(cfg.epsilon_decay_steps, 1)
-        self.epsilon = max(cfg.epsilon_end, cfg.epsilon_start - (cfg.epsilon_start - cfg.epsilon_end) * frac)
+        self.manager_epsilon = float(max(cfg.epsilon_end, cfg.epsilon_start - (cfg.epsilon_start - cfg.epsilon_end) * frac))
 
-    def get_worker_action(self, z_current: np.ndarray, z_subgoal: np.ndarray, proprio: np.ndarray, task_id: int, deterministic: bool = False) -> np.ndarray:
-        zc = torch.from_numpy(z_current).float().unsqueeze(0).to(self.device)
-        zs = torch.from_numpy(z_subgoal).float().unsqueeze(0).to(self.device)
-        p = torch.from_numpy(self.low_buffer.normalise_proprio(proprio)).float().unsqueeze(0).to(self.device)
-        t = self.task_onehot(np.array([task_id], dtype=np.int64))
+    def select_task(
+        self,
+        z_current: np.ndarray,
+        proprio: np.ndarray,
+        completion_mask: np.ndarray,
+        prev_task: int,
+        deterministic: bool = False,
+    ) -> int:
+        state = self.build_manager_state(proprio, completion_mask, prev_task, z_current=z_current)
+        remaining = state['remaining']
+        valid = np.where(remaining > 0.5)[0]
+        if len(valid) == 0:
+            return int(np.argmin(state['errors']))
+
+        if deterministic:
+            return self._greedy_manager_choice(z_current, proprio, state)
+
+        if self.total_steps < self.config.manager.bootstrap_uniform_steps:
+            if np.random.rand() < self.config.manager.heuristic_mix_prob:
+                return heuristic_task_choice(state['progress'], state['remaining'], state['prototype_sims'])
+            return int(np.random.choice(valid))
+
+        if np.random.rand() < self.manager_epsilon:
+            if np.random.rand() < self.config.manager.heuristic_mix_prob:
+                return heuristic_task_choice(state['progress'], state['remaining'], state['prototype_sims'])
+            return int(np.random.choice(valid))
+        return self._greedy_manager_choice(z_current, proprio, state)
+
+    def _greedy_manager_choice(self, z_current: np.ndarray, proprio: np.ndarray, state: Dict[str, np.ndarray]) -> int:
         with torch.no_grad():
+            z = torch.from_numpy(z_current).float().unsqueeze(0).to(self.device)
+            p = torch.from_numpy(self.manager_buffer.proprio_norm.normalize(proprio)).float().unsqueeze(0).to(self.device)
+            progress = torch.from_numpy(state['progress']).float().unsqueeze(0).to(self.device)
+            errors = torch.from_numpy(state['errors']).float().unsqueeze(0).to(self.device)
+            completion = torch.from_numpy(state['completion']).float().unsqueeze(0).to(self.device)
+            remain = torch.from_numpy(state['remaining']).float().unsqueeze(0).to(self.device)
+            sims = torch.from_numpy(state['prototype_sims']).float().unsqueeze(0).to(self.device)
+            prev_task = torch.tensor([state['prev_task']], dtype=torch.long, device=self.device)
+            q = self.manager_q.evaluate_all_tasks(
+                z, p, progress, errors, completion, remain, sims, prev_task, self.task_lang, self.task_goals, valid_mask=remain
+            )
+            return int(q.argmax(dim=1).item())
+
+    def get_worker_structured_inputs(self, proprio: np.ndarray, task_id: int) -> Dict[str, np.ndarray]:
+        task = self.tasks[task_id]
+        value, target, error_vec = task_structured_vectors(proprio, task, max_dim=self.config.worker.task_goal_dim)
+        progress = per_task_progress(proprio, [task])[0]
+        return {
+            'value': value.astype(np.float32),
+            'target': target.astype(np.float32),
+            'error_vec': error_vec.astype(np.float32),
+            'progress': np.float32(progress),
+        }
+
+    def select_worker_action(
+        self,
+        z_current: np.ndarray,
+        proprio: np.ndarray,
+        completion_mask: np.ndarray,
+        task_id: int,
+        deterministic: bool = False,
+        force_random: bool = False,
+    ) -> np.ndarray:
+        if force_random or self.total_steps < self.config.worker.bootstrap_random_action_steps or (not deterministic and np.random.rand() < self.current_worker_random_prob()):
+            return None
+        inputs = self.get_worker_structured_inputs(proprio, task_id)
+        with torch.no_grad():
+            z = torch.from_numpy(z_current).float().unsqueeze(0).to(self.device)
+            p = torch.from_numpy(self.worker_buffer.proprio_norm.normalize(proprio)).float().unsqueeze(0).to(self.device)
+            task_lang = self.task_lang[task_id].unsqueeze(0)
+            target = torch.from_numpy(inputs['target']).float().unsqueeze(0).to(self.device)
+            value = torch.from_numpy(inputs['value']).float().unsqueeze(0).to(self.device)
+            error_vec = torch.from_numpy(inputs['error_vec']).float().unsqueeze(0).to(self.device)
+            progress = torch.tensor([inputs['progress']], dtype=torch.float32, device=self.device)
+            completion = torch.from_numpy(completion_mask).float().unsqueeze(0).to(self.device)
             if deterministic:
-                a = self.worker_actor.get_action_deterministic(zc, zs, p, t)
+                a = self.worker_actor.get_action_deterministic(z, p, task_lang, target, value, error_vec, progress, completion)
             else:
-                a, _ = self.worker_actor(zc, zs, p, t)
-        return a.cpu().numpy().squeeze()
+                a, _ = self.worker_actor(z, p, task_lang, target, value, error_vec, progress, completion)
+        return a.cpu().numpy().squeeze().astype(np.float32)
 
-    def maybe_inject_hindsight(self, z_current: np.ndarray, n_tasks_completed: int, task_id: int):
-        if self.config.landmarks.use_hindsight_landmarks and n_tasks_completed > self._prev_n_tasks:
-            self.landmarks.add_success_state(z_current, task_id)
-        self._prev_n_tasks = n_tasks_completed
+    def compute_worker_reward(
+        self,
+        prev_proprio: np.ndarray,
+        next_proprio: np.ndarray,
+        task_id: int,
+        prev_completion: np.ndarray,
+        next_completion: np.ndarray,
+        env_reward: float,
+        action: np.ndarray,
+    ) -> Tuple[float, Dict[str, float]]:
+        cfg = self.config.worker
+        task = self.tasks[task_id]
+        prev_err = per_task_errors(prev_proprio, [task])[0]
+        next_err = per_task_errors(next_proprio, [task])[0]
+        prev_prog = per_task_progress(prev_proprio, [task])[0]
+        next_prog = per_task_progress(next_proprio, [task])[0]
+        delta_err = float(prev_err - next_err)
+        delta_prog = float(next_prog - prev_prog)
+        selected_completed = 1.0 if task_transition_completed(prev_completion, next_completion, task_id) else 0.0
 
-    def compute_worker_reward(self, z_t: np.ndarray, z_next: np.ndarray, z_subgoal: np.ndarray,
-                              sparse_reward: float, task_deltas: np.ndarray, task_id: int,
-                              task_completed_delta: int, initial_dist: float | None = None) -> float:
-        cfg = self.config.reward
-        r = cfg.sparse_weight * sparse_reward
-        r += cfg.selected_task_progress_weight * float(task_deltas[task_id])
-        r += cfg.any_task_progress_weight * float(np.maximum(task_deltas, 0.0).sum())
-        r += cfg.completion_bonus * float(task_completed_delta)
-        dist_before = np.linalg.norm(z_t - z_subgoal)
-        dist_after = np.linalg.norm(z_next - z_subgoal)
-        delta_lat = dist_before - dist_after
-        denom = max(initial_dist if initial_dist is not None else dist_before, dist_before, 1e-6)
-        r += cfg.latent_weight * max(delta_lat / denom, -1.0)
-        return float(r)
+        regression = 0.0
+        if prev_completion is not None:
+            completed_ids = np.where(np.asarray(prev_completion) > 0.5)[0]
+            for j in completed_ids:
+                if j == task_id:
+                    continue
+                before = per_task_errors(prev_proprio, [self.tasks[j]])[0]
+                after = per_task_errors(next_proprio, [self.tasks[j]])[0]
+                regression += max(0.0, float(after - before))
 
-    def compute_manager_reward(self, start_progress: np.ndarray, end_progress: np.ndarray,
-                               selected_task_id: int, tasks_completed_delta: int,
-                               cumulative_env_reward: float, subgoal_reached: bool,
-                               start_dist: float, end_dist: float) -> float:
-        cfg = self.config.manager
-        delta = end_progress - start_progress
-        latent_progress = (start_dist - end_dist) / max(start_dist, 1e-6)
         reward = 0.0
-        reward += cfg.completion_bonus * float(tasks_completed_delta)
-        reward += cfg.selected_task_progress_weight * float(delta[selected_task_id])
-        reward += cfg.any_task_progress_weight * float(np.maximum(delta, 0.0).sum())
-        reward += cfg.env_reward_weight * float(cumulative_env_reward)
-        reward += cfg.latent_progress_weight * float(max(latent_progress, -1.0))
-        if subgoal_reached:
-            reward += cfg.reach_bonus
-        return float(reward)
+        reward += cfg.reward_error_reduction * delta_err
+        reward += cfg.reward_progress_gain * delta_prog
+        reward += cfg.reward_completion_bonus * selected_completed
+        reward -= cfg.reward_regression_penalty * regression
+        reward -= cfg.reward_action_penalty * float(np.square(action).mean())
+        reward += cfg.reward_env_weight * float(env_reward)
 
-    def update_manager(self) -> dict:
-        if len(self.high_buffer) < self.config.buffer.batch_size:
-            return {}
-        b = self.high_buffer.sample(self.config.buffer.batch_size)
-        zc = torch.from_numpy(b['z_current']).to(self.device)
-        zs = torch.from_numpy(b['z_subgoal']).to(self.device)
-        r = torch.from_numpy(b['reward']).unsqueeze(1).to(self.device)
-        zn = torch.from_numpy(b['z_next']).to(self.device)
-        d = torch.from_numpy(b['done']).unsqueeze(1).to(self.device)
-        t = self.task_onehot(b['task_id'])
-        q = self.manager_q(zc, zs, t)
-        with torch.no_grad():
-            lms = torch.from_numpy(self.landmarks.get_all()).float().to(self.device)
-            task_oh = self.task_onehot(self.landmarks.get_all_task_ids())
-            q_next = self.manager_q_target.evaluate_all_landmarks(zn, lms, task_oh).max(dim=1, keepdim=True)[0]
-            target = r + self.config.manager.gamma * (1 - d) * q_next
-        loss = F.mse_loss(q, target)
-        self.manager_optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.manager_q.parameters(), 1.0)
-        self.manager_optimizer.step()
-        self._soft_update(self.manager_q, self.manager_q_target, self.config.manager.tau)
-        return {'manager_loss': float(loss.item()), 'manager_q_mean': float(q.mean().item())}
+        stats = {
+            'delta_err': delta_err,
+            'delta_prog': delta_prog,
+            'selected_completed': selected_completed,
+            'regression': regression,
+            'next_err': float(next_err),
+        }
+        return float(reward), stats
 
-    def update_worker(self) -> dict:
-        if len(self.low_buffer) < self.config.buffer.batch_size:
+    def compute_manager_reward(
+        self,
+        start_proprio: np.ndarray,
+        end_proprio: np.ndarray,
+        task_id: int,
+        start_completion: np.ndarray,
+        end_completion: np.ndarray,
+        option_steps: int,
+    ) -> Tuple[float, Dict[str, float]]:
+        cfg = self.config.manager
+        task = self.tasks[task_id]
+        start_err = per_task_errors(start_proprio, [task])[0]
+        end_err = per_task_errors(end_proprio, [task])[0]
+        start_prog = per_task_progress(start_proprio, [task])[0]
+        end_prog = per_task_progress(end_proprio, [task])[0]
+        completion_gain = newly_completed_count(start_completion, end_completion)
+        selected_completed = 1.0 if task_transition_completed(start_completion, end_completion, task_id) else 0.0
+        regression = 0.0
+        completed_ids = np.where(np.asarray(start_completion) > 0.5)[0]
+        for j in completed_ids:
+            if j == task_id:
+                continue
+            before = per_task_errors(start_proprio, [self.tasks[j]])[0]
+            after = per_task_errors(end_proprio, [self.tasks[j]])[0]
+            regression += max(0.0, float(after - before))
+
+        delta_err = float(start_err - end_err)
+        delta_prog = float(end_prog - start_prog)
+        reward = 0.0
+        reward += cfg.reward_completion_bonus * completion_gain
+        reward += cfg.reward_selected_error_reduction * delta_err
+        reward += cfg.reward_selected_progress_gain * delta_prog
+        reward -= cfg.reward_regression_penalty * regression
+        reward -= cfg.reward_efficiency_penalty * (option_steps / max(cfg.option_horizon, 1))
+
+        stats = {
+            'delta_err': delta_err,
+            'delta_prog': delta_prog,
+            'completion_gain': float(completion_gain),
+            'selected_completed': selected_completed,
+            'regression': regression,
+            'end_err': float(end_err),
+        }
+        return float(reward), stats
+
+    def option_success(self, task_id: int, prev_completion: np.ndarray, next_completion: np.ndarray, task_error: float, hold_count: int) -> bool:
+        task_name = self.tasks[task_id]
+        if task_transition_completed(prev_completion, next_completion, task_id):
+            return True
+        return task_error <= task_success_threshold(task_name) and hold_count >= self.config.worker.success_hold_steps
+
+    def update_worker(self) -> Dict[str, float]:
+        if len(self.worker_buffer) < self.config.buffer.batch_size:
             return {}
-        b = self.low_buffer.sample(self.config.buffer.batch_size)
-        zc = torch.from_numpy(b['z_current']).to(self.device)
+        b = self.worker_buffer.sample(self.config.buffer.batch_size)
+        z = torch.from_numpy(b['z']).to(self.device)
         p = torch.from_numpy(b['proprio']).to(self.device)
-        zs = torch.from_numpy(b['z_subgoal']).to(self.device)
-        t = self.task_onehot(b['task_id'])
-        a = torch.from_numpy(b['action']).to(self.device)
-        r = torch.from_numpy(b['reward']).unsqueeze(1).to(self.device)
-        zn = torch.from_numpy(b['z_next']).to(self.device)
-        pn = torch.from_numpy(b['proprio_next']).to(self.device)
-        d = torch.from_numpy(b['done']).unsqueeze(1).to(self.device)
+        task_id = torch.from_numpy(b['task_id']).long().to(self.device)
+        task_lang = self.task_lang[task_id]
+        target = torch.from_numpy(b['target']).to(self.device)
+        value = torch.from_numpy(b['value']).to(self.device)
+        error_vec = torch.from_numpy(b['error_vec']).to(self.device)
+        progress = torch.from_numpy(b['progress']).to(self.device)
+        completion = torch.from_numpy(b['completion']).to(self.device)
+        action = torch.from_numpy(b['action']).to(self.device)
+        reward = torch.from_numpy(b['reward']).unsqueeze(1).to(self.device)
+        next_z = torch.from_numpy(b['next_z']).to(self.device)
+        next_p = torch.from_numpy(b['next_proprio']).to(self.device)
+        next_value = torch.from_numpy(b['next_value']).to(self.device)
+        next_error_vec = torch.from_numpy(b['next_error_vec']).to(self.device)
+        next_progress = torch.from_numpy(b['next_progress']).to(self.device)
+        next_completion = torch.from_numpy(b['next_completion']).to(self.device)
+        done = torch.from_numpy(b['done']).unsqueeze(1).to(self.device)
 
         with torch.no_grad():
-            next_a, next_logp = self.worker_actor(zn, zs, pn, t)
-            q1n, q2n = self.worker_critic_target(zn, zs, pn, t, next_a)
-            qn = torch.min(q1n, q2n) - self.alpha * next_logp
-            target_q = r + self.config.worker.gamma * (1 - d) * qn
+            next_action, next_logp = self.worker_actor(next_z, next_p, task_lang, target, next_value, next_error_vec, next_progress, next_completion)
+            q1n, q2n = self.worker_critic_target(next_z, next_p, task_lang, target, next_value, next_error_vec, next_progress, next_completion, next_action)
+            q_next = torch.min(q1n, q2n) - self.alpha * next_logp
+            target_q = reward + self.config.worker.gamma * (1 - done) * q_next
 
-        q1, q2 = self.worker_critic(zc, zs, p, t, a)
+        q1, q2 = self.worker_critic(z, p, task_lang, target, value, error_vec, progress, completion, action)
         critic_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
         self.worker_critic_optimizer.zero_grad()
         critic_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.worker_critic.parameters(), 1.0)
         self.worker_critic_optimizer.step()
 
-        new_a, logp = self.worker_actor(zc, zs, p, t)
-        q1a, q2a = self.worker_critic(zc, zs, p, t, new_a)
+        new_action, logp = self.worker_actor(z, p, task_lang, target, value, error_vec, progress, completion)
+        q1a, q2a = self.worker_critic(z, p, task_lang, target, value, error_vec, progress, completion, new_action)
         actor_loss = (self.alpha * logp - torch.min(q1a, q2a)).mean()
         self.worker_actor_optimizer.zero_grad()
         actor_loss.backward()
@@ -241,28 +413,53 @@ class VisualHRLAgent:
             'worker_alpha': float(self.alpha.item()),
         }
 
-    def _soft_update(self, source, target, tau):
+    def update_manager(self) -> Dict[str, float]:
+        if len(self.manager_buffer) < self.config.buffer.batch_size:
+            return {}
+        b = self.manager_buffer.sample(self.config.buffer.batch_size)
+        z = torch.from_numpy(b['z']).to(self.device)
+        p = torch.from_numpy(b['proprio']).to(self.device)
+        progress = torch.from_numpy(b['progress']).to(self.device)
+        errors = torch.from_numpy(b['errors']).to(self.device)
+        completion = torch.from_numpy(b['completion']).to(self.device)
+        remain = torch.from_numpy(b['remaining']).to(self.device)
+        sims = torch.from_numpy(b['prototype_sims']).to(self.device)
+        prev_task = torch.from_numpy(b['prev_task']).long().to(self.device)
+        task_id = torch.from_numpy(b['task_id']).long().to(self.device)
+        reward = torch.from_numpy(b['reward']).unsqueeze(1).to(self.device)
+        next_z = torch.from_numpy(b['next_z']).to(self.device)
+        next_p = torch.from_numpy(b['next_proprio']).to(self.device)
+        next_progress = torch.from_numpy(b['next_progress']).to(self.device)
+        next_errors = torch.from_numpy(b['next_errors']).to(self.device)
+        next_completion = torch.from_numpy(b['next_completion']).to(self.device)
+        next_remain = torch.from_numpy(b['next_remaining']).to(self.device)
+        next_sims = torch.from_numpy(b['next_prototype_sims']).to(self.device)
+        done = torch.from_numpy(b['done']).unsqueeze(1).to(self.device)
+
+        q = self.manager_q(z, p, progress, errors, completion, remain, sims, prev_task, self.task_lang, self.task_goals, task_id)
+        with torch.no_grad():
+            next_prev_task = task_id
+            q_next_all = self.manager_q_target.evaluate_all_tasks(
+                next_z, next_p, next_progress, next_errors, next_completion, next_remain, next_sims, next_prev_task, self.task_lang, self.task_goals, valid_mask=next_remain,
+            )
+            has_valid = (next_remain.sum(dim=1, keepdim=True) > 0.5).float()
+            q_next = q_next_all.max(dim=1, keepdim=True)[0] * has_valid
+            target = reward + self.config.manager.gamma * (1 - done) * q_next
+
+        loss = F.mse_loss(q, target)
+        self.manager_optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.manager_q.parameters(), 1.0)
+        self.manager_optimizer.step()
+        self._soft_update(self.manager_q, self.manager_q_target, self.config.manager.tau)
+        return {
+            'manager_loss': float(loss.item()),
+            'manager_q_mean': float(q.mean().item()),
+        }
+
+    def _soft_update(self, source, target, tau: float):
         for sp, tp in zip(source.parameters(), target.parameters()):
             tp.data.copy_(tau * sp.data + (1 - tau) * tp.data)
 
-    def calibrate_success_threshold(self):
-        if not self.landmarks.is_ready:
-            return
-        lm = self.landmarks.get_all()
-        if len(lm) < 2:
-            return
-        pairwise = np.linalg.norm(lm[:, None, :] - lm[None, :, :], axis=-1)
-        np.fill_diagonal(pairwise, np.inf)
-        nn_dists = pairwise.min(axis=1)
-        step_mean = float(np.mean(self._latent_dists)) if self._latent_dists else 0.0
-        target = np.percentile(nn_dists, 10) * 0.35
-        lower = max(step_mean * 1.5, 1e-3)
-        upper = np.percentile(nn_dists, 50) * 0.75
-        self.success_threshold = float(np.clip(target, lower, upper))
-        print(f"Calibrated success threshold: {self.success_threshold:.4f}")
-        print(f"  NN landmark dist — p10={np.percentile(nn_dists, 10):.4f}  median={np.percentile(nn_dists, 50):.4f}  mean={nn_dists.mean():.4f}")
-        if self._latent_dists:
-            sd = np.asarray(self._latent_dists)
-            print(f"  Step dist        — mean={sd.mean():.4f}  std={sd.std():.4f}  min={sd.min():.4f}  max={sd.max():.4f}")
-            if not (1.0 <= sd.mean() <= 20.0):
-                print("  [Check] Raw R3M step distance mean is outside the requested 1-20 range. Calibration still adapts, but inspect videos and threshold logs.")
+
+
