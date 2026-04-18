@@ -4,45 +4,94 @@
 
 ## What This Is
 
-A minimal viable implementation of image-based Hierarchical Reinforcement Learning
-for long-horizon manipulation. The system:
+### SMGW — Semantic Manager, Grounded Worker
 
-## File Structure
+Pivot from latent-landmark HRL to a semantically-structured hierarchy for
+FrankaKitchen-v1. The design decisions and why-each-file-exists reasoning are
+discussed in the conversation that produced this codebase; this README is a
+quick operational reference.
+
+## File layout
 
 ```
-hrl_visual_manipulation/
-├── setup.sh          # Environment setup script (conda/pip)
-├── config.py         # All hyperparameters in one place
-├── encoder.py        # Frozen R3M + projection head
-├── env_wrapper.py    # Franka Kitchen image wrapper + hierarchical protocol
-├── landmarks.py      # FPS landmark buffer with visit tracking
-├── networks.py       # Manager (DQN), Worker (SAC), Reachability predictor
-├── buffers.py        # FER buffer (manager), standard buffer (worker), reachability buffer
-├── train.py          # Main training loop
-└── README.md         # This file
+smgw/
+├── config.py         # Dataclass config; action-chunk toggle is worker.action_chunk_len
+├── task_spec.py      # SINGLE source of truth: per-task indices, goals, ε, text embeds
+├── env_wrapper.py    # FrankaKitchen-v1 image wrapper; reset() returns (img, state)
+├── encoder.py        # Frozen R3M / DINOv2 visual backbone (context only, not subgoal)
+├── networks.py       # SemanticManager (mask-aware Q) + GroundedWorker (FiLM + chunks)
+├── buffers.py        # ManagerBuffer (option transitions) + WorkerBuffer (chunk tx)
+├── agent.py          # SMGWAgent: option execution, task-grounded rewards, updates
+├── warmup.py         # Stage A: task-grounded probes + BC on worker + CE on manager
+├── evaluator.py      # Deterministic eval with video recording
+├── train.py          # Main loop: Stage A → Stage B + checkpoints + videos
+├── plots.py          # TensorBoard → PNG diagnostics
+└── utils.py          # save_video, formatters
 ```
+
+
+## Quickstart
+
+```bash
+# Default run (single-step worker, R3M encoder, ~1M env steps)
+python train.py --seed 42 --log_dir logs/smgw_baseline
+
+# Action-chunk ablation (π0-style chunks of length 4)
+python train.py --action_chunk 4 --log_dir logs/smgw_chunk4
+
+# Skip demo GIF loading (demo is context-only, safe to skip)
+python train.py --no_warmup_demo --log_dir logs/smgw_nodemo
+
+# Generate plots
+python plots.py --log_dir logs/smgw_baseline
+python plots.py --log_dir logs/ --compare    # overlay subdirs as separate runs
+```
+
+
+## What each component optimises
+
+| Component | Input | Output | Objective |
+|---|---|---|---|
+| SemanticManager | `(z, proprio, task_state, completion_mask, text_embeds)` | Q-values over 4 tasks with completed-task logits masked to −∞ | DQN TD on `option_return = 10·(#new completions) + shaping·Δerr − cost + 20·all_done_bonus` |
+| GroundedWorker (actor) | `(z, proprio, padded_cur, padded_goal, mask, text_embed[k])` | Tanh-squashed Gaussian over `H_chunk × 9` dims | SAC on `r = 5·Δtask_err + 5·completion_bit − 0.005·‖a‖² − 0.1·failure` |
+
+**The invariant that makes this work:** every reward and every termination
+criterion is a function of benchmark completion bits or task-space errors.
+Zero latent distances. Training signal = evaluation signal by construction.
+
+## Headline metric
+
+`eval/full_task_success_rate` — fraction of eval episodes where all 4 tasks
+completed. This is the chaining metric the old codebase could not move; the
+whole point of this redesign is to move it.
+
+## Key knobs you might want to sweep
+
+- `worker.action_chunk_len` — 1 vs 4 vs 8. Primary ablation.
+- `manager.subgoal_horizon` — option budget K. Default 40; try 60 if the
+  worker needs more steps per task.
+- `worker.progress_weight` vs `worker.completion_bonus` — relative strength of
+  dense shaping vs terminal bonus. Raise completion_bonus if the worker
+  hovers at medium error without closing.
+- `manager.option_cost` — raise to 0.1 if the manager is running too many
+  wasted options before completing the episode.
+
+## Residual caveats
+
+1. Probe transitions written to the worker buffer during Stage A use `done=1.0,
+   reward=0` — they are cold-start anchors, not real data. If the critic
+   seems pessimistic early, delete the probe-injection loop in
+   `run_stage_a_warmup`; BC still works.
+2. Chunked mode stores full `H×9` action tensors even when the chunk
+   terminated early (e.g. task completed on step 2 of a 4-step chunk). For
+   `H=1` this is a no-op; for `H≥4` it is a small bias in the critic.
+3. The env wrapper assumes `info['episode_task_completions']` contains
+   exactly the task names in our `tasks_to_complete` list. If that mapping
+   breaks, the completion mask stays zero — print the info dict on first
+   completion to verify.
+
 
 --- 
-
-## Key Design Decisions
-
-### Why L2 delta-progress, not temporal distance?
-L2 in frozen latent space is stable and well-calibrated. Temporal distance predictors
-can drift and be gamed. We use L2 as the default and temporal distance as an optional
-ablation (to be added later).
-
-### Ablations to Run (for the paper)
-
-1. Later: **+ DPO manager** vs **Q-learning manager**
-2. Later: **+ temporal distance** vs **L2 distance** shaping
-
-## Known Limitations / TODOs
-
-- [ ] No DPO for manager yet (this is the Q-learning baseline). Add as ablation.
-- [ ] No temporal distance predictor yet. Add as ablation.
-- [ ] No `real-robot` validation.
-
----
 
 ## Embodied-HRL: Setup Guide (FrankaKitchen-v1)
 
@@ -52,16 +101,6 @@ ablation (to be added later).
 
 ---
 
-## Why v1 instead of v0?
-
-| | v0 (D4RL) | v1 (gymnasium-robotics) |
-|---|---|---|
-| Install | Painful — mujoco_py, gym conflicts, XML errors | Clean — one pip command |
-| Step API | 4-value (old) | 5-value (modern gymnasium) |
-| Task info | Manual reward parsing | `info['episode_task_completions']` built-in |
-| Camera | Only 2 bad cameras | Proper `render_mode='rgb_array'` API |
-| Maintained | No | Yes |
-| Offline dataset | Yes (D4RL) | No (not needed for online HRL) |
 
 ---
 
@@ -174,7 +213,10 @@ pip install \
     matplotlib==3.9.2 \
     tensorboard==2.17.1 \
     tqdm==4.66.5 \
-    scikit-learn==1.5.1
+    scikit-learn==1.5.1 \
+    timm==0.9.10 \
+    tokenizers==0.19.1 \
+    transformers==4.40.1
 ```
 
 ---

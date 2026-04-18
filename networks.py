@@ -1,171 +1,326 @@
 """
-Neural network modules.
+networks.py — Neural architectures for SMGW.
 
-Changes from previous version:
-  - All z_dim inputs are now 2048 (raw R3M). Networks compress internally.
-  - ManagerQNetwork: input = 2*2048 = 4096. First layer compresses to hidden_dim.
-  - SACActorNetwork / SACCriticNetwork: image streams compress 2*2048 → 256,
-    proprio stream compresses 59 → 64. Merge dim = 320.
-  - hidden_dim defaults raised to 512 throughout.
-  - ReachabilityPredictor kept but disabled via config.
+Two models:
+
+  * SemanticManager  : maps (z, proprio, task-state, completion-mask, task-embeds)
+                       to a Q-value per task. At action time we mask the
+                       logits of already-completed tasks so the manager is
+                       STRUCTURALLY unable to re-pick a finished task.
+
+  * GroundedWorker   : SAC actor/critic conditioned on the chosen task via
+                       FiLM over a frozen text embedding + a compact task
+                       target vector (padded goal slice from task_spec).
+                       Optionally outputs an action chunk of length H_chunk.
+
+Design choices worth flagging in review:
+
+  - The worker's subgoal input is the BENCHMARK'S OWN GOAL (padded to
+    max_goal_dim). There is NO latent subgoal anywhere in these networks.
+  - The image latent z is still a context channel, because what's on screen
+    (e.g., where the kettle currently sits) carries information that the
+    indexed task-state slice alone may miss for non-selected tasks.
+  - Action chunks use a single head that emits H_chunk * action_dim outputs,
+    with per-step log_std. The chunk is executed open-loop by the env
+    runner; the next policy query happens after the chunk ends.
 """
+from __future__ import annotations
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
-import numpy as np
-from typing import Tuple
+from typing import Tuple, Optional
 
 
-def build_mlp(input_dim, hidden_dim, output_dim, n_layers=3):
-    layers = []
+# =============================================================================
+# Small helpers
+# =============================================================================
+
+def build_mlp(input_dim: int, hidden_dim: int, output_dim: int,
+              n_layers: int = 3, use_layernorm: bool = True) -> nn.Sequential:
+    assert n_layers >= 2, "MLP needs at least 2 linear layers"
     dims = [input_dim] + [hidden_dim] * (n_layers - 1) + [output_dim]
+    layers = []
     for i in range(len(dims) - 1):
         layers.append(nn.Linear(dims[i], dims[i + 1]))
         if i < len(dims) - 2:
-            layers.append(nn.LayerNorm(dims[i + 1]))
+            if use_layernorm:
+                layers.append(nn.LayerNorm(dims[i + 1]))
             layers.append(nn.ReLU())
     return nn.Sequential(*layers)
 
 
+class FiLMLayer(nn.Module):
+    """
+    Feature-wise Linear Modulation: given a conditioning vector c,
+    produce (gamma, beta) and apply gamma * h + beta to features h.
+    Used to inject task identity into worker features.
+    """
+    def __init__(self, cond_dim: int, feat_dim: int):
+        super().__init__()
+        self.gamma = nn.Linear(cond_dim, feat_dim)
+        self.beta = nn.Linear(cond_dim, feat_dim)
+        # Initialise so FiLM starts close to identity
+        nn.init.zeros_(self.gamma.weight); nn.init.ones_(self.gamma.bias)
+        nn.init.zeros_(self.beta.weight);  nn.init.zeros_(self.beta.bias)
+
+    def forward(self, feats: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        return self.gamma(cond) * feats + self.beta(cond)
+
+
 # =============================================================================
-# Manager Q-Network
-# Input: [z_current (2048), z_landmark (2048)] = 4096
+# Semantic Manager
 # =============================================================================
 
-class ManagerQNetwork(nn.Module):
-    def __init__(self, z_dim: int, hidden_dim: int = 512, n_layers: int = 3):
+class SemanticManager(nn.Module):
+    """
+    Q-function over the N_tasks discrete action space.
+
+    Inputs (all per-batch):
+      z              : (B, z_dim)          image latent (context)
+      proprio        : (B, P)              full 59-d state (context)
+      task_state     : (B, n_tasks * max_goal_dim)   flattened per-task slices
+      completion     : (B, n_tasks)        binary completion mask
+      task_embeds    : (n_tasks, d_text)   FROZEN text embeds (shared, not per-batch)
+
+    Output:
+      q_values       : (B, n_tasks)        Q-values per task; apply
+                                           completion mask at ACTION time
+                                           by setting q[:, k] = -inf where
+                                           completion[:, k] == 1.
+
+    Why we concatenate task_embeds into the manager's hidden representation
+    rather than using them as FiLM conditioning: the manager's OUTPUT is
+    already indexed per-task (one Q-value per task), so we just need the
+    embeddings to differentiate tasks in the head. We tile and concat.
+    """
+
+    MASK_FILL = -1e9  # used to mask completed tasks
+
+    def __init__(self,
+                 z_dim: int,
+                 proprio_dim: int,
+                 n_tasks: int,
+                 max_goal_dim: int,
+                 text_embed_dim: int,
+                 hidden_dim: int = 256,
+                 n_layers: int = 3):
         super().__init__()
-        # First compress the large input before the MLP
-        self.input_compress = nn.Sequential(
-            nn.Linear(2 * z_dim, hidden_dim),
+        self.n_tasks = n_tasks
+        self.max_goal_dim = max_goal_dim
+
+        task_state_dim = n_tasks * max_goal_dim
+
+        # Torso: maps (z, proprio, task_state, completion) -> a shared hidden
+        in_dim = z_dim + proprio_dim + task_state_dim + n_tasks
+        self.torso = build_mlp(in_dim, hidden_dim, hidden_dim, n_layers)
+
+        # Per-task head: concat(torso_out, text_embed_k) -> scalar Q
+        self.head = build_mlp(hidden_dim + text_embed_dim, hidden_dim, 1,
+                              n_layers=2)
+
+    def forward(self,
+                z: torch.Tensor,
+                proprio: torch.Tensor,
+                task_state: torch.Tensor,
+                completion: torch.Tensor,
+                task_embeds: torch.Tensor) -> torch.Tensor:
+        """Return Q-values (B, n_tasks) UNMASKED (caller masks)."""
+        B = z.shape[0]
+        x = torch.cat([z, proprio, task_state, completion], dim=-1)
+        h = self.torso(x)                                    # (B, H)
+
+        # Broadcast torso output over tasks, concat per-task text embedding
+        h_exp = h.unsqueeze(1).expand(B, self.n_tasks, h.shape[-1])
+        t_exp = task_embeds.unsqueeze(0).expand(B, self.n_tasks,
+                                                task_embeds.shape[-1])
+        head_in = torch.cat([h_exp, t_exp], dim=-1)          # (B, K, H+d_text)
+        head_in = head_in.reshape(B * self.n_tasks, -1)
+        q = self.head(head_in).reshape(B, self.n_tasks)      # (B, K)
+        return q
+
+    def q_masked(self,
+                 z: torch.Tensor,
+                 proprio: torch.Tensor,
+                 task_state: torch.Tensor,
+                 completion: torch.Tensor,
+                 task_embeds: torch.Tensor) -> torch.Tensor:
+        """Q-values with completed tasks set to -inf for argmax."""
+        q = self.forward(z, proprio, task_state, completion, task_embeds)
+        q = q.masked_fill(completion > 0.5, self.MASK_FILL)
+        return q
+
+
+# =============================================================================
+# Grounded Worker
+# =============================================================================
+
+LOG_STD_MIN = -5.0
+LOG_STD_MAX = 2.0
+
+
+class WorkerTrunk(nn.Module):
+    """
+    Shared torso used by actor and critic. Produces a conditioning-modulated
+    feature vector given:
+      z           : (B, z_dim)         image latent
+      proprio     : (B, P)             raw proprio (normalized outside)
+      task_target : (B, max_goal_dim)  padded goal slice for chosen task
+      task_cur    : (B, max_goal_dim)  padded current task-state slice
+      task_mask   : (B, max_goal_dim)  1/0 mask over active goal dims
+      task_embed  : (B, d_text)        frozen text embed for chosen task
+
+    The FiLM layer injects task identity into the fused features so the
+    same shared trunk can behave very differently per task.
+    """
+    def __init__(self,
+                 z_dim: int,
+                 proprio_dim: int,
+                 max_goal_dim: int,
+                 text_embed_dim: int,
+                 hidden_dim: int,
+                 n_layers: int):
+        super().__init__()
+        # Individual streams -> a compact feature each
+        self.z_stream = build_mlp(z_dim, hidden_dim, hidden_dim, 2)
+        self.prop_stream = build_mlp(proprio_dim, hidden_dim, hidden_dim, 2)
+        # Task-grounding stream: current task-slice + goal + mask -> features
+        # Feeding (cur, goal, cur-goal) so the net sees the DELTA directly.
+        self.task_stream = build_mlp(3 * max_goal_dim + max_goal_dim,
+                                     hidden_dim, hidden_dim, 2)
+
+        fused_dim = 3 * hidden_dim
+        self.fuse = nn.Sequential(
+            nn.Linear(fused_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ReLU(),
         )
-        self.net = build_mlp(hidden_dim, hidden_dim, 1, max(n_layers - 1, 2))
+        self.film = FiLMLayer(text_embed_dim, hidden_dim)
 
-    def forward(self, z_current: torch.Tensor, z_landmark: torch.Tensor) -> torch.Tensor:
-        x = torch.cat([z_current, z_landmark], dim=-1)
-        return self.net(self.input_compress(x))
+        # Post-FiLM head
+        self.post = build_mlp(hidden_dim, hidden_dim, hidden_dim,
+                              max(n_layers - 1, 2))
 
-    def evaluate_all_landmarks(
-        self,
-        z_current: torch.Tensor,   # (B, z_dim)
-        landmarks: torch.Tensor,   # (N, z_dim)
-    ) -> torch.Tensor:             # (B, N)
-        B, N = z_current.shape[0], landmarks.shape[0]
-        z_exp  = z_current.unsqueeze(1).expand(B, N, -1)
-        lm_exp = landmarks.unsqueeze(0).expand(B, N, -1)
-        x = torch.cat([z_exp, lm_exp], dim=-1).reshape(B * N, -1)
-        compressed = self.input_compress(x)
-        return self.net(compressed).reshape(B, N)
+    def forward(self,
+                z: torch.Tensor,
+                proprio: torch.Tensor,
+                task_target: torch.Tensor,
+                task_cur: torch.Tensor,
+                task_mask: torch.Tensor,
+                task_embed: torch.Tensor) -> torch.Tensor:
+        delta = (task_target - task_cur) * task_mask
+        task_in = torch.cat([task_cur, task_target, delta, task_mask], dim=-1)
 
+        fz = self.z_stream(z)
+        fp = self.prop_stream(proprio)
+        ft = self.task_stream(task_in)
 
-# =============================================================================
-# Worker: Dual-stream SAC
-# Stream 1: [z_current (2048), z_subgoal (2048)] → compressed 256
-# Stream 2: normalised proprio (59) → compressed 64
-# Merge: 320 → action
-# =============================================================================
-
-LOG_STD_MIN = -20
-LOG_STD_MAX = 2
-
-_IMG_STREAM_OUT  = 256
-_PROP_STREAM_OUT = 64
-_MERGE_DIM       = _IMG_STREAM_OUT + _PROP_STREAM_OUT  # 320
+        h = self.fuse(torch.cat([fz, fp, ft], dim=-1))
+        h = self.film(h, task_embed)
+        h = F.relu(h)
+        return self.post(h)
 
 
-def _img_stream(z_dim: int, hidden_dim: int) -> nn.Sequential:
-    """Compress [z_current, z_subgoal] = 4096 → _IMG_STREAM_OUT."""
-    return nn.Sequential(
-        nn.Linear(2 * z_dim, hidden_dim),
-        nn.LayerNorm(hidden_dim),
-        nn.ReLU(),
-        nn.Linear(hidden_dim, _IMG_STREAM_OUT),
-        nn.LayerNorm(_IMG_STREAM_OUT),
-        nn.ReLU(),
-    )
+class GroundedWorkerActor(nn.Module):
+    """
+    SAC actor with optional action-chunk output.
 
-
-def _prop_stream(proprio_dim: int, hidden_dim: int) -> nn.Sequential:
-    mid = max(hidden_dim // 4, 64)
-    return nn.Sequential(
-        nn.Linear(proprio_dim, mid),
-        nn.LayerNorm(mid),
-        nn.ReLU(),
-        nn.Linear(mid, _PROP_STREAM_OUT),
-        nn.LayerNorm(_PROP_STREAM_OUT),
-        nn.ReLU(),
-    )
-
-
-class SACActorNetwork(nn.Module):
-    def __init__(self, z_dim, action_dim, hidden_dim=512, n_layers=3, proprio_dim=59):
+    If action_chunk_len == 1 : outputs a single-step squashed-Gaussian policy
+                               over action_dim dims.
+    If action_chunk_len  > 1 : outputs H_chunk step actions, each squashed-
+                               Gaussian, stacked as (B, H_chunk, action_dim).
+                               log_prob is summed across chunk steps AND
+                               across action dims.
+    """
+    def __init__(self,
+                 z_dim: int,
+                 proprio_dim: int,
+                 action_dim: int,
+                 max_goal_dim: int,
+                 text_embed_dim: int,
+                 hidden_dim: int,
+                 n_layers: int,
+                 action_chunk_len: int = 1):
         super().__init__()
-        self.img_stream  = _img_stream(z_dim, hidden_dim)
-        self.prop_stream = _prop_stream(proprio_dim, hidden_dim)
+        assert action_chunk_len >= 1
+        self.action_dim = action_dim
+        self.H = action_chunk_len
+        self.out_dim = action_dim * action_chunk_len
 
-        # Trunk after merge: _MERGE_DIM → hidden_dim → ... → hidden_dim
-        trunk = [nn.Linear(_MERGE_DIM, hidden_dim), nn.LayerNorm(hidden_dim), nn.ReLU()]
-        for _ in range(max(n_layers - 3, 0)):
-            trunk += [nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.ReLU()]
-        self.trunk = nn.Sequential(*trunk)
+        self.trunk = WorkerTrunk(z_dim, proprio_dim, max_goal_dim,
+                                 text_embed_dim, hidden_dim, n_layers)
+        self.mean_head = nn.Linear(hidden_dim, self.out_dim)
+        self.log_std_head = nn.Linear(hidden_dim, self.out_dim)
 
-        self.mean_head    = nn.Linear(hidden_dim, action_dim)
-        self.log_std_head = nn.Linear(hidden_dim, action_dim)
-
-    def _encode(self, z_c, z_s, p):
-        img  = self.img_stream(torch.cat([z_c, z_s], dim=-1))
-        prop = self.prop_stream(p)
-        return self.trunk(torch.cat([img, prop], dim=-1))
-
-    def forward(self, z_c, z_s, p):
-        h = self._encode(z_c, z_s, p)
-        mean    = self.mean_head(h)
+    def _dist(self, z, proprio, task_target, task_cur, task_mask, task_embed):
+        h = self.trunk(z, proprio, task_target, task_cur, task_mask, task_embed)
+        mean = self.mean_head(h)
         log_std = torch.clamp(self.log_std_head(h), LOG_STD_MIN, LOG_STD_MAX)
-        dist    = Normal(mean, log_std.exp())
-        x_t     = dist.rsample()
-        action  = torch.tanh(x_t)
-        lp      = dist.log_prob(x_t) - torch.log(1 - action.pow(2) + 1e-6)
-        return action, lp.sum(-1, keepdim=True)
+        return Normal(mean, log_std.exp())
 
-    def get_action_deterministic(self, z_c, z_s, p):
-        return torch.tanh(self.mean_head(self._encode(z_c, z_s, p)))
+    def forward(self, z, proprio, task_target, task_cur, task_mask, task_embed
+                ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns (action, log_prob).
+          action   : (B, out_dim)  in [-1, 1]
+          log_prob : (B, 1)        summed over all action dims (and chunk steps)
+        """
+        dist = self._dist(z, proprio, task_target, task_cur, task_mask, task_embed)
+        x = dist.rsample()
+        action = torch.tanh(x)
+        # Tanh-squashed log-prob correction
+        logp = dist.log_prob(x) - torch.log(1 - action.pow(2) + 1e-6)
+        logp = logp.sum(-1, keepdim=True)
+        return action, logp
+
+    def get_action_deterministic(self, z, proprio, task_target, task_cur,
+                                 task_mask, task_embed) -> torch.Tensor:
+        h = self.trunk(z, proprio, task_target, task_cur, task_mask, task_embed)
+        return torch.tanh(self.mean_head(h))
+
+    def action_to_chunk(self, action: torch.Tensor) -> torch.Tensor:
+        """
+        Reshape a flat action output (B, H*A) into (B, H, A). When H==1 this
+        is just (B, 1, A).
+        """
+        B = action.shape[0]
+        return action.reshape(B, self.H, self.action_dim)
 
 
-class SACCriticNetwork(nn.Module):
-    def __init__(self, z_dim, action_dim, hidden_dim=512, n_layers=3, proprio_dim=59):
+class GroundedWorkerCritic(nn.Module):
+    """
+    Twin-Q critic. For chunked workers the critic Q(s, a_chunk) treats the
+    flat action vector (B, H*A) as the action, so the TD target is an
+    n-step return sum over the chunk.
+    """
+    def __init__(self,
+                 z_dim: int,
+                 proprio_dim: int,
+                 action_dim: int,
+                 max_goal_dim: int,
+                 text_embed_dim: int,
+                 hidden_dim: int,
+                 n_layers: int,
+                 action_chunk_len: int = 1):
         super().__init__()
-        self.img1  = _img_stream(z_dim, hidden_dim)
-        self.prop1 = _prop_stream(proprio_dim, hidden_dim)
-        self.q1    = build_mlp(_MERGE_DIM + action_dim, hidden_dim, 1, n_layers)
+        self.H = action_chunk_len
+        self.action_dim = action_dim
+        flat_action_dim = action_dim * action_chunk_len
 
-        self.img2  = _img_stream(z_dim, hidden_dim)
-        self.prop2 = _prop_stream(proprio_dim, hidden_dim)
-        self.q2    = build_mlp(_MERGE_DIM + action_dim, hidden_dim, 1, n_layers)
+        self.trunk_1 = WorkerTrunk(z_dim, proprio_dim, max_goal_dim,
+                                   text_embed_dim, hidden_dim, n_layers)
+        self.trunk_2 = WorkerTrunk(z_dim, proprio_dim, max_goal_dim,
+                                   text_embed_dim, hidden_dim, n_layers)
+        self.q1 = build_mlp(hidden_dim + flat_action_dim, hidden_dim, 1,
+                            n_layers=3)
+        self.q2 = build_mlp(hidden_dim + flat_action_dim, hidden_dim, 1,
+                            n_layers=3)
 
-    def forward(self, z_c, z_s, p, action):
-        img_cat = torch.cat([z_c, z_s], dim=-1)
-        f1 = torch.cat([self.img1(img_cat), self.prop1(p), action], dim=-1)
-        f2 = torch.cat([self.img2(img_cat), self.prop2(p), action], dim=-1)
-        return self.q1(f1), self.q2(f2)
-
-
-# =============================================================================
-# Reachability Predictor (kept but disabled via config)
-# =============================================================================
-
-class ReachabilityPredictor(nn.Module):
-    def __init__(self, z_dim: int, hidden_dim: int = 512, n_layers: int = 3):
-        super().__init__()
-        self.input_compress = nn.Sequential(
-            nn.Linear(2 * z_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-        )
-        self.net = build_mlp(hidden_dim, hidden_dim, 1, max(n_layers - 1, 2))
-
-    def forward(self, z_c: torch.Tensor, z_s: torch.Tensor) -> torch.Tensor:
-        x = torch.cat([z_c, z_s], dim=-1)
-        return torch.sigmoid(self.net(self.input_compress(x)))
+    def forward(self, z, proprio, task_target, task_cur, task_mask, task_embed,
+                action) -> Tuple[torch.Tensor, torch.Tensor]:
+        h1 = self.trunk_1(z, proprio, task_target, task_cur, task_mask, task_embed)
+        h2 = self.trunk_2(z, proprio, task_target, task_cur, task_mask, task_embed)
+        q1 = self.q1(torch.cat([h1, action], dim=-1))
+        q2 = self.q2(torch.cat([h2, action], dim=-1))
+        return q1, q2
