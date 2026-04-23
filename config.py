@@ -8,8 +8,8 @@ Design principles that drive these defaults:
    it is a Q-over-tasks that gets MASKED by the completion bits so
    finished tasks cannot be re-selected.
 
-2. The worker's "subgoal" is the benchmark's own task-space goal slice
-   (see task_spec.py), NOT an image latent. The image latent remains
+2. The worker's "subgoal" is the benchmark's own task-space goal slice, 
+   NOT an image latent. The image latent remains
    an INPUT channel for both manager and worker, but it is never a
    termination target.
 
@@ -114,7 +114,7 @@ class WorkerConfig:
     action_cost: float = 0.005
     failure_penalty: float = 0.1
 
-    # Success criterion on task-space error (per-task ε is in task_spec.py)
+    # Success criterion on task-space error (per-task ε is in utils.py)
     # If the task-space error drops below TASK_EPS[k] we also terminate the
     # option early. Completion bit flip still takes precedence.
 

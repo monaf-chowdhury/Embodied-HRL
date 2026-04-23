@@ -16,17 +16,15 @@ quick operational reference.
 ```
 smgw/
 ├── config.py         # Dataclass config; action-chunk toggle is worker.action_chunk_len
-├── task_spec.py      # SINGLE source of truth: per-task indices, goals, ε, text embeds
 ├── env_wrapper.py    # FrankaKitchen-v1 image wrapper; reset() returns (img, state)
 ├── encoder.py        # Frozen R3M / DINOv2 visual backbone (context only, not subgoal)
 ├── networks.py       # SemanticManager (mask-aware Q) + GroundedWorker (FiLM + chunks)
 ├── buffers.py        # ManagerBuffer (option transitions) + WorkerBuffer (chunk tx)
 ├── agent.py          # SMGWAgent: option execution, task-grounded rewards, updates
 ├── warmup.py         # Stage A: task-grounded probes + BC on worker + CE on manager
-├── evaluator.py      # Deterministic eval with video recording
 ├── train.py          # Main loop: Stage A → Stage B + checkpoints + videos
 ├── plots.py          # TensorBoard → PNG diagnostics
-└── utils.py          # save_video, formatters
+└── utils.py          # save_video, formatters, per-task indices, goals, ε, text embeds
 ```
 
 
@@ -216,7 +214,8 @@ pip install \
     scikit-learn==1.5.1 \
     timm==0.9.10 \
     tokenizers==0.19.1 \
-    transformers==4.40.1
+    transformers==4.40.1 \
+    minari==0.5.3
 ```
 
 ---

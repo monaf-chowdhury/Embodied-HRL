@@ -9,7 +9,7 @@ Binds together:
   * ManagerBuffer     — option-level transitions
   * WorkerBuffer      — low-level or chunk-level transitions
 
-Public API used by train.py / warmup.py / evaluator.py:
+Public API used by train.py / warmup.py:
 
   * agent.select_task(z, proprio, task_state, completion, deterministic)
         -> chosen_task_id
@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from config import Config
-from task_spec import TaskSpec, build_frozen_text_embeddings
+from utils import TaskSpec, build_frozen_text_embeddings
 from encoder import VisualEncoder
 from networks import SemanticManager, GroundedWorkerActor, GroundedWorkerCritic
 from buffers import ManagerBuffer, WorkerBuffer
