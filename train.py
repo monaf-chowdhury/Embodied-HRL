@@ -1,27 +1,53 @@
-import argparse
-import datetime
+"""
+train.py — SMGW training: Stage A (task-grounded warmup) -> Stage B (joint HRL).
+
+Usage:
+    python train.py [--seed 42] [--device cuda] [--log_dir logs/run1]
+    python train.py --total_steps 1500000 --action_chunk 4
+    python train.py --no_warmup_demo --no_video
+
+Design notes:
+  - Stage A: warmup.run_stage_a_warmup fills the worker buffer, BC-trains
+    the worker actor, and CE-trains the manager with KNOWN labels.
+  - Stage B: for every env step, (a) manager picks a task from REMAINING
+    tasks, (b) worker runs an option (chunks of H actions) with dense
+    task-grounded rewards, (c) worker SAC updates online, (d) when the
+    option ends, the manager observes its option-level return and
+    does a DQN-style update.
+  - Checkpoints: evenly spaced across total_env_steps (configurable),
+    plus a "best" checkpoint on full_task_success_rate. Each checkpoint
+    saves model weights AND records N evaluation videos so you can
+    visually inspect what the policy does at that point.
+"""
 import os
 import sys
 import time
-from typing import Dict, Tuple
-
+import datetime
+import argparse
 import numpy as np
 import torch
+from __future__ import annotations
+from typing import Dict, Optional
 from torch.utils.tensorboard import SummaryWriter
-from tqdm import tqdm
 
-from agent import TaskGroundedHRLAgent
 from config import Config
 from env_wrapper import FrankaKitchenImageWrapper
-from utils import completed_mask_from_info, per_task_errors, task_success_tolerance, save_video, set_seed
+from agent import SMGWAgent
+from warmup import run_stage_a_warmup
+from utils import save_video, format_time, format_steps
+
+
+# =============================================================================
+# Stdout tee logger
+# =============================================================================
 
 class Logger:
     def __init__(self, log_dir: str):
         os.makedirs(log_dir, exist_ok=True)
-        ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-        path = os.path.join(log_dir, f'train_log_{ts}.txt')
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(log_dir, f"train_log_{ts}.txt")
         self.terminal = sys.stdout
-        self.file = open(path, 'w', buffering=1)
+        self.file = open(path, "w", buffering=1)
         self.log_path = path
         sys.stdout = self
 
@@ -38,9 +64,16 @@ class Logger:
         self.file.close()
 
 
+# =============================================================================
+# Checkpoint scheduler
+# =============================================================================
+
 class CheckpointScheduler:
-    def __init__(self, total_steps: int, n_checkpoints: int = 10):
-        self.thresholds = [int((i + 1) * total_steps / n_checkpoints) for i in range(n_checkpoints)]
+    def __init__(self, total_steps: int, n_checkpoints: int):
+        self.thresholds = [
+            int((i + 1) * total_steps / n_checkpoints)
+            for i in range(n_checkpoints)
+        ]
         self.next_idx = 0
 
     def should_save(self, steps: int) -> bool:
@@ -52,546 +85,536 @@ class CheckpointScheduler:
         return False
 
     def label(self, steps: int) -> str:
-        return f'periodic_{self.next_idx:02d}_step{steps}'
+        return f"periodic_{self.next_idx:02d}_step{steps}"
 
+# =============================================================================
+# Evaluator
+# =============================================================================
 
-SEP = '═' * 72
-SEP2 = '─' * 72
-SEP3 = '·' * 72
+def evaluate(agent: SMGWAgent,
+             config: Config,
+             n_episodes: Optional[int] = None,
+             deterministic: bool = True,
+             record_dir: Optional[str] = None,
+             n_videos: int = 0) -> Dict[str, float]:
+    """
+    Run `n_episodes` deterministic evaluation episodes.
 
+    If `record_dir` is set, save the first `n_videos` episodes as MP4s.
+    Metrics produced (per evaluation run):
+    * any_task_success_rate     — fraction of eps where ≥1 task completed
+    * full_task_success_rate    — fraction of eps where ALL tasks completed  (MAIN metric)
+    * mean_tasks_completed      — average number of tasks completed per ep
+    * mean_options_used         — average number of options (manager decisions)
+    * mean_chosen_task_success  — how often the chosen task actually got its bit flipped
+    * mean_env_reward           — raw env reward per ep (for comparison with baselines)
 
-def _fmt_steps(s: int) -> str:
-    if s >= 1_000_000:
-        return f'{s/1e6:.2f}M'
-    if s >= 1_000:
-        return f'{s/1e3:.1f}k'
-    return str(s)
+    Chained success is what we really care about: full_task_success_rate.
 
-
-def _fmt_time(seconds: float) -> str:
-    return str(datetime.timedelta(seconds=int(seconds)))
-
-
-def run_option(
-    env: FrankaKitchenImageWrapper,
-    agent: TaskGroundedHRLAgent,
-    z_current: np.ndarray,
-    proprio: np.ndarray,
-    completion_mask: np.ndarray,
-    prev_task: int,
-    task_id: int,
-    deterministic: bool = False,
-    store: bool = True,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, bool, Dict[str, float], list]:
-    cfg = agent.config
-    task_name = agent.tasks[task_id]
-    start_state = agent.build_manager_state(proprio, completion_mask, prev_task, z_current=z_current)
-    start_z = z_current.copy()
-    start_proprio = proprio.copy()
-    start_completion = completion_mask.copy()
-
-    option_reward_env = 0.0
-    option_len = 0
-    option_success = False
-    done = False
-    hold_count = 0
-    best_err = per_task_errors(proprio, [task_name])[0]
-    patience = 0
-    selected_error_traj = []
-    frames = []
-
-    if deterministic:
-        frames.append(env._render_image())
-
-    while option_len < cfg.manager.option_horizon:
-        action = agent.select_worker_action(
-            z_current=z_current,
-            proprio=proprio,
-            completion_mask=completion_mask,
-            task_id=task_id,
-            deterministic=deterministic,
-        )
-        if action is None:
-            action = env.action_space.sample().astype(np.float32)
-
-        next_img, env_reward, done, info = env.step(action)
-        next_z = agent.encoder.encode_numpy(next_img).squeeze()
-        next_proprio = info['state']
-        next_completion = completed_mask_from_info(info, agent.tasks)
-
-        prev_inputs = agent.get_worker_structured_inputs(proprio, task_id)
-        next_inputs = agent.get_worker_structured_inputs(next_proprio, task_id)
-        worker_reward, worker_stats = agent.compute_worker_reward(
-            prev_proprio=proprio,
-            next_proprio=next_proprio,
-            task_id=task_id,
-            prev_completion=completion_mask,
-            next_completion=next_completion,
-            env_reward=env_reward,
-            action=action,
-        )
-        if store:
-            agent.worker_buffer.add(
-                z=z_current,
-                proprio=proprio,
-                task_id=task_id,
-                target=prev_inputs['target'],
-                value=prev_inputs['value'],
-                error_vec=prev_inputs['error_vec'],
-                progress=prev_inputs['progress'],
-                completion=completion_mask,
-                action=action,
-                reward=worker_reward,
-                next_z=next_z,
-                next_proprio=next_proprio,
-                next_value=next_inputs['value'],
-                next_error_vec=next_inputs['error_vec'],
-                next_progress=next_inputs['progress'],
-                next_completion=next_completion,
-                done=done,
-            )
-
-        option_reward_env += env_reward
-        option_len += 1
-        if store:
-            agent.total_steps += 1
-            agent.update_manager_epsilon()
-
-        task_err = per_task_errors(next_proprio, [task_name])[0]
-        selected_error_traj.append(float(task_err))
-        if task_err <= task_success_tolerance(task_name):
-            hold_count += 1
-        else:
-            hold_count = 0
-        if task_err < best_err - cfg.worker.improvement_epsilon:
-            best_err = float(task_err)
-            patience = 0
-        else:
-            patience += 1
-
-        success_now = agent.option_success(task_id, completion_mask, next_completion, task_err, hold_count)
-        z_current = next_z
-        proprio = next_proprio
-        completion_mask = next_completion
-        if deterministic:
-            frames.append(next_img)
-
-        if success_now:
-            option_success = True
-            break
-        if done:
-            break
-        if option_len >= cfg.worker.option_min_steps and patience >= cfg.worker.option_patience:
-            break
-        if store and agent.total_steps >= cfg.training.total_timesteps:
-            break
-
-    manager_reward, manager_stats = agent.compute_manager_reward(
-        start_proprio=start_proprio,
-        end_proprio=proprio,
-        task_id=task_id,
-        start_completion=start_completion,
-        end_completion=completion_mask,
-        option_steps=option_len,
-    )
-
-    end_state = agent.build_manager_state(proprio, completion_mask, task_id, z_current=z_current)
-    if store:
-        agent.manager_buffer.add(
-            z=start_z,
-            proprio=start_proprio,
-            progress=start_state['progress'],
-            errors=start_state['errors'],
-            completion=start_state['completion'],
-            remaining=start_state['remaining'],
-            prototype_sims=start_state['prototype_sims'],
-            prev_task=start_state['prev_task'],
-            task_id=task_id,
-            reward=manager_reward,
-            next_z=z_current,
-            next_proprio=proprio,
-            next_progress=end_state['progress'],
-            next_errors=end_state['errors'],
-            next_completion=end_state['completion'],
-            next_remaining=end_state['remaining'],
-            next_prototype_sims=end_state['prototype_sims'],
-            done=done,
-        )
-        agent.total_options += 1
-
-    stats = {
-        'option_env_reward': float(option_reward_env),
-        'option_len': float(option_len),
-        'option_success': float(option_success),
-        'manager_reward': float(manager_reward),
-        'selected_task_end_error': float(manager_stats['end_err']),
-        'selected_task_delta_err': float(manager_stats['delta_err']),
-        'selected_task_delta_prog': float(manager_stats['delta_prog']),
-        'completion_gain': float(manager_stats['completion_gain']),
-        'worker_last_delta_err': float(worker_stats['delta_err']) if selected_error_traj else 0.0,
-    }
-    return z_current, proprio, completion_mask, done, stats, frames
-
-
-def evaluate(agent: TaskGroundedHRLAgent, config: Config, n_episodes: int = None) -> Dict[str, float]:
-    n_episodes = n_episodes or config.training.n_eval_episodes
+    """
+    n_eps = n_episodes or config.eval.n_eval_episodes
     env = FrankaKitchenImageWrapper(
         tasks_to_complete=config.training.tasks_to_complete,
         img_size=config.encoder.img_size,
-        terminate_on_tasks_completed=config.training.terminate_on_tasks_completed,
     )
-    any_flags, full_flags = [], []
-    rewards, tasks_completed, high_steps = [], [], []
 
-    for _ in range(n_episodes):
-        img = env.reset()
-        z_current = agent.encoder.encode_numpy(img).squeeze()
-        proprio = env.get_state()
+    any_success = []
+    full_success = []
+    tasks_completed = []
+    options_used = []
+    chosen_task_successes = []
+    env_rewards = []
+    termination_reasons: Dict[str, int] = {}
+
+    for ep_i in range(n_eps):
+        collect_frames = (record_dir is not None and ep_i < n_videos)
+        frames_accum = []
+
+        img, state = env.reset()
+        z = agent.encoder.encode_numpy(img).squeeze()
+        proprio = state.copy()
         completion = np.zeros(agent.n_tasks, dtype=np.float32)
-        prev_task = -1
+
+        if collect_frames:
+            frames_accum.append(img.copy())
+
         done = False
-        ep_reward = 0.0
-        options = 0
+        n_options = 0
+        chosen_success_count = 0
+        ep_env_reward = 0.0
 
-        while not done and options < config.manager.max_high_level_steps and completion.sum() < agent.n_tasks:
-            task_id = agent.select_task(z_current, proprio, completion, prev_task, deterministic=True)
-            z_current, proprio, completion, done, stats, _ = run_option(
-                env, agent, z_current, proprio, completion, prev_task, task_id, deterministic=True, store=False
+        while (not done
+               and n_options < config.manager.max_high_level_steps
+               and completion.sum() < agent.n_tasks):
+
+            task_id = agent.select_task(z, proprio, state, completion,
+                                        deterministic=deterministic)
+
+            result = agent.execute_option(
+                env=env, task_id=task_id,
+                start_img=img, start_state=state, start_z=z,
+                completion=completion,
+                deterministic_worker=deterministic,
+                collect_frames=collect_frames,
+                train_worker_online=False,
             )
-            ep_reward += stats['option_env_reward']
-            prev_task = task_id
-            options += 1
 
-        n_done = int(round(completion.sum()))
-        rewards.append(ep_reward)
+            # Advance episode state from option result
+            state = result.proprio_end
+            proprio = state
+            z = result.z_end
+            completion = result.completion_end
+            ep_env_reward += result.env_reward_sum
+            done = result.env_done
+            n_options += 1
+            if result.chosen_task_completed:
+                chosen_success_count += 1
+
+            reason = result.termination_reason
+            termination_reasons[reason] = termination_reasons.get(reason, 0) + 1
+
+            if collect_frames:
+                # append frames from this option (skip the first frame to
+                # avoid duplicates — it's the same as the previous last frame)
+                if result.frames:
+                    frames_accum.extend(result.frames[1:])
+
+            # The env doesn't give us an updated "img" field back from
+            # execute_option because we pushed frames out separately. To
+            # keep the outer loop in sync, re-render:
+            img = env.render_image()
+
+        n_done = int(completion.sum())
+        any_success.append(n_done >= 1)
+        full_success.append(n_done >= agent.n_tasks)
         tasks_completed.append(n_done)
-        high_steps.append(options)
-        any_flags.append(n_done >= 1)
-        full_flags.append(n_done >= agent.n_tasks)
+        options_used.append(n_options)
+        chosen_task_successes.append(chosen_success_count / max(n_options, 1))
+        env_rewards.append(ep_env_reward)
+
+        if collect_frames and frames_accum:
+            out_path = os.path.join(record_dir, f"ep_{ep_i:03d}.mp4")
+            save_video(frames_accum, out_path, fps=config.training.video_fps)
 
     env.close()
+
     return {
-        'any_task_success_rate': float(np.mean(any_flags)),
-        'full_task_success_rate': float(np.mean(full_flags)),
-        'mean_reward': float(np.mean(rewards)),
-        'std_reward': float(np.std(rewards)),
+        'any_task_success_rate': float(np.mean(any_success)),
+        'full_task_success_rate': float(np.mean(full_success)),
         'mean_tasks_completed': float(np.mean(tasks_completed)),
-        'mean_high_steps': float(np.mean(high_steps)),
-        'n_episodes': int(n_episodes),
+        'mean_options_used': float(np.mean(options_used)),
+        'mean_chosen_task_success': float(np.mean(chosen_task_successes)),
+        'mean_env_reward': float(np.mean(env_rewards)),
+        'std_env_reward': float(np.std(env_rewards)),
+        'n_episodes': n_eps,
+        'termination_reasons': termination_reasons,
     }
 
+# =============================================================================
+# Save checkpoint and record eval videos
+# =============================================================================
 
-def record_episode_videos(agent: TaskGroundedHRLAgent, config: Config, label: str, n_episodes: int = 3):
-    if not config.training.record_video:
-        return
+def save_checkpoint_and_videos(agent: SMGWAgent, config: Config, label: str):
+    ckpt_dir = os.path.join(config.training.log_dir, 'checkpoints')
     video_dir = os.path.join(config.training.log_dir, 'videos', label)
-    os.makedirs(video_dir, exist_ok=True)
-    env = FrankaKitchenImageWrapper(
-        tasks_to_complete=config.training.tasks_to_complete,
-        img_size=config.encoder.img_size,
-        terminate_on_tasks_completed=config.training.terminate_on_tasks_completed,
-    )
-    for ep_i in range(n_episodes):
-        frames = []
-        img = env.reset()
-        frames.append(img)
-        z_current = agent.encoder.encode_numpy(img).squeeze()
-        proprio = env.get_state()
-        completion = np.zeros(agent.n_tasks, dtype=np.float32)
-        prev_task = -1
-        done = False
-        high_steps = 0
-        while not done and high_steps < config.manager.max_high_level_steps and completion.sum() < agent.n_tasks:
-            task_id = agent.select_task(z_current, proprio, completion, prev_task, deterministic=True)
-            z_current, proprio, completion, done, _, option_frames = run_option(
-                env, agent, z_current, proprio, completion, prev_task, task_id, deterministic=True, store=False
-            )
-            if option_frames:
-                frames.extend(option_frames[1:] if len(frames) > 0 else option_frames)
-            prev_task = task_id
-            high_steps += 1
-        save_video(frames, os.path.join(video_dir, f'ep_{ep_i:03d}.mp4'), fps=15)
-    env.close()
-    print(f'  [Video] {n_episodes} episodes recorded -> {video_dir}/')
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    ckpt_path = os.path.join(ckpt_dir, f'checkpoint_{label}.pt')
+    agent.save(ckpt_path)
+    print(f"  [Checkpoint] Saved -> {os.path.basename(ckpt_path)}")
+
+    if config.training.record_video:
+        os.makedirs(video_dir, exist_ok=True)
+        n = config.training.video_n_episodes
+        print(f"  [Video] Recording {n} eval episodes at '{label}'...")
+        result = evaluate(agent, config,
+                          n_episodes=n, deterministic=True,
+                          record_dir=video_dir, n_videos=n)
+        print(f"  [Video] Saved to {video_dir}/")
+        print(f"  [Video] Any-task: {result['any_task_success_rate']*100:.1f}%  "
+              f"Full-task: {result['full_task_success_rate']*100:.1f}%  "
+              f"Mean tasks done: {result['mean_tasks_completed']:.2f}/{agent.n_tasks}")
 
 
-def save_checkpoint(agent: TaskGroundedHRLAgent, config: Config, name: str):
-    path = os.path.join(config.training.log_dir, f'checkpoint_{name}.pt')
-    torch.save({
-        'manager_q': agent.manager_q.state_dict(),
-        'manager_q_target': agent.manager_q_target.state_dict(),
-        'worker_actor': agent.worker_actor.state_dict(),
-        'worker_critic': agent.worker_critic.state_dict(),
-        'worker_critic_target': agent.worker_critic_target.state_dict(),
-        'manager_optimizer': agent.manager_optimizer.state_dict(),
-        'worker_actor_optimizer': agent.worker_actor_optimizer.state_dict(),
-        'worker_critic_optimizer': agent.worker_critic_optimizer.state_dict(),
-        'alpha_optimizer': agent.alpha_optimizer.state_dict() if agent.alpha_optimizer is not None else None,
-        'log_alpha': agent.log_alpha.detach().cpu().item(),
-        'task_lang_np': agent.task_lang_np,
-        'task_goals_np': agent.task_goals_np,
-        'manager_epsilon': agent.manager_epsilon,
-        'total_steps': agent.total_steps,
-        'total_episodes': agent.total_episodes,
-        'total_options': agent.total_options,
-        'manager_proprio_mean': agent.manager_buffer.proprio_norm.mean,
-        'manager_proprio_M2': agent.manager_buffer.proprio_norm.M2,
-        'manager_proprio_n': agent.manager_buffer.proprio_norm.n,
-        'worker_proprio_mean': agent.worker_buffer.proprio_norm.mean,
-        'worker_proprio_M2': agent.worker_buffer.proprio_norm.M2,
-        'worker_proprio_n': agent.worker_buffer.proprio_norm.n,
-        'config': config,
-    }, path)
-    print(f'  [Checkpoint] Saved -> {os.path.basename(path)}')
+# =============================================================================
+# Pretty-printed banners
+# =============================================================================
 
+SEP = "=" * 76
+SEP2 = "-" * 76
+SEP3 = "." * 76
+
+
+def print_start_banner(config: Config, log_path: str):
+    print(f"\n{SEP}")
+    print(f"  SMGW — Semantic Manager, Grounded Worker")
+    print(f"  FrankaKitchen-v1")
+    print(f"  Started : {datetime.datetime.now().strftime('%Y-%m-%d  %H:%M:%S')}")
+    print(SEP)
+    print(f"  Encoder        : {config.encoder.name.upper()}  "
+          f"({config.encoder.raw_dim}-d features, FROZEN)")
+    print(f"  Tasks          : {config.training.tasks_to_complete}")
+    print(f"  Manager        : 4-way discrete, completion-mask gated")
+    print(f"  Worker         : SAC, FiLM-conditioned, "
+          f"chunk_len = {config.worker.action_chunk_len}")
+    print(f"  Subgoal K      : {config.manager.subgoal_horizon} env steps / option")
+    print(f"  Max HL steps   : {config.manager.max_high_level_steps} per episode")
+    print(SEP2)
+    print(f"  Manager reward : completion={config.manager.completion_bonus}  "
+          f"dense={config.manager.dense_shaping_weight}  "
+          f"option_cost={config.manager.option_cost}  "
+          f"all_done={config.manager.all_done_bonus}")
+    print(f"  Worker reward  : progress={config.worker.progress_weight}  "
+          f"completion={config.worker.completion_bonus}  "
+          f"action_cost={config.worker.action_cost}  "
+          f"failure={config.worker.failure_penalty}")
+    print(f"  NOTE: Zero latent-distance terms anywhere. All rewards are "
+          f"grounded in benchmark completion bits and task-space errors.")
+    print(SEP2)
+    print(f"  Stage A probes : {config.warmup.n_probe_episodes_per_task} ep/task "
+          f"* {config.warmup.probe_steps_per_episode} steps")
+    print(f"  Stage A BC     : worker={config.warmup.n_worker_sl_steps} steps, "
+          f"manager={config.warmup.n_manager_sl_steps} steps")
+    print(f"  Stage B steps  : {config.training.total_env_steps:,}")
+    print(f"  Batch size     : {config.buffer.batch_size}")
+    print(f"  Buffer cap     : worker={config.buffer.worker_capacity:,}  "
+          f"manager={config.buffer.manager_capacity:,}")
+    print(f"  Seed           : {config.training.seed}")
+    print(f"  Device         : {config.training.device}")
+    if torch.cuda.is_available():
+        print(f"  GPU            : {torch.cuda.get_device_name(0)}  "
+              f"({torch.cuda.get_device_properties(0).total_memory/1e9:.1f} GB VRAM)")
+    print(f"  Log dir        : {config.training.log_dir}")
+    print(f"  Train log      : {log_path}")
+    print(f"{SEP}\n")
+
+
+# =============================================================================
+# Main training
+# =============================================================================
 
 def train(config: Config):
     logger = Logger(config.training.log_dir)
-    set_seed(config.training.seed)
+
+    np.random.seed(config.training.seed)
+    torch.manual_seed(config.training.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(config.training.seed)
 
     writer = SummaryWriter(config.training.log_dir)
-    ckpt_sched = CheckpointScheduler(config.training.total_timesteps, n_checkpoints=config.training.checkpoint_every_n)
+    ckpt_sched = CheckpointScheduler(
+        config.training.total_env_steps,
+        config.training.n_periodic_checkpoints,
+    )
 
+    # -- Build env and agent --
     env = FrankaKitchenImageWrapper(
         tasks_to_complete=config.training.tasks_to_complete,
         img_size=config.encoder.img_size,
         seed=config.training.seed,
-        terminate_on_tasks_completed=config.training.terminate_on_tasks_completed,
+        terminate_on_tasks_completed=False,
     )
-    agent = TaskGroundedHRLAgent(config)
+    agent = SMGWAgent(config)
 
-    print(f'\n{SEP}')
-    print('  Task-Grounded Hierarchical RL — FrankaKitchen-v1')
-    print(f"  Started : {datetime.datetime.now().strftime('%Y-%m-%d  %H:%M:%S')}")
-    print(SEP)
-    print(f'  Encoder          : {config.encoder.name.upper()} ({config.encoder.raw_dim}-d frozen visual context)')
-    print(f'  Tasks            : {config.training.tasks_to_complete}')
-    print(f'  Manager horizon  : {config.manager.option_horizon} steps / option')
-    print(f'  Max HL steps     : {config.manager.max_high_level_steps} per episode')
-    print(f'  Demo prototypes  : {config.semantic.use_demo_prototypes} ({config.semantic.demo_gif_path})')
-    print(f'  Task language    : {config.semantic.use_task_language_embeddings} ({config.semantic.task_language_dim}-d hashed embeddings)')
-    print(SEP2)
-    print(f'  Manager reward   : completion={config.manager.reward_completion_bonus}  err={config.manager.reward_selected_error_reduction}  prog={config.manager.reward_selected_progress_gain}  regress={config.manager.reward_regression_penalty}')
-    print(f'  Worker reward    : err={config.worker.reward_error_reduction}  prog={config.worker.reward_progress_gain}  completion={config.worker.reward_completion_bonus}  regress={config.worker.reward_regression_penalty}  env={config.worker.reward_env_weight}')
-    print(SEP2)
-    print(f'  Buffer start     : {config.buffer.start_learning_after:,} steps before learning')
-    print(f'  Worker bootstrap : random actions for first {config.worker.bootstrap_random_action_steps:,} steps')
-    print(f'  Manager bootstrap: uniform/heuristic for first {config.manager.bootstrap_uniform_steps:,} steps')
-    print(f'  Total steps      : {config.training.total_timesteps:,}')
-    print(f'  Batch size       : {config.buffer.batch_size}')
-    print(f'  Buffer caps      : worker={config.buffer.worker_capacity:,}  manager={config.buffer.manager_capacity:,}')
-    print(f'  Device           : {config.training.device}')
-    if torch.cuda.is_available() and config.training.device == 'cuda':
-        props = torch.cuda.get_device_properties(0)
-        print(f'  GPU              : {torch.cuda.get_device_name(0)} ({props.total_memory / 1e9:.1f} GB VRAM)')
-    print(f'  Log dir          : {config.training.log_dir}')
-    print(f'  Train log        : {logger.log_path}')
-    print(f'{SEP}\n')
+    print_start_banner(config, logger.log_path)
 
-    best_full = 0.0
-    last_worker = {}
-    last_manager = {}
+    # =========================================================================
+    # Stage A: task-grounded warmup
+    # =========================================================================
+    print(SEP2)
+    print(f"  STAGE A  —  Task-Grounded Warmup")
+    print(SEP2 + "\n")
+
+    t0 = time.time()
+    warmup_stats = run_stage_a_warmup(agent, config, verbose=True)
+    warmup_elapsed = time.time() - t0
+    print(f"\n  Stage A complete in {format_time(warmup_elapsed)}.")
+    for k, v in warmup_stats.items():
+        if isinstance(v, (int, float)):
+            writer.add_scalar(f'warmup/{k}', v, 0)
+    print(f"{SEP}\n")
+
+    # =========================================================================
+    # Stage B: joint HRL training
+    # =========================================================================
+    print(SEP2)
+    print(f"  STAGE B  —  Joint HRL (manager DQN + worker SAC)")
+    print(SEP2 + "\n")
+
+    best_full_task_sr = -1.0
     train_start = time.time()
-    pbar = tqdm(total=config.training.total_timesteps, desc='Training', dynamic_ncols=True, unit='step')
+    last_worker_losses = {}
+    last_manager_losses = {}
 
-    run_rewards, run_tasks, run_options, run_option_sr, run_option_len = [], [], [], [], []
-    run_selected_err = []
+    # Rolling windows for terminal logging
+    run_env_rewards = []
+    run_any_success = []
+    run_full_success = []
+    run_tasks_completed = []
+    run_options_per_ep = []
 
-    while agent.total_steps < config.training.total_timesteps:
-        img = env.reset()
-        z_current = agent.encoder.encode_numpy(img).squeeze()
-        proprio = env.get_state()
+    # Explicit eval trigger — fire when total_env_steps crosses next_eval_at
+    next_eval_at = config.eval.eval_every_env_steps
+
+    # Worker online update cadence: update every N env steps
+    updates_per_step = config.training.worker_updates_per_env_step
+    update_every_n = max(1, int(round(1.0 / max(updates_per_step, 1e-6))))
+
+    while agent.total_env_steps < config.training.total_env_steps:
+
+        # ---- Episode reset ----
+        img, state = env.reset()
+        z = agent.encoder.encode_numpy(img).squeeze()
+        proprio = state.copy()
         completion = np.zeros(agent.n_tasks, dtype=np.float32)
-        prev_task = -1
-        done = False
-        episode_reward = 0.0
-        episode_options = 0
-        episode_option_success = 0
-        episode_option_lengths = []
-        episode_new_completions = 0
-        episode_selected_errors = []
 
-        while not done and episode_options < config.manager.max_high_level_steps and completion.sum() < agent.n_tasks:
-            task_id = agent.select_task(z_current, proprio, completion, prev_task, deterministic=False)
-            z_current, proprio, completion, done, stats, _ = run_option(
-                env, agent, z_current, proprio, completion, prev_task, task_id, deterministic=False, store=True
+        ep_env_reward = 0.0
+        ep_tasks_completed = 0
+        ep_options = 0
+        env_done = False
+
+        # ---- Option loop ----
+        while (not env_done
+               and ep_options < config.manager.max_high_level_steps
+               and completion.sum() < agent.n_tasks):
+
+            # -- Manager picks a task --
+            task_id = agent.select_task(z, proprio, state, completion,
+                                        deterministic=False)
+
+            # -- Worker executes the option --
+            result = agent.execute_option(
+                env=env,
+                task_id=task_id,
+                start_img=img, start_state=state, start_z=z,
+                completion=completion,
+                deterministic_worker=False,
+                collect_frames=False,
+                train_worker_online=True,
+                update_every_n_env_steps=update_every_n,
             )
-            pbar.n = agent.total_steps
-            pbar.refresh()
-            episode_reward += stats['option_env_reward']
-            episode_options += 1
-            episode_option_success += int(stats['option_success'])
-            episode_option_lengths.append(stats['option_len'])
-            episode_new_completions += int(stats['completion_gain'])
-            episode_selected_errors.append(stats['selected_task_end_error'])
-            prev_task = task_id
 
-            if agent.total_steps >= config.buffer.start_learning_after:
-                for _ in range(config.buffer.worker_updates_per_step):
-                    last_worker = agent.update_worker()
-                for _ in range(config.buffer.manager_updates_per_option):
-                    last_manager = agent.update_manager()
+            # -- Write option transition to manager buffer --
+            agent.manager_buf.add(
+                z=result.z_start, proprio=result.proprio_start,
+                task_state=result.task_state_start,
+                completion=result.completion_start,
+                action=result.chosen_task,
+                reward=result.option_return,
+                z_next=result.z_end, proprio_next=result.proprio_end,
+                task_state_next=result.task_state_end,
+                completion_next=result.completion_end,
+                done=float(result.env_done
+                           or (result.completion_end.sum() >= agent.n_tasks)),
+            )
+            if result.last_worker_losses:
+                last_worker_losses = result.last_worker_losses
 
-            if agent.total_steps >= config.training.total_timesteps:
-                break
+            # -- Manager online update --
+            for _ in range(config.training.manager_updates_per_option):
+                loss = agent.update_manager()
+                if loss:
+                    last_manager_losses = loss
 
+            # -- Update epsilon schedule --
+            agent._update_epsilon()
+
+            # -- Advance outer state --
+            state = result.proprio_end
+            proprio = state
+            z = result.z_end
+            completion = result.completion_end
+            env_done = result.env_done
+            ep_env_reward += result.env_reward_sum
+            ep_tasks_completed = int(completion.sum())
+            ep_options += 1
+            agent.total_options += 1
+
+            # We need a fresh image for the next option. env.render_image()
+            # re-renders from the current MuJoCo state (no step is taken).
+            img = env.render_image()
+
+        # ---- End of episode ----
         agent.total_episodes += 1
-        tasks_done = int(round(completion.sum()))
-        run_rewards.append(episode_reward)
-        run_tasks.append(tasks_done)
-        run_options.append(episode_options)
-        run_option_sr.append(episode_option_success / max(episode_options, 1))
-        run_option_len.append(np.mean(episode_option_lengths) if episode_option_lengths else 0.0)
-        run_selected_err.append(np.mean(episode_selected_errors) if episode_selected_errors else 0.0)
 
-        if agent.total_episodes % 10 == 0:
-            writer.add_scalar('train/episode_reward', episode_reward, agent.total_steps)
-            writer.add_scalar('train/tasks_completed', float(tasks_done), agent.total_steps)
-            writer.add_scalar('train/any_task_success', float(tasks_done >= 1), agent.total_steps)
-            writer.add_scalar('train/full_task_success', float(tasks_done >= agent.n_tasks), agent.total_steps)
-            writer.add_scalar('train/new_completions_per_episode', float(episode_new_completions), agent.total_steps)
-            writer.add_scalar('train/high_level_steps', float(episode_options), agent.total_steps)
-            writer.add_scalar('train/option_success_rate', episode_option_success / max(episode_options, 1), agent.total_steps)
-            writer.add_scalar('train/option_length_mean', np.mean(episode_option_lengths) if episode_option_lengths else 0.0, agent.total_steps)
-            writer.add_scalar('train/mean_selected_task_error', np.mean(episode_selected_errors) if episode_selected_errors else 0.0, agent.total_steps)
-            writer.add_scalar('train/manager_epsilon', agent.manager_epsilon, agent.total_steps)
-            writer.add_scalar('train/worker_random_prob', agent.current_worker_random_prob(), agent.total_steps)
-            writer.add_scalar('train/worker_buffer_size', len(agent.worker_buffer), agent.total_steps)
-            writer.add_scalar('train/manager_buffer_size', len(agent.manager_buffer), agent.total_steps)
-            for k, v in last_worker.items():
-                writer.add_scalar(f'worker/{k}', v, agent.total_steps)
-            for k, v in last_manager.items():
-                writer.add_scalar(f'manager/{k}', v, agent.total_steps)
+        run_env_rewards.append(ep_env_reward)
+        run_any_success.append(ep_tasks_completed >= 1)
+        run_full_success.append(ep_tasks_completed >= agent.n_tasks)
+        run_tasks_completed.append(ep_tasks_completed)
+        run_options_per_ep.append(ep_options)
 
-        if agent.total_episodes % 50 == 0 and run_rewards:
+        # ---- Per-episode TB scalars ----
+        if agent.total_episodes % config.training.tb_every_episodes == 0:
+            s = agent.total_env_steps
+            writer.add_scalar('train/ep_env_reward', ep_env_reward, s)
+            writer.add_scalar('train/ep_any_success', float(ep_tasks_completed >= 1), s)
+            writer.add_scalar('train/ep_full_success',
+                              float(ep_tasks_completed >= agent.n_tasks), s)
+            writer.add_scalar('train/ep_tasks_completed', ep_tasks_completed, s)
+            writer.add_scalar('train/ep_options', ep_options, s)
+            writer.add_scalar('train/epsilon', agent.epsilon, s)
+            writer.add_scalar('train/worker_buffer_size', len(agent.worker_buf), s)
+            writer.add_scalar('train/manager_buffer_size', len(agent.manager_buf), s)
+
+            for k, v in last_worker_losses.items():
+                writer.add_scalar(f'worker/{k}', v, s)
+            for k, v in last_manager_losses.items():
+                writer.add_scalar(f'manager/{k}', v, s)
+
+        # ---- Terminal logging ----
+        if agent.total_episodes % config.training.log_every_episodes == 0 and run_env_rewards:
             elapsed = time.time() - train_start
-            sps = agent.total_steps / max(elapsed, 1.0)
-            eta = (config.training.total_timesteps - agent.total_steps) / max(sps, 1.0)
-            pct = 100.0 * agent.total_steps / config.training.total_timesteps
-            n_ep = len(run_rewards)
-            print(f'\n{SEP2}')
-            print(f'  Step {agent.total_steps:>10,} / {config.training.total_timesteps:,} ({pct:5.1f}%)   Episode {agent.total_episodes:,}')
-            print(f'  Elapsed : {_fmt_time(elapsed)}    ETA : {_fmt_time(eta)}    Speed : {sps:.0f} steps/s')
-            print(SEP3)
-            print(f'  [Last {n_ep} episodes]')
-            print(f'    Episode reward       : mean = {np.mean(run_rewards):.4f}   max = {np.max(run_rewards):.4f}')
-            print(f'    Tasks completed      : mean = {np.mean(run_tasks):.2f} / {agent.n_tasks}   full-task = {np.mean(np.asarray(run_tasks) >= agent.n_tasks) * 100:5.1f}%')
-            print(f'    Options / episode    : mean = {np.mean(run_options):.2f}')
-            print(f'    Option success rate  : mean = {np.mean(run_option_sr) * 100:5.1f}%')
-            print(f'    Option length        : mean = {np.mean(run_option_len):.2f}')
-            print(f'    Selected task error  : mean = {np.mean(run_selected_err):.4f}')
-            print(SEP3)
-            print(f'  Exploration')
-            print(f'    Manager epsilon      : {agent.manager_epsilon:.4f}')
-            print(f'    Worker random prob   : {agent.current_worker_random_prob():.4f}')
-            print(f'  Buffers')
-            print(f'    Worker replay        : {len(agent.worker_buffer):>8,}')
-            print(f'    Manager replay       : {len(agent.manager_buffer):>8,}')
-            if last_worker:
-                print(SEP3)
-                print('  Worker (SAC)')
-                print(f"    Critic loss          : {last_worker.get('worker_critic_loss', 0):.5f}")
-                print(f"    Actor loss           : {last_worker.get('worker_actor_loss', 0):.5f}")
-                print(f"    Alpha                : {last_worker.get('worker_alpha', 0):.4f}")
-            if last_manager:
-                print(SEP3)
-                print('  Manager (Task Q)')
-                print(f"    Q loss               : {last_manager.get('manager_loss', 0):.5f}")
-                print(f"    Q mean               : {last_manager.get('manager_q_mean', 0):.4f}")
-            run_rewards.clear()
-            run_tasks.clear()
-            run_options.clear()
-            run_option_sr.clear()
-            run_option_len.clear()
-            run_selected_err.clear()
+            sps = agent.total_env_steps / max(elapsed, 1)
+            remaining_steps = config.training.total_env_steps - agent.total_env_steps
+            eta = remaining_steps / max(sps, 1)
+            pct = 100.0 * agent.total_env_steps / config.training.total_env_steps
 
-        if agent.total_steps > 0 and agent.total_steps % config.training.eval_freq < config.manager.option_horizon:
+            print(f"\n{SEP2}")
+            print(f"  Step {agent.total_env_steps:>10,} / "
+                  f"{config.training.total_env_steps:,} ({pct:5.1f}%)  "
+                  f"Ep {agent.total_episodes:,}")
+            print(f"  Elapsed {format_time(elapsed)}  ETA {format_time(eta)}  "
+                  f"Speed {sps:.0f} steps/s")
+            print(SEP3)
+            n_win = len(run_env_rewards)
+            print(f"  Last {n_win} episodes:")
+            print(f"    Env reward        mean={np.mean(run_env_rewards):.3f}  "
+                  f"max={np.max(run_env_rewards):.3f}")
+            print(f"    Any-task success  {np.mean(run_any_success)*100:5.1f}%")
+            print(f"    Full-task success {np.mean(run_full_success)*100:5.1f}%")
+            print(f"    Mean tasks done   {np.mean(run_tasks_completed):.2f} / {agent.n_tasks}")
+            print(f"    Mean options/ep   {np.mean(run_options_per_ep):.1f}")
+            print(SEP3)
+            print(f"  Exploration  epsilon={agent.epsilon:.3f}")
+            print(f"  Buffers      worker={len(agent.worker_buf):>7,}  "
+                  f"manager={len(agent.manager_buf):>6,}")
+            if last_worker_losses:
+                print(f"  Worker (SAC)  critic={last_worker_losses.get('worker_critic_loss', 0):.5f}  "
+                      f"actor={last_worker_losses.get('worker_actor_loss', 0):.4f}  "
+                      f"alpha={last_worker_losses.get('worker_alpha', 0):.4f}")
+            if last_manager_losses:
+                print(f"  Manager (DQN) loss={last_manager_losses.get('manager_loss', 0):.5f}  "
+                      f"q_mean={last_manager_losses.get('manager_q_mean', 0):.3f}")
+
+            run_env_rewards.clear()
+            run_any_success.clear()
+            run_full_success.clear()
+            run_tasks_completed.clear()
+            run_options_per_ep.clear()
+
+        # ---- Periodic evaluation ----
+        if agent.total_env_steps >= next_eval_at:
+            next_eval_at = agent.total_env_steps + config.eval.eval_every_env_steps
             t0 = time.time()
-            result = evaluate(agent, config)
+            eval_result = evaluate(agent, config,
+                                   deterministic=config.eval.deterministic_worker)
             eval_t = time.time() - t0
-            is_best = result['full_task_success_rate'] > best_full
-            if is_best:
-                best_full = result['full_task_success_rate']
-                save_checkpoint(agent, config, 'best')
-                record_episode_videos(agent, config, 'best', config.training.video_n_episodes)
-            for k, v in result.items():
-                if isinstance(v, (float, int)):
-                    writer.add_scalar(f'eval/{k}', float(v), agent.total_steps)
-            badge = '  ◀ NEW BEST' if is_best else f'  (best so far: {best_full * 100:.1f}%)'
-            print(f'\n{SEP}')
-            print(f"  EVALUATION — Step {_fmt_steps(agent.total_steps)} ({result['n_episodes']} episodes, {eval_t:.1f}s)")
+
+            is_best = (eval_result['full_task_success_rate'] > best_full_task_sr)
+            if is_best and config.training.save_best:
+                best_full_task_sr = eval_result['full_task_success_rate']
+                save_checkpoint_and_videos(agent, config, 'best')
+
+            for k, v in eval_result.items():
+                if isinstance(v, (int, float)):
+                    writer.add_scalar(f'eval/{k}', v, agent.total_env_steps)
+
+            badge = "  <- NEW BEST" if is_best else f"  (best so far: {best_full_task_sr*100:.1f}%)"
+            print(f"\n{SEP}")
+            print(f"  EVALUATION  Step {format_steps(agent.total_env_steps)}  "
+                  f"({eval_result['n_episodes']} eps, {eval_t:.1f}s)")
             print(SEP2)
-            print(f"  Any-task success   : {result['any_task_success_rate'] * 100:5.1f}%")
-            print(f"  Full-task success  : {result['full_task_success_rate'] * 100:5.1f}%{badge}")
-            print(f"  Mean tasks done    : {result['mean_tasks_completed']:.2f} / {agent.n_tasks}")
-            print(f"  Mean env reward    : {result['mean_reward']:.4f} ± {result['std_reward']:.4f}")
-            print(f"  Mean HL steps      : {result['mean_high_steps']:.2f}")
-            print(f'{SEP}\n')
+            print(f"  Any-task success    {eval_result['any_task_success_rate']*100:5.1f}%")
+            print(f"  Full-task success   {eval_result['full_task_success_rate']*100:5.1f}%{badge}")
+            print(f"  Mean tasks done     {eval_result['mean_tasks_completed']:.2f}  /  {agent.n_tasks}")
+            print(f"  Mean options used   {eval_result['mean_options_used']:.1f}")
+            print(f"  Chosen-task SR      {eval_result['mean_chosen_task_success']*100:5.1f}%")
+            print(f"  Mean env reward     {eval_result['mean_env_reward']:.4f}  "
+                  f"+-  {eval_result['std_env_reward']:.4f}")
+            print(f"  Termination mix     {eval_result['termination_reasons']}")
+            print(f"{SEP}\n")
 
-        if ckpt_sched.should_save(agent.total_steps):
-            label = ckpt_sched.label(agent.total_steps)
-            save_checkpoint(agent, config, label)
-            record_episode_videos(agent, config, label, config.training.video_n_episodes)
+        # ---- Periodic checkpoint ----
+        if ckpt_sched.should_save(agent.total_env_steps):
+            lbl = ckpt_sched.label(agent.total_env_steps)
+            save_checkpoint_and_videos(agent, config, lbl)
 
-    pbar.close()
+    # =========================================================================
+    # Training complete
+    # =========================================================================
     writer.close()
-    env.close()
     total_time = time.time() - train_start
-    print(f'\n{SEP}')
-    print('  TRAINING COMPLETE')
+
+    print(f"\n{SEP}")
+    print(f"  TRAINING COMPLETE")
     print(SEP2)
-    print(f'  Total time        : {_fmt_time(total_time)}')
-    print(f'  Total steps       : {agent.total_steps:,}')
-    print(f'  Total episodes    : {agent.total_episodes:,}')
-    print(f'  Total options     : {agent.total_options:,}')
-    print(f'  Best full-task SR : {best_full * 100:.1f}%')
-    print(f'  Final epsilon     : {agent.manager_epsilon:.4f}')
-    print(f'  Train log         : {logger.log_path}')
-    print(f'{SEP}\n')
+    print(f"  Total time        {format_time(total_time)}")
+    print(f"  Total env steps   {agent.total_env_steps:,}")
+    print(f"  Total options     {agent.total_options:,}")
+    print(f"  Total episodes    {agent.total_episodes:,}")
+    print(f"  Best full-task SR {best_full_task_sr*100:.1f}%")
+    print(f"  Final epsilon     {agent.epsilon:.4f}")
+    print(f"  Log file          {logger.log_path}")
+    print(f"{SEP}\n")
+
+    # Final checkpoint + video
+    save_checkpoint_and_videos(agent, config, 'final')
     logger.close()
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Task-grounded hierarchical RL for Franka Kitchen v1')
+# =============================================================================
+# Entry point
+# =============================================================================
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="SMGW — FrankaKitchen-v1")
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--total_steps', type=int, default=1_200_000)
-    parser.add_argument('--encoder', type=str, default='r3m', choices=['r3m', 'dinov2'])
+    parser.add_argument('--total_steps', type=int, default=None,
+                        help='Override config.training.total_env_steps')
+    parser.add_argument('--encoder', type=str, default='r3m',
+                        choices=['r3m', 'dinov2'])
+    parser.add_argument('--subgoal_horizon', type=int, default=None)
     parser.add_argument('--log_dir', type=str, default=None)
     parser.add_argument('--tasks', type=str, nargs='+', default=None)
-    parser.add_argument('--option_horizon', type=int, default=None)
-    parser.add_argument('--max_high_level_steps', type=int, default=None)
-    parser.add_argument('--batch_size', type=int, default=None)
-    parser.add_argument('--eval_freq', type=int, default=None)
+    parser.add_argument('--action_chunk', type=int, default=None,
+                        help='Worker action chunk length (1 = single-step SAC). '
+                             'Use this flag to run the chunk-ablation experiment.')
+    parser.add_argument('--no_warmup_demo', action='store_true',
+                        help='Skip loading the demo GIF during Stage A.')
     parser.add_argument('--demo_gif', type=str, default=None)
-    parser.add_argument('--no_demo_prototypes', action='store_true')
     parser.add_argument('--no_video', action='store_true')
+    parser.add_argument('--n_probe_eps', type=int, default=None,
+                        help='Per-task probe episodes in Stage A.')
     args = parser.parse_args()
 
     config = Config()
     config.training.seed = args.seed
     config.training.device = args.device
-    config.training.total_timesteps = args.total_steps
-    config.encoder.name = args.encoder
+    if args.total_steps is not None:
+        config.training.total_env_steps = args.total_steps
     if args.log_dir is not None:
         config.training.log_dir = args.log_dir
     if args.tasks is not None:
         config.training.tasks_to_complete = args.tasks
-    if args.option_horizon is not None:
-        config.manager.option_horizon = args.option_horizon
-    if args.max_high_level_steps is not None:
-        config.manager.max_high_level_steps = args.max_high_level_steps
-    if args.batch_size is not None:
-        config.buffer.batch_size = args.batch_size
-    if args.eval_freq is not None:
-        config.training.eval_freq = args.eval_freq
+    config.encoder.name = args.encoder
+    if args.subgoal_horizon is not None:
+        config.manager.subgoal_horizon = args.subgoal_horizon
+    if args.action_chunk is not None:
+        assert args.action_chunk >= 1, "action_chunk must be >= 1"
+        config.worker.action_chunk_len = args.action_chunk
     if args.demo_gif is not None:
-        config.semantic.demo_gif_path = args.demo_gif
-    if args.no_demo_prototypes:
-        config.semantic.use_demo_prototypes = False
+        config.warmup.demo_gif_path = args.demo_gif
     if args.no_video:
         config.training.record_video = False
+    if args.no_warmup_demo:
+        config.warmup.use_demo_gif_for_context = False
+    if args.n_probe_eps is not None:
+        config.warmup.n_probe_episodes_per_task = args.n_probe_eps
+
+    config.__post_init__()  # re-run to update encoder raw_dim if needed
 
     if config.training.device == 'cuda':
-        assert torch.cuda.is_available(), 'CUDA not available — use --device cpu'
+        assert torch.cuda.is_available(), "CUDA not available — use --device cpu"
+
     train(config)
