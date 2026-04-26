@@ -1,38 +1,38 @@
 """
-warmup.py — Stage A: Demo BC pretraining for SMGW.
+warmup.py — Stage A: Demo pretraining for SMGW.
 
-This replaces the previous random-walk warmup. The new version:
-  1. Loads the Minari kitchen demos via demo_loader.
-  2. BC-trains the worker actor on (state, image, task_id) -> demo_action
-     with MSE over the pre-tanh action mean. Task labels come from the
-     demo's completion timeline (see demo_loader.py).
-  3. BC-trains the manager on (state, image, completion_mask) -> task_id
-     where the label is the task about to complete in the demo.
-  4. Populates the worker replay buffer with the demo transitions so Stage B
-     starts with a non-empty buffer of purposeful data.
+Two pretraining modes (controlled by config.warmup.use_iql):
 
-Why this is different (and better) than the previous warmup:
-  - Old warmup used random actions as BC targets. A small actor trained to
-    regress random actions has learned nothing useful.
-  - New warmup uses real teleoperated actions that actually cause the
-    objects to move toward the goals. The actor learns a real prior.
-  - The manager label used to be "the task that happened to complete
-    during random rollout" - almost always no label. Now it's "the task
-    that completes next in a demo" - ~4 labels per episode, hundreds of
-    episodes.
+  use_iql=True  [DEFAULT, recommended]:
+    IQL (Implicit Q-Learning) offline RL on the demo dataset.
+      1. Build dense per-step rewards from task-space error reduction.
+      2. Train V (expectile), Q (TD backup via V), and actor
+         (advantage-weighted BC) jointly for N_IQL_STEPS steps.
+      3. Follow with a short BC warmup for the actor (optional polish).
+    Advantage over pure BC: avoids mode-averaging on multimodal demos,
+    gives the actor a signal about which demo actions are actually useful.
 
-Verifying BC worked:
-  After Stage A completes, call run_single_task_eval() (in
-  single_task_eval.py) to measure how often the deterministic BC worker
-  completes each task when commanded. Target: 40-70% on the easier tasks
-  (microwave, slide cabinet).
+  use_iql=False  [fallback]:
+    Original MSE-BC: regress actor mean towards atanh(demo_action).
+    Simpler but prone to mode-averaging → wishy-washy near-zero actions
+    when the demo distribution is multimodal.
+
+Manager pretraining (BC, CE loss) is the same in both modes.
+
+Target single-task SR after Stage A (IQL mode):
+  microwave, slide cabinet : 40-70%
+  light switch              : 20-50%
+  kettle                    : 10-40%
+
+Run:
+  python train.py --warmup_only --eval_single_tasks --log_dir logs/run
 """
 from __future__ import annotations
 import os
 import numpy as np
 import torch
 import torch.nn.functional as F
-from typing import Dict
+from typing import Dict, Callable
 
 from config import Config
 from utils import TaskSpec
@@ -133,7 +133,13 @@ def _manager_bc_step(agent: SMGWAgent,
 
 def _populate_worker_buffer_from_demos(agent: SMGWAgent,
                                        ds: DemoBCDataset) -> int:
-    """Push every demo transition into the worker replay buffer."""
+    """
+    Push every demo transition into the worker replay buffer.
+
+    task_cur_next is now computed from proprio_next (not reusing task_cur),
+    which is the correct next-step task-state slice for SAC bootstrapping
+    in Stage B.
+    """
     H = agent.H_chunk
     n = ds.n_worker
     if n == 0:
@@ -144,19 +150,23 @@ def _populate_worker_buffer_from_demos(agent: SMGWAgent,
     else:
         actions_flat = ds.action
 
+    spec = agent.spec
     for i in range(n):
+        k = int(ds.task_id[i])
+        # Correct: task_cur_next from the NEXT state's task-space slice.
+        task_cur_next = spec.padded_state_slice_for(ds.proprio_next[i], k)
         agent.worker_buf.add(
             z=ds.z[i],
             proprio=ds.proprio[i],
             task_target=ds.task_target[i],
             task_cur=ds.task_cur[i],
             task_mask=ds.task_mask[i],
-            task_id=int(ds.task_id[i]),
+            task_id=k,
             action_flat=actions_flat[i],
             reward=float(ds.reward[i]),
             z_next=ds.z_next[i],
             proprio_next=ds.proprio_next[i],
-            task_cur_next=ds.task_cur[i],
+            task_cur_next=task_cur_next,
             done=0.0,
         )
 
@@ -201,6 +211,178 @@ def _make_manager_sampler(ds: DemoBCDataset):
     return sample
 
 
+def _make_iql_sampler(ds: DemoBCDataset,
+                      agent: SMGWAgent,
+                      config: Config) -> Callable[[int], Dict[str, np.ndarray]]:
+    """
+    Build a batch sampler for IQL training.
+
+    Key differences from the plain BC sampler:
+      1. Computes DENSE per-step rewards using task-space error reduction
+         (matches exactly what Stage B computes during online rollouts).
+      2. Computes task_cur_next from proprio_next rather than reusing task_cur.
+      3. Properly normalises proprio and proprio_next together.
+    """
+    n = ds.n_worker
+    spec = agent.spec
+    wcfg = config.worker
+
+    # Pre-compute task_cur_next and dense rewards for all samples at once.
+    # Both loops iterate over tasks (4 tasks × N/4 samples each) → fast.
+    print(f"  [IQL sampler] Pre-computing task_cur_next and dense rewards "
+          f"for {n:,} samples ...")
+    task_cur_next_all = np.zeros((n, spec.max_goal_dim), dtype=np.float32)
+    dense_reward_all  = np.zeros(n, dtype=np.float32)
+    action_cost_all   = wcfg.action_cost * np.sum(ds.action ** 2, axis=1)
+
+    for k in range(spec.n_tasks):
+        mask_k = (ds.task_id == k)
+        if not mask_k.any():
+            continue
+        idx_k = np.where(mask_k)[0]
+        # task_cur_next: extract and pad task-state slice from proprio_next
+        raw_next = ds.proprio_next[idx_k][:, spec.indices(k)]   # (N_k, d_k)
+        padded = np.zeros((len(idx_k), spec.max_goal_dim), dtype=np.float32)
+        padded[:, :raw_next.shape[1]] = raw_next
+        task_cur_next_all[idx_k] = padded
+        # dense reward: progress + completion bonus - action cost
+        raw_cur = ds.proprio[idx_k][:, spec.indices(k)]
+        goal_k  = spec.goal(k)
+        err_cur  = np.linalg.norm(raw_cur  - goal_k, axis=1)
+        err_next = np.linalg.norm(raw_next - goal_k, axis=1)
+        progress = err_cur - err_next
+        completion = (ds.reward[idx_k] > 0.5).astype(np.float32)
+        dense_reward_all[idx_k] = (
+            wcfg.progress_weight * progress
+            + wcfg.completion_bonus * completion
+            - action_cost_all[idx_k]
+        )
+    print(f"  [IQL sampler] Done. Reward stats: "
+          f"mean={dense_reward_all.mean():.4f}  "
+          f"min={dense_reward_all.min():.4f}  "
+          f"max={dense_reward_all.max():.4f}")
+
+    def sample(bs: int) -> Dict[str, np.ndarray]:
+        idx = np.random.randint(0, n, size=bs)
+
+        p_raw  = ds.proprio[idx]
+        pn_raw = ds.proprio_next[idx]
+        p_norm  = np.stack([agent.worker_buf.normalize_proprio(p_raw[b])
+                            for b in range(bs)]).astype(np.float32)
+        pn_norm = np.stack([agent.worker_buf.normalize_proprio(pn_raw[b])
+                            for b in range(bs)]).astype(np.float32)
+
+        # Tile action for chunked workers
+        H = agent.H_chunk
+        a = ds.action[idx]
+        if H > 1:
+            a = np.tile(a, (1, H))
+
+        return {
+            'z':             ds.z[idx].astype(np.float32),
+            'proprio':       p_norm,
+            'task_target':   ds.task_target[idx],
+            'task_cur':      ds.task_cur[idx],
+            'task_mask':     ds.task_mask[idx],
+            'task_id':       ds.task_id[idx],
+            'action':        a.astype(np.float32),
+            'reward':        dense_reward_all[idx],
+            'z_next':        ds.z_next[idx].astype(np.float32),
+            'proprio_next':  pn_norm,
+            'task_cur_next': task_cur_next_all[idx],
+            'done':          np.zeros(bs, dtype=np.float32),
+        }
+
+    return sample
+
+
+def _run_iql_training(agent: SMGWAgent,
+                      ds: DemoBCDataset,
+                      config: Config,
+                      verbose: bool = True) -> Dict[str, float]:
+    """
+    Train worker (V, Q, actor) with IQL for n_iql_steps steps.
+
+    Also runs a short BC polish pass on the actor afterwards to ensure the
+    actor distribution mode is well-aligned with the demo actions (IQL's
+    advantage weighting can leave the mode slightly off due to the clipped
+    exp-weight).
+
+    Returns a dict of final mean losses.
+    """
+    cfg = config.warmup
+    sampler = _make_iql_sampler(ds, agent, config)
+    bc_sampler = _make_worker_sampler(ds, agent)    # for the BC polish pass
+
+    iql_losses: Dict[str, list] = {
+        'iql/v_loss': [], 'iql/q_loss': [], 'iql/actor_loss': [],
+        'iql/adv_mean': [], 'iql/weight_mean': [], 'iql/logp_mean': [],
+    }
+
+    log_every = 5_000
+
+    if verbose:
+        print(f"\n  [Warmup] IQL pretraining: {cfg.n_iql_steps:,} steps, "
+              f"batch {cfg.bc_batch_size}, "
+              f"τ={cfg.iql_tau}, β={cfg.iql_beta}, γ={cfg.iql_gamma}")
+
+    for step in range(cfg.n_iql_steps):
+        batch = sampler(cfg.bc_batch_size)
+        losses = agent.update_worker_iql(
+            batch,
+            iql_tau=cfg.iql_tau,
+            iql_beta=cfg.iql_beta,
+            gamma=cfg.iql_gamma,
+            lr_override=cfg.iql_lr,
+        )
+        for k, v in losses.items():
+            if k in iql_losses:
+                iql_losses[k].append(v)
+
+        if verbose and (step + 1) % log_every == 0:
+            recent = {k: float(np.mean(v[-500:])) for k, v in iql_losses.items()}
+            print(f"    step {step+1:>7,}/{cfg.n_iql_steps:,}  "
+                  f"V={recent['iql/v_loss']:.4f}  "
+                  f"Q={recent['iql/q_loss']:.4f}  "
+                  f"actor={recent['iql/actor_loss']:.4f}  "
+                  f"adv={recent['iql/adv_mean']:.3f}  "
+                  f"w={recent['iql/weight_mean']:.2f}  "
+                  f"logp={recent['iql/logp_mean']:.3f}")
+
+    # Optional BC polish — DISABLED by default (n_iql_bc_polish_steps=0).
+    # WARNING: more than ~5k steps reintroduces MSE-BC mode-averaging and
+    # undoes the advantage-weighted IQL actor.  In the v2 run we observed
+    # BC polish (20k steps) returning the actor to the same 0.037 loss as
+    # pure BC, destroying IQL's per-task gains for slide cabinet / light switch.
+    n_polish = cfg.n_iql_bc_polish_steps
+    if n_polish > 0:
+        if verbose:
+            print(f"\n  [Warmup] BC polish: {n_polish:,} steps")
+        bc_losses = []
+        for step in range(n_polish):
+            bc_batch = bc_sampler(cfg.bc_batch_size)
+            bc_losses.append(
+                _worker_bc_step(agent, bc_batch, lr_override=cfg.bc_lr)
+            )
+            if verbose and (step + 1) % 1_000 == 0:
+                print(f"    step {step+1:>6,}/{n_polish:,}  "
+                      f"BC loss = {float(np.mean(bc_losses[-200:])):.5f}")
+        final_bc = float(np.mean(bc_losses[-200:]))
+        if verbose:
+            print(f"  [Warmup] BC polish final loss: {final_bc:.5f}")
+    else:
+        final_bc = float('nan')
+        if verbose:
+            print(f"\n  [Warmup] BC polish skipped (n_iql_bc_polish_steps=0).")
+
+    return {
+        'iql_v_loss_final':     float(np.mean(iql_losses['iql/v_loss'][-500:])),
+        'iql_q_loss_final':     float(np.mean(iql_losses['iql/q_loss'][-500:])),
+        'iql_actor_loss_final': float(np.mean(iql_losses['iql/actor_loss'][-500:])),
+        'bc_polish_loss_final': final_bc,
+    }
+
+
 # =============================================================================
 # Public entry point
 # =============================================================================
@@ -236,25 +418,34 @@ def run_stage_a_warmup(agent: SMGWAgent,
         print(f"  [Warmup] Worker buffer now holds {len(agent.worker_buf):,} transitions.")
         print(f"  [Warmup] Proprio running-stats N = {agent.worker_buf.proprio_stats.n:,}")
 
-    # 3. Worker BC
+    # 3. Worker pretraining — IQL (recommended) or plain BC (fallback)
     if ds.n_worker > 0:
-        if verbose:
-            print(f"\n  [Warmup] Worker BC: {cfg.warmup.n_worker_bc_steps:,} steps, "
-                  f"batch {cfg.warmup.bc_batch_size}, LR {cfg.warmup.bc_lr}")
-        sampler = _make_worker_sampler(ds, agent)
-        losses = []
-        for step in range(cfg.warmup.n_worker_bc_steps):
-            batch = sampler(cfg.warmup.bc_batch_size)
-            losses.append(_worker_bc_step(agent, batch,
-                                          lr_override=cfg.warmup.bc_lr))
-            if verbose and (step + 1) % 1000 == 0:
-                recent = float(np.mean(losses[-500:]))
-                print(f"    step {step+1:>6,}/{cfg.warmup.n_worker_bc_steps:,}  "
-                      f"BC loss (last 500) = {recent:.5f}")
-        results['worker_bc_loss_final'] = float(np.mean(losses[-500:]))
-        if verbose:
-            print(f"  [Warmup] Worker BC final loss: "
-                  f"{results['worker_bc_loss_final']:.5f}")
+        if cfg.warmup.use_iql:
+            if verbose:
+                print(f"\n  [Warmup] Worker pretraining: IQL mode")
+            iql_results = _run_iql_training(agent, ds, cfg, verbose=verbose)
+            results.update(iql_results)
+            results['worker_bc_loss_final'] = iql_results.get(
+                'bc_polish_loss_final', float('nan'))
+        else:
+            if verbose:
+                print(f"\n  [Warmup] Worker pretraining: BC mode "
+                      f"({cfg.warmup.n_worker_bc_steps:,} steps, "
+                      f"batch {cfg.warmup.bc_batch_size}, LR {cfg.warmup.bc_lr})")
+            sampler = _make_worker_sampler(ds, agent)
+            losses = []
+            for step in range(cfg.warmup.n_worker_bc_steps):
+                batch = sampler(cfg.warmup.bc_batch_size)
+                losses.append(_worker_bc_step(agent, batch,
+                                              lr_override=cfg.warmup.bc_lr))
+                if verbose and (step + 1) % 1000 == 0:
+                    recent = float(np.mean(losses[-500:]))
+                    print(f"    step {step+1:>6,}/{cfg.warmup.n_worker_bc_steps:,}  "
+                          f"BC loss (last 500) = {recent:.5f}")
+            results['worker_bc_loss_final'] = float(np.mean(losses[-500:]))
+            if verbose:
+                print(f"  [Warmup] Worker BC final loss: "
+                      f"{results['worker_bc_loss_final']:.5f}")
     else:
         results['worker_bc_loss_final'] = float('nan')
 

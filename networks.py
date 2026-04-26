@@ -279,6 +279,29 @@ class GroundedWorkerActor(nn.Module):
         h = self.trunk(z, proprio, task_target, task_cur, task_mask, task_embed)
         return torch.tanh(self.mean_head(h))
 
+    def log_prob_of(self,
+                    z: torch.Tensor,
+                    proprio: torch.Tensor,
+                    task_target: torch.Tensor,
+                    task_cur: torch.Tensor,
+                    task_mask: torch.Tensor,
+                    task_embed: torch.Tensor,
+                    action_flat: torch.Tensor) -> torch.Tensor:
+        """
+        Log-probability of a given action under the current policy.
+
+        action_flat : (B, out_dim) — tanh-squashed, in [-1, 1].
+        Returns     : (B,) log-probability summed over all action/chunk dims.
+
+        Used by IQL advantage-weighted BC:
+            loss = -mean( exp(beta * A(s,a)) * log_prob_of(s, a_demo) )
+        """
+        dist = self._dist(z, proprio, task_target, task_cur, task_mask, task_embed)
+        a = action_flat.clamp(-1.0 + 1e-6, 1.0 - 1e-6)
+        x = torch.atanh(a)                                  # invert tanh squashing
+        logp = dist.log_prob(x) - torch.log(1.0 - a.pow(2) + 1e-6)
+        return logp.sum(-1)                                  # (B,)
+
     def action_to_chunk(self, action: torch.Tensor) -> torch.Tensor:
         """
         Reshape a flat action output (B, H*A) into (B, H, A). When H==1 this
@@ -324,3 +347,44 @@ class GroundedWorkerCritic(nn.Module):
         q1 = self.q1(torch.cat([h1, action], dim=-1))
         q2 = self.q2(torch.cat([h2, action], dim=-1))
         return q1, q2
+
+
+# =============================================================================
+# Grounded Worker Value — V(s, task) for IQL offline pretraining
+# =============================================================================
+
+class GroundedWorkerValue(nn.Module):
+    """
+    Twin state-value function V(s, task) used during IQL offline pretraining.
+    Identical inputs to the actor/critic trunk but NO action input.
+
+    Twin architecture (V1, V2) mirrors the twin-Q critic for stability:
+    the IQL V-update uses min(Q1, Q2) as target and the Q-update uses
+    min(V1_target, V2_target) for bootstrapping.
+    """
+    def __init__(self,
+                 z_dim: int,
+                 proprio_dim: int,
+                 max_goal_dim: int,
+                 text_embed_dim: int,
+                 hidden_dim: int = 256,
+                 n_layers: int = 3):
+        super().__init__()
+        self.trunk_1 = WorkerTrunk(z_dim, proprio_dim, max_goal_dim,
+                                   text_embed_dim, hidden_dim, n_layers)
+        self.trunk_2 = WorkerTrunk(z_dim, proprio_dim, max_goal_dim,
+                                   text_embed_dim, hidden_dim, n_layers)
+        self.v1 = nn.Linear(hidden_dim, 1)
+        self.v2 = nn.Linear(hidden_dim, 1)
+
+    def forward(self,
+                z: torch.Tensor,
+                proprio: torch.Tensor,
+                task_target: torch.Tensor,
+                task_cur: torch.Tensor,
+                task_mask: torch.Tensor,
+                task_embed: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Returns (v1, v2), each shape (B,)."""
+        h1 = self.trunk_1(z, proprio, task_target, task_cur, task_mask, task_embed)
+        h2 = self.trunk_2(z, proprio, task_target, task_cur, task_mask, task_embed)
+        return self.v1(h1).squeeze(-1), self.v2(h2).squeeze(-1)

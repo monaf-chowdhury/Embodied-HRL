@@ -32,7 +32,8 @@ from typing import Dict, List, Optional
 from config import Config
 from utils import TaskSpec, build_frozen_text_embeddings
 from encoder import VisualEncoder
-from networks import SemanticManager, GroundedWorkerActor, GroundedWorkerCritic
+from networks import (SemanticManager, GroundedWorkerActor, GroundedWorkerCritic,
+                      GroundedWorkerValue)
 from buffers import ManagerBuffer, WorkerBuffer
 
 
@@ -157,6 +158,23 @@ class SMGWAgent:
                                                  lr=config.worker.actor_lr)
         self.worker_critic_opt = torch.optim.Adam(self.worker_critic.parameters(),
                                                   lr=config.worker.critic_lr)
+
+        # ---- Worker value function (IQL offline pretraining only) ----
+        self.worker_value = GroundedWorkerValue(
+            z_dim=z_dim, proprio_dim=proprio_dim,
+            max_goal_dim=max_goal_dim, text_embed_dim=text_dim,
+            hidden_dim=config.worker.hidden_dim,
+            n_layers=config.worker.n_layers,
+        ).to(self.device)
+        self.worker_value_target = GroundedWorkerValue(
+            z_dim=z_dim, proprio_dim=proprio_dim,
+            max_goal_dim=max_goal_dim, text_embed_dim=text_dim,
+            hidden_dim=config.worker.hidden_dim,
+            n_layers=config.worker.n_layers,
+        ).to(self.device)
+        self.worker_value_target.load_state_dict(self.worker_value.state_dict())
+        self.worker_value_opt = torch.optim.Adam(self.worker_value.parameters(),
+                                                 lr=config.worker.critic_lr)
 
         # SAC entropy temperature
         if config.worker.auto_alpha:
@@ -577,6 +595,161 @@ class SMGWAgent:
         }
 
     # =========================================================================
+    # IQL offline pretraining update — called from warmup.py Stage A
+    # =========================================================================
+
+    def update_worker_iql(self,
+                          batch: Dict[str, np.ndarray],
+                          iql_tau: float = 0.7,
+                          iql_beta: float = 3.0,
+                          gamma: float = 0.99,
+                          lr_override: Optional[float] = None) -> Dict[str, float]:
+        """
+        One IQL step: update V, Q, and actor from a batch of DEMO transitions.
+
+        IQL (Kostrikov et al. 2021) avoids OOD actions entirely:
+          V  ← expectile regression on Q (learns an optimistic value function)
+          Q  ← TD backup using V_target(s') as next-state value
+          π  ← advantage-weighted BC: exp(β*(Q(s,a)-V(s))) * log π(a|s)
+
+        All three updates share the same demo batch. Actor is never queried
+        to generate new actions — the demo action a_demo is used throughout.
+
+        Args:
+            batch         : dict with keys z, proprio, task_target, task_cur,
+                            task_mask, task_id, action, reward, z_next,
+                            proprio_next, task_cur_next, done — all float32 np.
+            iql_tau       : expectile (0.5=mean, 0.9=optimistic)
+            iql_beta      : advantage temperature (higher → sharper weighting)
+            gamma         : discount for Q-update TD target
+            lr_override   : if set, temporarily override all optimiser LRs
+        """
+        device = self.device
+
+        def to(x):
+            return torch.from_numpy(x).float().to(device)
+
+        z   = to(batch['z'])
+        p   = to(batch['proprio'])
+        tt  = to(batch['task_target'])
+        tc  = to(batch['task_cur'])
+        tm  = to(batch['task_mask'])
+        tid = torch.from_numpy(batch['task_id']).long().to(device)
+        a   = to(batch['action'])
+        r   = to(batch['reward'])
+        zn  = to(batch['z_next'])
+        pn  = to(batch['proprio_next'])
+        tcn = to(batch['task_cur_next'])
+        don = to(batch['done'])
+        te  = self.spec.text_embeddings[tid]       # (B, d_text)
+
+        def _set_lr(optimizers, lr):
+            for opt in optimizers:
+                for g in opt.param_groups:
+                    g['_saved_lr'] = g['lr']
+                    g['lr'] = lr
+
+        def _restore_lr(optimizers):
+            for opt in optimizers:
+                for g in opt.param_groups:
+                    g['lr'] = g.pop('_saved_lr', g['lr'])
+
+        all_opts = [self.worker_value_opt,
+                    self.worker_critic_opt,
+                    self.worker_actor_opt]
+        if lr_override is not None:
+            _set_lr(all_opts, lr_override)
+
+        # ------------------------------------------------------------------
+        # 1. V update — expectile regression targeting min(Q1, Q2)
+        # ------------------------------------------------------------------
+        with torch.no_grad():
+            q1_sg, q2_sg = self.worker_critic(z, p, tt, tc, tm, te, a)
+            q_target = torch.min(q1_sg.squeeze(-1), q2_sg.squeeze(-1))
+
+        v1, v2 = self.worker_value(z, p, tt, tc, tm, te)
+
+        def expectile_loss(diff: torch.Tensor, tau: float) -> torch.Tensor:
+            # Asymmetric L2: weight τ when diff>0, (1-τ) when diff<0
+            weight = torch.where(diff > 0,
+                                 torch.full_like(diff, tau),
+                                 torch.full_like(diff, 1.0 - tau))
+            return (weight * diff.pow(2)).mean()
+
+        loss_v = (expectile_loss(q_target - v1, iql_tau)
+                  + expectile_loss(q_target - v2, iql_tau))
+
+        self.worker_value_opt.zero_grad()
+        loss_v.backward()
+        torch.nn.utils.clip_grad_norm_(self.worker_value.parameters(), 1.0)
+        self.worker_value_opt.step()
+
+        # Soft update value target
+        self._soft_update(self.worker_value, self.worker_value_target,
+                          self.config.worker.tau)
+
+        # ------------------------------------------------------------------
+        # 2. Q update — TD backup using V_target(s') (no OOD actions)
+        # ------------------------------------------------------------------
+        with torch.no_grad():
+            v1n, v2n = self.worker_value_target(zn, pn, tt, tcn, tm, te)
+            v_next = torch.min(v1n, v2n)
+            # For chunked workers, gamma is raised to chunk length power
+            # (reward is chunk-summed, TD target uses next-chunk-start state).
+            gamma_eff = gamma ** self.H_chunk
+            q_td = r + gamma_eff * (1.0 - don) * v_next
+
+        q1, q2 = self.worker_critic(z, p, tt, tc, tm, te, a)
+        loss_q = (F.mse_loss(q1.squeeze(-1), q_td)
+                  + F.mse_loss(q2.squeeze(-1), q_td))
+
+        self.worker_critic_opt.zero_grad()
+        loss_q.backward()
+        torch.nn.utils.clip_grad_norm_(self.worker_critic.parameters(), 1.0)
+        self.worker_critic_opt.step()
+
+        # Soft update critic target
+        self._soft_update(self.worker_critic, self.worker_critic_target,
+                          self.config.worker.tau)
+
+        # ------------------------------------------------------------------
+        # 3. Actor update — advantage-weighted BC
+        #    loss = -E[ exp(β * (Q(s,a) - V(s))) * log π(a|s) ]
+        # ------------------------------------------------------------------
+        with torch.no_grad():
+            q1a, q2a = self.worker_critic(z, p, tt, tc, tm, te, a)
+            q_adv    = torch.min(q1a.squeeze(-1), q2a.squeeze(-1))
+            v1_adv, v2_adv = self.worker_value(z, p, tt, tc, tm, te)
+            v_adv    = torch.min(v1_adv, v2_adv)
+            adv      = q_adv - v_adv
+            # Clamp weights.  max=20 prevents the runaway feedback loop where
+            # high logp → higher effective weights → even higher logp → collapse.
+            # With β=1 (recommended), exp(1 * adv) stays in [0.37, 20] for
+            # ±1σ advantage range, which is stable.
+            weights  = torch.exp(iql_beta * adv).clamp(max=20.0)
+
+        logp = self.worker_actor.log_prob_of(z, p, tt, tc, tm, te, a)
+        loss_actor = -(weights * logp).mean()
+
+        self.worker_actor_opt.zero_grad()
+        loss_actor.backward()
+        torch.nn.utils.clip_grad_norm_(self.worker_actor.parameters(), 1.0)
+        self.worker_actor_opt.step()
+
+        if lr_override is not None:
+            _restore_lr(all_opts)
+
+        return {
+            'iql/v_loss':        float(loss_v.item()),
+            'iql/q_loss':        float(loss_q.item()),
+            'iql/actor_loss':    float(loss_actor.item()),
+            'iql/q_mean':        float(q_td.mean().item()),
+            'iql/adv_mean':      float(adv.mean().item()),
+            'iql/weight_mean':   float(weights.mean().item()),
+            'iql/logp_mean':     float(logp.mean().item()),
+        }
+
+    # =========================================================================
     # Updates — manager DQN
     # =========================================================================
 
@@ -645,6 +818,8 @@ class SMGWAgent:
             'worker_actor': self.worker_actor.state_dict(),
             'worker_critic': self.worker_critic.state_dict(),
             'worker_critic_target': self.worker_critic_target.state_dict(),
+            'worker_value': self.worker_value.state_dict(),
+            'worker_value_target': self.worker_value_target.state_dict(),
             'log_alpha': float(self.log_alpha.detach().cpu().item()),
             'total_env_steps': self.total_env_steps,
             'total_options': self.total_options,
@@ -662,6 +837,9 @@ class SMGWAgent:
         self.worker_actor.load_state_dict(ckpt['worker_actor'])
         self.worker_critic.load_state_dict(ckpt['worker_critic'])
         self.worker_critic_target.load_state_dict(ckpt['worker_critic_target'])
+        if 'worker_value' in ckpt:
+            self.worker_value.load_state_dict(ckpt['worker_value'])
+            self.worker_value_target.load_state_dict(ckpt['worker_value_target'])
         if self.config.worker.auto_alpha:
             self.log_alpha.data = torch.tensor(ckpt['log_alpha'],
                                                device=self.device)

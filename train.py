@@ -278,14 +278,23 @@ def print_start_banner(config: Config, log_path: str):
     print(f"  NOTE: Zero latent-distance terms anywhere. All rewards are "
           f"grounded in benchmark completion bits and task-space errors.")
     print(SEP2)
-    print(f"  Stage A        : Demo BC from Minari")
+    _mode = "IQL + BC polish" if config.warmup.use_iql else "BC only"
+    print(f"  Stage A        : Demo pretraining ({_mode}) from Minari")
     print(f"  Demo datasets  : {config.warmup.minari_dataset_ids}")
     print(f"  Demo cache     : {config.warmup.cache_path}  "
           f"(rebuild={config.warmup.rebuild_cache})")
     print(f"  Max/task       : {config.warmup.max_per_task:,}")
-    print(f"  Worker BC      : {config.warmup.n_worker_bc_steps:,} steps")
+    if config.warmup.use_iql:
+        print(f"  IQL steps      : {config.warmup.n_iql_steps:,}  "
+              f"τ={config.warmup.iql_tau}  β={config.warmup.iql_beta}  "
+              f"γ={config.warmup.iql_gamma}")
+        _polish = config.warmup.n_iql_bc_polish_steps
+        print(f"  BC polish      : {_polish:,} steps"
+              f"{'  (skipped)' if _polish == 0 else ''}")
+    else:
+        print(f"  Worker BC      : {config.warmup.n_worker_bc_steps:,} steps")
     print(f"  Manager BC     : {config.warmup.n_manager_bc_steps:,} steps")
-    print(f"  BC LR / batch  : {config.warmup.bc_lr} / {config.warmup.bc_batch_size}")
+    print(f"  LR / batch     : {config.warmup.bc_lr} / {config.warmup.bc_batch_size}")
     print(f"  Stage B steps  : {config.training.total_env_steps:,}")
     print(f"  Batch size     : {config.buffer.batch_size}")
     print(f"  Buffer cap     : worker={config.buffer.worker_capacity:,}  "

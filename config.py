@@ -171,6 +171,10 @@ class WarmupConfig:
     render_demo_images: bool = True
 
     # ---- BC training ----
+    # n_worker_bc_steps is used in TWO places:
+    #   1. When use_iql=False: this is the SOLE actor training (plain MSE-BC).
+    #   2. When use_iql=True:  this is a short BC polish AFTER IQL — kept at 0
+    #      by default to avoid undoing IQL gains (see n_iql_bc_polish_steps).
     n_worker_bc_steps: int = 20_000
     n_manager_bc_steps: int = 3_000
     bc_batch_size: int = 256
@@ -180,6 +184,28 @@ class WarmupConfig:
     # without redoing warmup.
     save_bc_checkpoint: bool = True
     bc_checkpoint_path: str = "logs/smgw_bc/bc_worker.pt"
+
+    # ---- IQL offline pretraining ----
+    # Replaces pure MSE-BC for the worker actor.  IQL trains a Q-function and
+    # value function from the demo data, then updates the actor with advantage-
+    # weighted BC: actions with Q(s,a) > V(s) are imitated more strongly.
+    # This avoids the mode-averaging failure of MSE-BC on multimodal demos.
+    # Set use_iql=False to fall back to the original pure-BC path.
+    use_iql: bool = True
+    iql_tau: float = 0.7        # expectile for V update (0.5=mean, →1=max-return)
+    iql_beta: float = 1.0       # advantage weight temperature — keep ≤1.0 to avoid
+                                #   actor collapse before Q/V converge. β=3 caused
+                                #   runaway logp in tests; β=1 is the stable regime.
+    iql_gamma: float = 0.99     # Q-function discount
+    n_iql_steps: int = 100_000  # V + Q + actor update steps (interleaved)
+    iql_lr: float = 3e-4        # LR for V, Q, and actor during IQL
+
+    # When use_iql=True, run a short BC polish after IQL to re-align the actor
+    # mode with demo actions (IQL advantage-weighting can shift the mode
+    # slightly).  Set to 0 to skip entirely.
+    # WARNING: large values (>5k) risk re-introducing MSE-BC mode-averaging
+    # and undoing IQL gains.  Keep at ≤5k.
+    n_iql_bc_polish_steps: int = 0   # set to 0: skip; set to 2000-5000: light polish
 
 
 # =============================================================================
