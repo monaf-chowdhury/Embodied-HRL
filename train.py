@@ -3,12 +3,13 @@ train.py — SMGW training: Stage A (task-grounded warmup) -> Stage B (joint HRL
 
 Usage:
     python train.py [--seed 42] [--device cuda] [--log_dir logs/run1]
+    python train.py --bc_only --demo_datasets franka-complete franka-mixed franka-partial
     python train.py --total_steps 1500000 --action_chunk 4
-    python train.py --no_warmup_demo --no_video
 
 Design notes:
-  - Stage A: warmup.run_stage_a_warmup fills the worker buffer, BC-trains
-    the worker actor, and CE-trains the manager with KNOWN labels.
+  - Stage A: warmup.run_stage_a_warmup loads offline demos, replays them
+    through MuJoCo for rendering, BC-trains the worker actor, and optionally
+    CE-trains the manager with demo-derived labels.
   - Stage B: for every env step, (a) manager picks a task from REMAINING
     tasks, (b) worker runs an option (chunks of H actions) with dense
     task-grounded rewards, (c) worker SAC updates online, (d) when the
@@ -19,14 +20,16 @@ Design notes:
     saves model weights AND records N evaluation videos so you can
     visually inspect what the policy does at that point.
 """
+from __future__ import annotations
+
 import os
 import sys
 import time
+import random
 import datetime
 import argparse
 import numpy as np
 import torch
-from __future__ import annotations
 from typing import Dict, Optional
 from torch.utils.tensorboard import SummaryWriter
 
@@ -130,7 +133,7 @@ def evaluate(agent: SMGWAgent,
         collect_frames = (record_dir is not None and ep_i < n_videos)
         frames_accum = []
 
-        img, state = env.reset()
+        img, state = env.reset(seed=config.training.seed + 10_000 + ep_i)
         z = agent.encoder.encode_numpy(img).squeeze()
         proprio = state.copy()
         completion = np.zeros(agent.n_tasks, dtype=np.float32)
@@ -210,6 +213,155 @@ def evaluate(agent: SMGWAgent,
         'termination_reasons': termination_reasons,
     }
 
+
+def evaluate_single_task_worker(agent: SMGWAgent,
+                                config: Config,
+                                n_episodes: Optional[int] = None,
+                                deterministic: bool = True,
+                                record_dir: Optional[str] = None) -> Dict[str, float]:
+    """
+    Evaluate the worker alone by repeatedly commanding a single task until
+    success or episode termination. This is the first real post-BC signal.
+
+    If `record_dir` is set, save the best rollout for each task:
+      - best successful rollout if any succeeded
+      - otherwise the closest / best-reward attempt
+    """
+    n_eps = n_episodes or config.eval.n_single_task_episodes
+    results: Dict[str, float] = {}
+    report_lines = [
+        "Stage A Single-Task Evaluation",
+        f"episodes_per_task={n_eps}",
+        "",
+    ]
+
+    print(SEP2)
+    print("  STAGE A EVAL  —  Deterministic worker, one commanded task at a time")
+    print(SEP2)
+
+    for task_id, task_name in enumerate(agent.tasks):
+        env = FrankaKitchenImageWrapper(
+            tasks_to_complete=[task_name],
+            img_size=config.encoder.img_size,
+            terminate_on_tasks_completed=True,
+        )
+        success = []
+        option_counts = []
+        env_rewards = []
+        best_rollout = None
+
+        for ep_idx in range(n_eps):
+            img, state = env.reset(
+                seed=config.training.seed + 20_000 + 1000 * task_id + ep_idx
+            )
+            z = agent.encoder.encode_numpy(img).squeeze()
+            completion = np.zeros(agent.n_tasks, dtype=np.float32)
+            collect_frames = record_dir is not None
+            frames_accum = [img.copy()] if collect_frames else []
+
+            done = False
+            ep_success = False
+            ep_options = 0
+            ep_env_reward = 0.0
+
+            while not done and not ep_success and ep_options < config.manager.max_high_level_steps:
+                result = agent.execute_option(
+                    env=env,
+                    task_id=task_id,
+                    start_img=img,
+                    start_state=state,
+                    start_z=z,
+                    completion=completion,
+                    deterministic_worker=deterministic,
+                    collect_frames=collect_frames,
+                    train_worker_online=False,
+                )
+                state = result.proprio_end
+                z = result.z_end
+                completion = result.completion_end
+                done = result.env_done
+                ep_options += 1
+                ep_env_reward += result.env_reward_sum
+                ep_success = bool(
+                    result.chosen_task_completed
+                    or completion[task_id] > 0.5
+                    or agent.spec.is_close(state, task_id)
+                )
+                if collect_frames and result.frames:
+                    frames_accum.extend(result.frames[1:])
+                if not done:
+                    img = env.render_image()
+
+            success.append(float(ep_success))
+            option_counts.append(float(ep_options))
+            env_rewards.append(float(ep_env_reward))
+            final_error = agent.spec.task_error(state, task_id)
+
+            if collect_frames and frames_accum:
+                score = (
+                    1 if ep_success else 0,
+                    -float(final_error),
+                    float(ep_env_reward),
+                    -float(ep_options),
+                )
+                if best_rollout is None or score > best_rollout["score"]:
+                    best_rollout = {
+                        "score": score,
+                        "frames": list(frames_accum),
+                        "success": bool(ep_success),
+                        "reward": float(ep_env_reward),
+                        "final_error": float(final_error),
+                        "options": int(ep_options),
+                        "episode_index": int(ep_idx),
+                    }
+
+        env.close()
+
+        sr = float(np.mean(success))
+        mean_opts = float(np.mean(option_counts))
+        mean_reward = float(np.mean(env_rewards))
+        safe_task = task_name.lower().replace(" ", "_")
+        results[f"single_task/{safe_task}_success_rate"] = sr
+        results[f"single_task/{safe_task}_mean_options"] = mean_opts
+        results[f"single_task/{safe_task}_mean_env_reward"] = mean_reward
+
+        print(f"  {task_name:<14} success={sr*100:5.1f}%  "
+              f"mean_options={mean_opts:4.1f}  env_reward={mean_reward:7.3f}")
+
+        if record_dir is not None and best_rollout is not None:
+            task_dir = os.path.join(record_dir, safe_task)
+            os.makedirs(task_dir, exist_ok=True)
+            video_name = 'best_success.mp4' if best_rollout["success"] else 'best_attempt.mp4'
+            video_path = os.path.join(task_dir, video_name)
+            save_video(best_rollout["frames"], video_path, fps=config.training.video_fps)
+            report_lines.append(
+                f"{task_name}: success_rate={sr:.4f} mean_options={mean_opts:.3f} "
+                f"mean_env_reward={mean_reward:.4f} saved={video_path} "
+                f"best_episode={best_rollout['episode_index']} "
+                f"best_success={int(best_rollout['success'])} "
+                f"best_final_error={best_rollout['final_error']:.6f} "
+                f"best_options={best_rollout['options']} "
+                f"best_reward={best_rollout['reward']:.4f}"
+            )
+
+    success_keys = [k for k in results if k.endswith("_success_rate")]
+    results["single_task/mean_success_rate"] = float(
+        np.mean([results[k] for k in success_keys])
+    ) if success_keys else 0.0
+    print(SEP3)
+    print(f"  Mean single-task success: {results['single_task/mean_success_rate']*100:5.1f}%")
+    print(SEP2 + "\n")
+
+    if record_dir is not None:
+        os.makedirs(record_dir, exist_ok=True)
+        report_path = os.path.join(record_dir, 'summary.txt')
+        with open(report_path, 'w', encoding='utf-8') as f:
+            f.write("\n".join(report_lines) + "\n")
+        print(f"  [Stage A Video] Saved best single-task rollouts -> {record_dir}")
+        print(f"  [Stage A Video] Summary -> {report_path}")
+
+    return results
+
 # =============================================================================
 # Save checkpoint and record eval videos
 # =============================================================================
@@ -268,13 +420,19 @@ def print_start_banner(config: Config, log_path: str):
           f"completion={config.worker.completion_bonus}  "
           f"action_cost={config.worker.action_cost}  "
           f"failure={config.worker.failure_penalty}")
+    print(f"  Stage B stabil.: deterministic_rollout_steps={config.training.deterministic_worker_rollout_steps:,}  "
+          f"demo_bc_weight={config.worker.online_demo_bc_weight}  "
+          f"demo_bc_steps={config.worker.online_demo_bc_steps:,}")
     print(f"  NOTE: Zero latent-distance terms anywhere. All rewards are "
           f"grounded in benchmark completion bits and task-space errors.")
     print(SEP2)
-    print(f"  Stage A probes : {config.warmup.n_probe_episodes_per_task} ep/task "
-          f"* {config.warmup.probe_steps_per_episode} steps")
-    print(f"  Stage A BC     : worker={config.warmup.n_worker_sl_steps} steps, "
-          f"manager={config.warmup.n_manager_sl_steps} steps")
+    print(f"  Stage A demos  : {config.warmup.dataset_ids}")
+    print(f"  Stage A cache  : {config.warmup.cache_dir}  "
+          f"(rebuild={config.warmup.rebuild_cache})")
+    print(f"  Stage A BC/IQL : worker_bc={config.warmup.n_worker_sl_steps}  "
+          f"worker_iql={config.warmup.n_worker_iql_steps}  "
+          f"manager_ce={config.warmup.n_manager_sl_steps}  "
+          f"(batch={config.warmup.sl_batch_size})")
     print(f"  Stage B steps  : {config.training.total_env_steps:,}")
     print(f"  Batch size     : {config.buffer.batch_size}")
     print(f"  Buffer cap     : worker={config.buffer.worker_capacity:,}  "
@@ -296,10 +454,20 @@ def print_start_banner(config: Config, log_path: str):
 def train(config: Config):
     logger = Logger(config.training.log_dir)
 
+    random.seed(config.training.seed)
     np.random.seed(config.training.seed)
     torch.manual_seed(config.training.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(config.training.seed)
+        torch.cuda.manual_seed_all(config.training.seed)
+    if config.training.deterministic_torch:
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except Exception:
+            pass
+        if hasattr(torch.backends, 'cudnn'):
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
 
     writer = SummaryWriter(config.training.log_dir)
     ckpt_sched = CheckpointScheduler(
@@ -332,7 +500,34 @@ def train(config: Config):
     for k, v in warmup_stats.items():
         if isinstance(v, (int, float)):
             writer.add_scalar(f'warmup/{k}', v, 0)
+
+    stage_a_video_dir = None
+    if config.training.record_video:
+        stage_a_video_dir = os.path.join(
+            config.training.log_dir, 'videos', 'stage_a_single_task'
+        )
+    single_task_eval = evaluate_single_task_worker(
+        agent,
+        config,
+        deterministic=config.eval.deterministic_worker,
+        record_dir=stage_a_video_dir,
+    )
+    for k, v in single_task_eval.items():
+        writer.add_scalar(f'stage_a_eval/{k}', v, 0)
     print(f"{SEP}\n")
+
+    if config.training.stage_a_only:
+        writer.close()
+        env.close()
+        print(f"\n{SEP}")
+        print("  STAGE A ONLY RUN COMPLETE")
+        print(SEP2)
+        print(f"  Worker BC loss     {warmup_stats.get('worker_bc_loss_final', float('nan')):.4f}")
+        print(f"  Mean single-task SR {single_task_eval.get('single_task/mean_success_rate', 0.0)*100:.1f}%")
+        print(f"  Log file           {logger.log_path}")
+        print(f"{SEP}\n")
+        logger.close()
+        return
 
     # =========================================================================
     # Stage B: joint HRL training
@@ -363,7 +558,7 @@ def train(config: Config):
     while agent.total_env_steps < config.training.total_env_steps:
 
         # ---- Episode reset ----
-        img, state = env.reset()
+        img, state = env.reset(seed=config.training.seed + agent.total_episodes)
         z = agent.encoder.encode_numpy(img).squeeze()
         proprio = state.copy()
         completion = np.zeros(agent.n_tasks, dtype=np.float32)
@@ -388,7 +583,9 @@ def train(config: Config):
                 task_id=task_id,
                 start_img=img, start_state=state, start_z=z,
                 completion=completion,
-                deterministic_worker=False,
+                deterministic_worker=(
+                    agent.total_env_steps < config.training.deterministic_worker_rollout_steps
+                ),
                 collect_frames=False,
                 train_worker_online=True,
                 update_every_n_env_steps=update_every_n,
@@ -580,12 +777,23 @@ if __name__ == "__main__":
     parser.add_argument('--action_chunk', type=int, default=None,
                         help='Worker action chunk length (1 = single-step SAC). '
                              'Use this flag to run the chunk-ablation experiment.')
-    parser.add_argument('--no_warmup_demo', action='store_true',
-                        help='Skip loading the demo GIF during Stage A.')
-    parser.add_argument('--demo_gif', type=str, default=None)
+    parser.add_argument('--bc_only', action='store_true',
+                        help='Run Stage A demo BC + single-task worker eval, then exit.')
+    parser.add_argument('--demo_source', type=str, default=None,
+                        choices=['auto', 'minari', 'd4rl'])
+    parser.add_argument('--demo_datasets', type=str, nargs='+', default=None,
+                        help='Demo datasets or aliases, e.g. franka-complete '
+                             'franka-mixed franka-partial.')
+    parser.add_argument('--demo_cache_dir', type=str, default=None)
+    parser.add_argument('--rebuild_demo_cache', action='store_true')
+    parser.add_argument('--worker_bc_steps', type=int, default=None)
+    parser.add_argument('--worker_iql_steps', type=int, default=None)
+    parser.add_argument('--manager_ce_steps', type=int, default=None)
+    parser.add_argument('--online_demo_bc_weight', type=float, default=None)
+    parser.add_argument('--online_demo_bc_steps', type=int, default=None)
+    parser.add_argument('--deterministic_worker_rollout_steps', type=int, default=None)
+    parser.add_argument('--single_task_eval_episodes', type=int, default=None)
     parser.add_argument('--no_video', action='store_true')
-    parser.add_argument('--n_probe_eps', type=int, default=None,
-                        help='Per-task probe episodes in Stage A.')
     args = parser.parse_args()
 
     config = Config()
@@ -603,14 +811,32 @@ if __name__ == "__main__":
     if args.action_chunk is not None:
         assert args.action_chunk >= 1, "action_chunk must be >= 1"
         config.worker.action_chunk_len = args.action_chunk
-    if args.demo_gif is not None:
-        config.warmup.demo_gif_path = args.demo_gif
+    if args.bc_only:
+        config.training.stage_a_only = True
+    if args.demo_source is not None:
+        config.warmup.dataset_source = args.demo_source
+    if args.demo_datasets is not None:
+        config.warmup.dataset_ids = args.demo_datasets
+    if args.demo_cache_dir is not None:
+        config.warmup.cache_dir = args.demo_cache_dir
+    if args.rebuild_demo_cache:
+        config.warmup.rebuild_cache = True
+    if args.worker_bc_steps is not None:
+        config.warmup.n_worker_sl_steps = args.worker_bc_steps
+    if args.worker_iql_steps is not None:
+        config.warmup.n_worker_iql_steps = args.worker_iql_steps
+    if args.manager_ce_steps is not None:
+        config.warmup.n_manager_sl_steps = args.manager_ce_steps
+    if args.online_demo_bc_weight is not None:
+        config.worker.online_demo_bc_weight = args.online_demo_bc_weight
+    if args.online_demo_bc_steps is not None:
+        config.worker.online_demo_bc_steps = args.online_demo_bc_steps
+    if args.deterministic_worker_rollout_steps is not None:
+        config.training.deterministic_worker_rollout_steps = args.deterministic_worker_rollout_steps
+    if args.single_task_eval_episodes is not None:
+        config.eval.n_single_task_episodes = args.single_task_eval_episodes
     if args.no_video:
         config.training.record_video = False
-    if args.no_warmup_demo:
-        config.warmup.use_demo_gif_for_context = False
-    if args.n_probe_eps is not None:
-        config.warmup.n_probe_episodes_per_task = args.n_probe_eps
 
     config.__post_init__()  # re-run to update encoder raw_dim if needed
 

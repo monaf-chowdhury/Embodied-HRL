@@ -16,12 +16,13 @@ quick operational reference.
 ```
 smgw/
 ├── config.py         # Dataclass config; action-chunk toggle is worker.action_chunk_len
+├── demo_dataset.py   # D4RL/Minari demo loading + offline render/encode cache for Stage A
 ├── env_wrapper.py    # FrankaKitchen-v1 image wrapper; reset() returns (img, state)
 ├── encoder.py        # Frozen R3M / DINOv2 visual backbone (context only, not subgoal)
 ├── networks.py       # SemanticManager (mask-aware Q) + GroundedWorker (FiLM + chunks)
 ├── buffers.py        # ManagerBuffer (option transitions) + WorkerBuffer (chunk tx)
 ├── agent.py          # SMGWAgent: option execution, task-grounded rewards, updates
-├── warmup.py         # Stage A: task-grounded probes + BC on worker + CE on manager
+├── warmup.py         # Stage A: demo BC on worker + optional CE on manager
 ├── train.py          # Main loop: Stage A → Stage B + checkpoints + videos
 ├── plots.py          # TensorBoard → PNG diagnostics
 └── utils.py          # save_video, formatters, per-task indices, goals, ε, text embeds
@@ -31,14 +32,20 @@ smgw/
 ## Quickstart
 
 ```bash
-# Default run (single-step worker, R3M encoder, ~1M env steps)
-python train.py --seed 42 --log_dir logs/smgw_baseline
+# Stage A only: demo BC + deterministic single-task worker eval
+python train.py --bc_only \
+  --seed 42 \
+  --log_dir logs/bc_only \
+  --demo_datasets franka-complete franka-mixed franka-partial
+
+# Full run: Stage A demo BC -> Stage B online HRL
+python train.py --seed 42 --log_dir logs/smgw_demo_bc
 
 # Action-chunk ablation (π0-style chunks of length 4)
 python train.py --action_chunk 4 --log_dir logs/smgw_chunk4
 
-# Skip demo GIF loading (demo is context-only, safe to skip)
-python train.py --no_warmup_demo --log_dir logs/smgw_nodemo
+# Rebuild the offline demo render/latent cache
+python train.py --bc_only --rebuild_demo_cache --log_dir logs/bc_recache
 
 # Generate plots
 python plots.py --log_dir logs/smgw_baseline
@@ -76,10 +83,9 @@ whole point of this redesign is to move it.
 
 ## Residual caveats
 
-1. Probe transitions written to the worker buffer during Stage A use `done=1.0,
-   reward=0` — they are cold-start anchors, not real data. If the critic
-   seems pessimistic early, delete the probe-injection loop in
-   `run_stage_a_warmup`; BC still works.
+1. Stage A labels task segments by task-space completion order reconstructed
+   from demo states. If your environment version changes task tolerances,
+   re-run the timeline sanity check before trusting the labels.
 2. Chunked mode stores full `H×9` action tensors even when the chunk
    terminated early (e.g. task completed on step 2 of a 4-step chunk). For
    `H=1` this is a no-op; for `H≥4` it is a small bias in the critic.
@@ -325,9 +331,23 @@ CUDA_VISIBLE_DEVICES=0 python train.py \
     --device cuda \
     --total_steps 1000000 \
     --encoder r3m \
-    --n_landmarks 100 \
     --subgoal_horizon 20 \
     --log_dir logs/seed42/ \
+    --demo_datasets franka-complete franka-mixed franka-partial \
+    --tasks microwave kettle 'light switch' 'slide cabinet'
+```
+
+**BC only (recommended first signal after the pivot):**
+```bash
+CUDA_VISIBLE_DEVICES=0 python train.py \
+    --bc_only \
+    --seed 42 \
+    --device cuda \
+    --encoder r3m \
+    --worker_bc_steps 20000 \
+    --single_task_eval_episodes 20 \
+    --log_dir logs/bc_only/ \
+    --demo_datasets franka-complete franka-mixed franka-partial \
     --tasks microwave kettle 'light switch' 'slide cabinet'
 ```
 

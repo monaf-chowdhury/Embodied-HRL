@@ -172,6 +172,13 @@ class WorkerBuffer:
 
     # -------------------- write / sample --------------------
 
+    def observe_proprio(self, proprio):
+        self.proprio_stats.update(np.asarray(proprio, dtype=np.float64))
+
+    def observe_proprio_batch(self, proprio_batch):
+        for row in np.asarray(proprio_batch):
+            self.observe_proprio(row)
+
     def add(self, z, proprio, task_target, task_cur, task_mask, task_id,
             action_flat, reward,
             z_next, proprio_next, task_cur_next, done):
@@ -188,7 +195,7 @@ class WorkerBuffer:
         self.proprio_next[i] = proprio_next
         self.task_cur_next[i] = task_cur_next
         self.done[i] = float(done)
-        self.proprio_stats.update(np.asarray(proprio, dtype=np.float64))
+        self.observe_proprio(proprio)
         self.ptr = (self.ptr + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
 

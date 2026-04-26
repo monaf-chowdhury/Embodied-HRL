@@ -95,6 +95,9 @@ class WorkerConfig:
     init_alpha: float = 0.1
     min_alpha: float = 0.01
     auto_alpha: bool = True
+    online_demo_bc_weight: float = 20.0
+    online_demo_bc_steps: int = 200_000
+    online_demo_batch_size: int = 256
 
     # ----- Action chunk toggle -----
     # action_chunk_len = 1  → standard single-step SAC (baseline ablation)
@@ -139,27 +142,34 @@ class BufferConfig:
 
 @dataclass
 class WarmupConfig:
-    # Task-grounded warmup, NOT random-future-latent warmup.
-    # We use two sources of supervision:
-    #   (a) the demo GIF — decoded, encoded, and assigned to tasks by looking
-    #       at which completion bit flipped in the corresponding timestep
-    #       (we cannot know this from a GIF alone; instead we use DEMO as a
-    #       landmark source for z_goal CONTEXT only — NOT as the worker's target);
-    #   (b) scripted per-task random-walk probes: for each task k, reset the
-    #       env, set the manager's chosen task = k, take random actions for
-    #       a short budget, and label every transition with (task_id=k,
-    #       target=g_k). If the completion bit for k flips during this probe,
-    #       mark the transition as a positive example for the manager.
-    # Supervision is known-by-construction — no "max task delta" heuristic.
-    n_probe_episodes_per_task: int = 30
-    probe_steps_per_episode: int = 120
-    use_demo_gif_for_context: bool = True
-    demo_gif_path: str = "demo/franka_kitchen.gif"
-    demo_max_frames: int = 120
-    # Stage-A supervised pretraining pass over what we collected
-    n_worker_sl_steps: int = 4000
-    n_manager_sl_steps: int = 2000
+    # Stage A is now demo-driven, not random-walk-driven.
+    # We load offline kitchen demos, replay them in the env to recover the
+    # benchmark's own completion events, render the recorded states through
+    # MuJoCo, encode them with the frozen visual encoder, and BC-train the
+    # worker on the teleoperated actions.
+    dataset_source: str = "auto"   # "auto" | "minari" | "d4rl"
+    dataset_ids: List[str] = field(default_factory=lambda: [
+        "franka-complete",
+        "franka-mixed",
+        "franka-partial",
+    ])
+    cache_dir: str = "demo/cache"
+    rebuild_cache: bool = False
+    max_episodes_per_dataset: int = 0   # 0 -> use all episodes
+    render_batch_size: int = 128
+    manager_label_stride: int = 4       # subsample dense manager labels
+    min_segment_len: int = 1
+    seed_worker_replay_with_demos: bool = True
+    balance_worker_task_sampling: bool = True
+
+    # Stage-A supervised pretraining passes
+    n_worker_sl_steps: int = 20_000
+    n_worker_iql_steps: int = 100_000
+    n_manager_sl_steps: int = 4_000
     sl_batch_size: int = 256
+    iql_expectile: float = 0.7
+    iql_adv_beta: float = 3.0
+    iql_max_weight: float = 20.0
 
 
 # =============================================================================
@@ -171,6 +181,7 @@ class EvalConfig:
     n_eval_episodes: int = 15
     eval_every_env_steps: int = 15_000
     deterministic_worker: bool = True
+    n_single_task_episodes: int = 20
 
 
 # =============================================================================
@@ -182,6 +193,9 @@ class TrainingConfig:
     total_env_steps: int = 1_000_000
     worker_updates_per_env_step: int = 1
     manager_updates_per_option: int = 1
+    stage_a_only: bool = False
+    deterministic_torch: bool = True
+    deterministic_worker_rollout_steps: int = 200_000
     log_every_episodes: int = 20
     tb_every_episodes: int = 5
 

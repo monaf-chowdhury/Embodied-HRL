@@ -122,12 +122,70 @@ class FrankaKitchenImageWrapper:
                              interpolation=cv2.INTER_AREA)
         return img.astype(np.uint8)
 
+    @staticmethod
+    def observation_to_qpos_qvel(observation: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Reconstruct MuJoCo qpos/qvel from the D4RL-compatible observation
+        layout used by FrankaKitchen-v1.
+        """
+        obs = np.asarray(observation, dtype=np.float64).reshape(-1)
+        if obs.size < 39:
+            raise ValueError(
+                f"Expected kitchen observation with >=39 dims, got {obs.size}."
+            )
+        qpos = np.concatenate([obs[:9], obs[18:39]], axis=0)
+        qvel = np.concatenate([obs[9:18], obs[39:]], axis=0)
+        return qpos.astype(np.float64), qvel.astype(np.float64)
+
+    def set_mujoco_state(self, qpos: np.ndarray, qvel: np.ndarray):
+        """
+        Set the underlying MuJoCo simulator state for offline rendering.
+        """
+        base = self._env.unwrapped
+        qpos = np.asarray(qpos, dtype=np.float64).reshape(-1)
+        qvel = np.asarray(qvel, dtype=np.float64).reshape(-1)
+
+        if hasattr(base, "set_state"):
+            base.set_state(qpos, qvel)
+        elif hasattr(base, "data") and hasattr(base, "model"):
+            nq = int(getattr(base.model, "nq", qpos.shape[0]))
+            nv = int(getattr(base.model, "nv", qvel.shape[0]))
+            if qpos.shape[0] != nq or qvel.shape[0] != nv:
+                raise ValueError(
+                    f"State size mismatch for MuJoCo replay: "
+                    f"got qpos={qpos.shape[0]}, qvel={qvel.shape[0]}, "
+                    f"expected nq={nq}, nv={nv}."
+                )
+            base.data.qpos[:nq] = qpos
+            base.data.qvel[:nv] = qvel
+            if hasattr(base.data, "act") and base.data.act is not None:
+                base.data.act[:] = 0.0
+        else:
+            raise AttributeError(
+                "FrankaKitchen-v1 env does not expose set_state(qpos, qvel) "
+                "and direct MuJoCo state access is unavailable."
+            )
+
+        try:
+            import mujoco
+            mujoco.mj_forward(base.model, base.data)
+        except Exception:
+            pass
+
+    def render_from_observation(self, observation: np.ndarray) -> np.ndarray:
+        """
+        Replay a dataset observation into MuJoCo and render the corresponding RGB frame.
+        """
+        qpos, qvel = self.observation_to_qpos_qvel(observation)
+        self.set_mujoco_state(qpos, qvel)
+        return self.render_image()
+
     # Back-compat alias for any legacy callers.
     _render_image = render_image
 
     # ---------------------- lifecycle ----------------------
 
-    def reset(self) -> Tuple[np.ndarray, np.ndarray]:
+    def reset(self, seed: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
         """
         Reset and return (image, state_59d).
 
@@ -135,8 +193,9 @@ class FrankaKitchenImageWrapper:
         our task_spec indices assume this layout.
         """
         reset_kwargs = {}
-        if self._seed is not None:
-            reset_kwargs['seed'] = self._seed
+        eff_seed = self._seed if seed is None else seed
+        if eff_seed is not None:
+            reset_kwargs['seed'] = eff_seed
             self._seed = None
 
         obs_dict, _ = self._env.reset(**reset_kwargs)

@@ -18,10 +18,11 @@ Why this file exists:
 All code elsewhere in the repo should use `task_error(...)`,
 `task_goal(...)`, etc., rather than hand-indexing into proprio.
 """
+from __future__ import annotations
+
 import os
 import numpy as np
 import cv2
-from __future__ import annotations
 import torch
 from typing import Dict, List, Tuple, Optional
 from transformers import CLIPTokenizer, CLIPTextModel

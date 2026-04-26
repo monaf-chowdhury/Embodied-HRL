@@ -279,6 +279,18 @@ class GroundedWorkerActor(nn.Module):
         h = self.trunk(z, proprio, task_target, task_cur, task_mask, task_embed)
         return torch.tanh(self.mean_head(h))
 
+    def log_prob_from_action(self, z, proprio, task_target, task_cur,
+                             task_mask, task_embed, action: torch.Tensor) -> torch.Tensor:
+        """
+        Log-probability of a dataset action under the squashed Gaussian policy.
+        `action` is expected in [-1, 1].
+        """
+        dist = self._dist(z, proprio, task_target, task_cur, task_mask, task_embed)
+        clipped = action.clamp(-0.999, 0.999)
+        pre_tanh = 0.5 * (torch.log1p(clipped) - torch.log1p(-clipped))
+        logp = dist.log_prob(pre_tanh) - torch.log(1 - clipped.pow(2) + 1e-6)
+        return logp.sum(-1, keepdim=True)
+
     def action_to_chunk(self, action: torch.Tensor) -> torch.Tensor:
         """
         Reshape a flat action output (B, H*A) into (B, H, A). When H==1 this
@@ -324,3 +336,24 @@ class GroundedWorkerCritic(nn.Module):
         q1 = self.q1(torch.cat([h1, action], dim=-1))
         q2 = self.q2(torch.cat([h2, action], dim=-1))
         return q1, q2
+
+
+class GroundedWorkerValue(nn.Module):
+    """
+    State value network used for offline IQL-style worker pretraining.
+    """
+    def __init__(self,
+                 z_dim: int,
+                 proprio_dim: int,
+                 max_goal_dim: int,
+                 text_embed_dim: int,
+                 hidden_dim: int,
+                 n_layers: int):
+        super().__init__()
+        self.trunk = WorkerTrunk(z_dim, proprio_dim, max_goal_dim,
+                                 text_embed_dim, hidden_dim, n_layers)
+        self.v = build_mlp(hidden_dim, hidden_dim, 1, n_layers=3)
+
+    def forward(self, z, proprio, task_target, task_cur, task_mask, task_embed) -> torch.Tensor:
+        h = self.trunk(z, proprio, task_target, task_cur, task_mask, task_embed)
+        return self.v(h)

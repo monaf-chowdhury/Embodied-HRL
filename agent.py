@@ -32,7 +32,12 @@ from typing import Dict, List, Optional
 from config import Config
 from utils import TaskSpec, build_frozen_text_embeddings
 from encoder import VisualEncoder
-from networks import SemanticManager, GroundedWorkerActor, GroundedWorkerCritic
+from networks import (
+    SemanticManager,
+    GroundedWorkerActor,
+    GroundedWorkerCritic,
+    GroundedWorkerValue,
+)
 from buffers import ManagerBuffer, WorkerBuffer
 
 
@@ -152,11 +157,19 @@ class SMGWAgent:
             action_chunk_len=self.H_chunk,
         ).to(self.device)
         self.worker_critic_target.load_state_dict(self.worker_critic.state_dict())
+        self.worker_value = GroundedWorkerValue(
+            z_dim=z_dim, proprio_dim=proprio_dim,
+            max_goal_dim=max_goal_dim, text_embed_dim=text_dim,
+            hidden_dim=config.worker.hidden_dim,
+            n_layers=config.worker.n_layers,
+        ).to(self.device)
 
         self.worker_actor_opt = torch.optim.Adam(self.worker_actor.parameters(),
                                                  lr=config.worker.actor_lr)
         self.worker_critic_opt = torch.optim.Adam(self.worker_critic.parameters(),
                                                   lr=config.worker.critic_lr)
+        self.worker_value_opt = torch.optim.Adam(self.worker_value.parameters(),
+                                                 lr=config.worker.critic_lr)
 
         # SAC entropy temperature
         if config.worker.auto_alpha:
@@ -183,6 +196,7 @@ class SMGWAgent:
             action_dim=action_dim, action_chunk_len=self.H_chunk,
             max_goal_dim=max_goal_dim, n_tasks=self.n_tasks, z_dtype=z_dtype,
         )
+        self.demo_dataset = None
 
         # Counters
         self.total_env_steps = 0
@@ -552,6 +566,31 @@ class SMGWAgent:
         new_a, logp = self.worker_actor(z, p, tt, tc, tm, te)
         q1a, q2a = self.worker_critic(z, p, tt, tc, tm, te, new_a)
         actor_loss = (self.alpha * logp - torch.min(q1a, q2a)).mean()
+        demo_bc_loss = torch.tensor(0.0, device=self.device)
+        demo_bc_coef = 0.0
+        if (self.demo_dataset is not None
+                and self.config.worker.online_demo_bc_weight > 0.0
+                and self.total_env_steps < self.config.worker.online_demo_bc_steps):
+            frac = 1.0 - (self.total_env_steps / max(self.config.worker.online_demo_bc_steps, 1))
+            demo_bc_coef = self.config.worker.online_demo_bc_weight * max(0.0, frac)
+            demo_batch = self.demo_dataset.sample_worker_batch(
+                self.config.worker.online_demo_batch_size,
+                proprio_normalizer=self.worker_buf.normalize_proprio,
+                balance_by_task=self.config.warmup.balance_worker_task_sampling,
+            )
+            dz = torch.from_numpy(demo_batch['z']).to(self.device)
+            dp = torch.from_numpy(demo_batch['proprio']).to(self.device)
+            dtt = torch.from_numpy(demo_batch['task_target']).to(self.device)
+            dtc = torch.from_numpy(demo_batch['task_cur']).to(self.device)
+            dtm = torch.from_numpy(demo_batch['task_mask']).to(self.device)
+            dtid = torch.from_numpy(demo_batch['task_id']).long().to(self.device)
+            da = torch.from_numpy(demo_batch['action']).to(self.device)
+            dte = self.spec.text_embeddings[dtid]
+            demo_pred = self.worker_actor.get_action_deterministic(
+                dz, dp, dtt, dtc, dtm, dte
+            )
+            demo_bc_loss = F.mse_loss(demo_pred, da.clamp(-0.999, 0.999))
+            actor_loss = actor_loss + demo_bc_coef * demo_bc_loss
         self.worker_actor_opt.zero_grad()
         actor_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.worker_actor.parameters(), 1.0)
@@ -574,6 +613,8 @@ class SMGWAgent:
             'worker_actor_loss': float(actor_loss.item()),
             'worker_alpha': float(self.alpha.item()),
             'worker_mean_logp': float(logp.mean().item()),
+            'worker_demo_bc_loss': float(demo_bc_loss.item()),
+            'worker_demo_bc_coef': float(demo_bc_coef),
         }
 
     # =========================================================================
@@ -633,7 +674,8 @@ class SMGWAgent:
     def worker_warmup_step(self, batch: Dict[str, np.ndarray]) -> float:
         """
         Behavioural cloning: given (z, proprio, task_target, task_cur, task_mask,
-        task_id, action_flat), regress the actor mean onto action_flat with MSE.
+        task_id, action_flat), regress the deterministic actor output onto the
+        demo action chunk in env action space with MSE.
         Does not update critic (we'll train critic online from real rewards).
         """
         z = torch.from_numpy(batch['z']).to(self.device)
@@ -645,13 +687,81 @@ class SMGWAgent:
         a = torch.from_numpy(batch['action']).to(self.device)
         te = self.spec.text_embeddings[tid]
 
-        mean = self.worker_actor.get_action_deterministic(z, p, tt, tc, tm, te)
-        loss = F.mse_loss(mean, a.clamp(-0.999, 0.999).atanh())
+        pred_action = self.worker_actor.get_action_deterministic(z, p, tt, tc, tm, te)
+        loss = F.mse_loss(pred_action, a.clamp(-0.999, 0.999))
         self.worker_actor_opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.worker_actor.parameters(), 1.0)
         self.worker_actor_opt.step()
         return float(loss.item())
+
+    def worker_iql_step(self, batch: Dict[str, np.ndarray]) -> Dict[str, float]:
+        z = torch.from_numpy(batch['z']).to(self.device)
+        p = torch.from_numpy(batch['proprio']).to(self.device)
+        tt = torch.from_numpy(batch['task_target']).to(self.device)
+        tc = torch.from_numpy(batch['task_cur']).to(self.device)
+        tm = torch.from_numpy(batch['task_mask']).to(self.device)
+        tid = torch.from_numpy(batch['task_id']).long().to(self.device)
+        a = torch.from_numpy(batch['action']).to(self.device)
+        r = torch.from_numpy(batch['reward']).unsqueeze(1).to(self.device)
+        zn = torch.from_numpy(batch['z_next']).to(self.device)
+        pn = torch.from_numpy(batch['proprio_next']).to(self.device)
+        tcn = torch.from_numpy(batch['task_cur_next']).to(self.device)
+        d = torch.from_numpy(batch['done']).unsqueeze(1).to(self.device)
+        te = self.spec.text_embeddings[tid]
+
+        # ---- Value update (expectile regression onto min-Q) ----
+        with torch.no_grad():
+            q1_det, q2_det = self.worker_critic(z, p, tt, tc, tm, te, a)
+            q_det = torch.min(q1_det, q2_det)
+        v = self.worker_value(z, p, tt, tc, tm, te)
+        adv = q_det - v
+        expectile = self.config.warmup.iql_expectile
+        weight = torch.where(adv > 0, expectile, 1.0 - expectile)
+        value_loss = (weight * adv.pow(2)).mean()
+        self.worker_value_opt.zero_grad()
+        value_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.worker_value.parameters(), 1.0)
+        self.worker_value_opt.step()
+
+        # ---- Critic update ----
+        with torch.no_grad():
+            v_next = self.worker_value(zn, pn, tt, tcn, tm, te)
+            gamma_eff = self.config.worker.gamma ** self.H_chunk
+            target_q = r + gamma_eff * (1.0 - d) * v_next
+
+        q1, q2 = self.worker_critic(z, p, tt, tc, tm, te, a)
+        critic_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
+        self.worker_critic_opt.zero_grad()
+        critic_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.worker_critic.parameters(), 1.0)
+        self.worker_critic_opt.step()
+
+        # ---- Actor update (advantage-weighted BC) ----
+        with torch.no_grad():
+            q1_pi, q2_pi = self.worker_critic(z, p, tt, tc, tm, te, a)
+            v_pi = self.worker_value(z, p, tt, tc, tm, te)
+            adv_pi = torch.min(q1_pi, q2_pi) - v_pi
+            beta = self.config.warmup.iql_adv_beta
+            max_w = self.config.warmup.iql_max_weight
+            exp_adv = torch.exp(beta * adv_pi).clamp(max=max_w)
+
+        logp_data = self.worker_actor.log_prob_from_action(
+            z, p, tt, tc, tm, te, a
+        )
+        actor_loss = -(exp_adv * logp_data).mean()
+        self.worker_actor_opt.zero_grad()
+        actor_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.worker_actor.parameters(), 1.0)
+        self.worker_actor_opt.step()
+
+        return {
+            'worker_iql_value_loss': float(value_loss.item()),
+            'worker_iql_critic_loss': float(critic_loss.item()),
+            'worker_iql_actor_loss': float(actor_loss.item()),
+            'worker_iql_adv_mean': float(adv_pi.mean().item()),
+            'worker_iql_weight_mean': float(exp_adv.mean().item()),
+        }
 
     def manager_warmup_step(self, batch: Dict[str, np.ndarray]) -> float:
         """
@@ -697,6 +807,7 @@ class SMGWAgent:
             'worker_actor': self.worker_actor.state_dict(),
             'worker_critic': self.worker_critic.state_dict(),
             'worker_critic_target': self.worker_critic_target.state_dict(),
+            'worker_value': self.worker_value.state_dict(),
             'log_alpha': float(self.log_alpha.detach().cpu().item()),
             'total_env_steps': self.total_env_steps,
             'total_options': self.total_options,
@@ -714,6 +825,8 @@ class SMGWAgent:
         self.worker_actor.load_state_dict(ckpt['worker_actor'])
         self.worker_critic.load_state_dict(ckpt['worker_critic'])
         self.worker_critic_target.load_state_dict(ckpt['worker_critic_target'])
+        if 'worker_value' in ckpt:
+            self.worker_value.load_state_dict(ckpt['worker_value'])
         if self.config.worker.auto_alpha:
             self.log_alpha.data = torch.tensor(ckpt['log_alpha'],
                                                device=self.device)
