@@ -18,13 +18,12 @@ Why this file exists:
 All code elsewhere in the repo should use `task_error(...)`,
 `task_goal(...)`, etc., rather than hand-indexing into proprio.
 """
+from __future__ import annotations
 import os
 import numpy as np
 import cv2
-from __future__ import annotations
 import torch
 from typing import Dict, List, Tuple, Optional
-from transformers import CLIPTokenizer, CLIPTextModel
 
 # =============================================================================
 # Raw benchmark indices and goals — copied from Franka Kitchen relay-policy
@@ -254,7 +253,7 @@ def build_frozen_text_embeddings(task_names: List[str],
 
     # ---- Attempt 1: HuggingFace CLIP ----
     try:
-        
+        from transformers import CLIPTokenizer, CLIPTextModel
         tok = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
         mdl = CLIPTextModel.from_pretrained("openai/clip-vit-base-patch32")
         mdl = mdl.to(device).eval()

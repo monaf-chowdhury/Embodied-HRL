@@ -17,9 +17,9 @@ Public API used by train.py / warmup.py:
         -> OptionResult (see dataclass)
   * agent.update_worker() -> dict of losses
   * agent.update_manager() -> dict of losses
-  * agent.worker_warmup_step(batch) -> BC loss  (for Stage A)
-  * agent.manager_warmup_step(batch) -> CE loss (for Stage A)
   * agent.save(path) / agent.load(path)
+
+  (Note: BC pretraining steps live in warmup.py, not on the agent.)
 """
 from __future__ import annotations
 
@@ -625,58 +625,6 @@ class SMGWAgent:
             'manager_q_mean': float(q_all.mean().item()),
             'manager_q_sa_mean': float(q_sa.mean().item()),
         }
-
-    # =========================================================================
-    # Warmup supervised updates (Stage A)
-    # =========================================================================
-
-    def worker_warmup_step(self, batch: Dict[str, np.ndarray]) -> float:
-        """
-        Behavioural cloning: given (z, proprio, task_target, task_cur, task_mask,
-        task_id, action_flat), regress the actor mean onto action_flat with MSE.
-        Does not update critic (we'll train critic online from real rewards).
-        """
-        z = torch.from_numpy(batch['z']).to(self.device)
-        p = torch.from_numpy(batch['proprio']).to(self.device)
-        tt = torch.from_numpy(batch['task_target']).to(self.device)
-        tc = torch.from_numpy(batch['task_cur']).to(self.device)
-        tm = torch.from_numpy(batch['task_mask']).to(self.device)
-        tid = torch.from_numpy(batch['task_id']).long().to(self.device)
-        a = torch.from_numpy(batch['action']).to(self.device)
-        te = self.spec.text_embeddings[tid]
-
-        mean = self.worker_actor.get_action_deterministic(z, p, tt, tc, tm, te)
-        loss = F.mse_loss(mean, a.clamp(-0.999, 0.999).atanh())
-        self.worker_actor_opt.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.worker_actor.parameters(), 1.0)
-        self.worker_actor_opt.step()
-        return float(loss.item())
-
-    def manager_warmup_step(self, batch: Dict[str, np.ndarray]) -> float:
-        """
-        Cross-entropy over the 4 tasks: given (z, proprio, task_state,
-        completion), predict the TASK WHOSE BIT FLIPPED during the warmup
-        option. Label is known by construction — see warmup.py.
-
-        We mask completed tasks before softmax so the manager cannot learn
-        to predict an already-completed one.
-        """
-        z = torch.from_numpy(batch['z']).to(self.device)
-        p = torch.from_numpy(batch['proprio']).to(self.device)
-        ts = torch.from_numpy(batch['task_state']).to(self.device)
-        c = torch.from_numpy(batch['completion']).to(self.device)
-        y = torch.from_numpy(batch['label']).long().to(self.device)
-
-        q = self.manager(z, p, ts, c, self.spec.text_embeddings)
-        q = q.masked_fill(c > 0.5, SemanticManager.MASK_FILL)
-        logp = F.log_softmax(q, dim=-1)
-        loss = F.nll_loss(logp, y)
-        self.manager_opt.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.manager.parameters(), 1.0)
-        self.manager_opt.step()
-        return float(loss.item())
 
     # =========================================================================
     # Soft update

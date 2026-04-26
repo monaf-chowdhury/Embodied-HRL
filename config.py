@@ -134,32 +134,52 @@ class BufferConfig:
 
 
 # =============================================================================
-# Warmup (Stage A)
+# Warmup (Stage A) — DEMO-BASED behavioural cloning
 # =============================================================================
+# Step 2 of the fix plan: replace random-walk warmup with BC pretraining on
+# real teleoperated demonstrations from Minari / D4RL. The key change vs. the
+# old WarmupConfig is that the actions the worker regresses toward are
+# purposeful demo actions (not random noise), so BC actually teaches the
+# worker how to approach and manipulate the objects.
 
 @dataclass
 class WarmupConfig:
-    # Task-grounded warmup, NOT random-future-latent warmup.
-    # We use two sources of supervision:
-    #   (a) the demo GIF — decoded, encoded, and assigned to tasks by looking
-    #       at which completion bit flipped in the corresponding timestep
-    #       (we cannot know this from a GIF alone; instead we use DEMO as a
-    #       landmark source for z_goal CONTEXT only — NOT as the worker's target);
-    #   (b) scripted per-task random-walk probes: for each task k, reset the
-    #       env, set the manager's chosen task = k, take random actions for
-    #       a short budget, and label every transition with (task_id=k,
-    #       target=g_k). If the completion bit for k flips during this probe,
-    #       mark the transition as a positive example for the manager.
-    # Supervision is known-by-construction — no "max task delta" heuristic.
-    n_probe_episodes_per_task: int = 30
-    probe_steps_per_episode: int = 120
-    use_demo_gif_for_context: bool = True
-    demo_gif_path: str = "demo/franka_kitchen.gif"
-    demo_max_frames: int = 120
-    # Stage-A supervised pretraining pass over what we collected
-    n_worker_sl_steps: int = 4000
-    n_manager_sl_steps: int = 2000
-    sl_batch_size: int = 256
+    # ---- Demo sources ----
+    # Minari dataset ids. We include all three kitchen variants because
+    # Complete alone is only ~130k transitions and the worker benefits
+    # enormously from seeing partial (unsuccessful-chain) trajectories for
+    # the constituent sub-skills.
+    minari_dataset_ids: List[str] = field(default_factory=lambda: [
+        "D4RL/kitchen/complete-v2",
+        "D4RL/kitchen/partial-v2",
+        "D4RL/kitchen/mixed-v2",
+    ])
+    # Cap total transitions loaded across all datasets. Set to 0 = unlimited.
+    max_transitions: int = 0
+    # Cap per-task transitions after labelling (keeps dataset balanced across
+    # tasks). 0 = no cap.
+    max_per_task: int = 50_000
+    # Cache decoded demo dataset here so we don't redo the label-and-render
+    # pass on every run.
+    cache_path: str = "cache/demo_bc.npz"
+    # Force rebuild of the cache even if present. Useful after you change
+    # index conventions or the task list.
+    rebuild_cache: bool = False
+    # Render images during demo loading? Required for training the worker's
+    # z-context; if False, z is filled with zeros (faster but the worker
+    # won't be able to use visual context).
+    render_demo_images: bool = True
+
+    # ---- BC training ----
+    n_worker_bc_steps: int = 20_000
+    n_manager_bc_steps: int = 3_000
+    bc_batch_size: int = 256
+    bc_lr: float = 3e-4           # we use a dedicated LR for BC; SAC's actor_lr can differ
+
+    # Save a worker checkpoint right after BC so you can resume Stage B later
+    # without redoing warmup.
+    save_bc_checkpoint: bool = True
+    bc_checkpoint_path: str = "logs/smgw_bc/bc_worker.pt"
 
 
 # =============================================================================

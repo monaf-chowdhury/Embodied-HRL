@@ -1,24 +1,31 @@
 """
-train.py — SMGW training: Stage A (task-grounded warmup) -> Stage B (joint HRL).
+train.py — SMGW training: Stage A (demo BC warmup) -> Stage B (joint HRL).
 
-Usage:
+Step-2 usage (BC pretraining and single-task eval ONLY):
+    python train.py --warmup_only --log_dir logs/smgw_bc
+    python train.py --warmup_only --eval_single_tasks --log_dir logs/smgw_bc
+
+Full pipeline (Step 3+ - Stage A then Stage B):
     python train.py [--seed 42] [--device cuda] [--log_dir logs/run1]
     python train.py --total_steps 1500000 --action_chunk 4
-    python train.py --no_warmup_demo --no_video
+
+Other flags:
+    --resume <path>         Load a BC checkpoint before Stage B
+    --skip_warmup           Go straight to Stage B (assumes buffer is primed
+                            via --resume)
+    --rebuild_demo_cache    Force re-render of demo images
 
 Design notes:
-  - Stage A: warmup.run_stage_a_warmup fills the worker buffer, BC-trains
-    the worker actor, and CE-trains the manager with KNOWN labels.
+  - Stage A: warmup.run_stage_a_warmup loads Minari demos, fills the worker
+    buffer, BC-trains the worker actor, and CE-trains the manager.
   - Stage B: for every env step, (a) manager picks a task from REMAINING
     tasks, (b) worker runs an option (chunks of H actions) with dense
     task-grounded rewards, (c) worker SAC updates online, (d) when the
-    option ends, the manager observes its option-level return and
-    does a DQN-style update.
+    option ends, the manager does a DQN-style update.
   - Checkpoints: evenly spaced across total_env_steps (configurable),
-    plus a "best" checkpoint on full_task_success_rate. Each checkpoint
-    saves model weights AND records N evaluation videos so you can
-    visually inspect what the policy does at that point.
+    plus a "best" checkpoint on full_task_success_rate.
 """
+from __future__ import annotations
 import os
 import sys
 import time
@@ -26,7 +33,6 @@ import datetime
 import argparse
 import numpy as np
 import torch
-from __future__ import annotations
 from typing import Dict, Optional
 from torch.utils.tensorboard import SummaryWriter
 
@@ -34,6 +40,7 @@ from config import Config
 from env_wrapper import FrankaKitchenImageWrapper
 from agent import SMGWAgent
 from warmup import run_stage_a_warmup
+from single_task_eval import run_single_task_eval
 from utils import save_video, format_time, format_steps
 
 
@@ -271,10 +278,14 @@ def print_start_banner(config: Config, log_path: str):
     print(f"  NOTE: Zero latent-distance terms anywhere. All rewards are "
           f"grounded in benchmark completion bits and task-space errors.")
     print(SEP2)
-    print(f"  Stage A probes : {config.warmup.n_probe_episodes_per_task} ep/task "
-          f"* {config.warmup.probe_steps_per_episode} steps")
-    print(f"  Stage A BC     : worker={config.warmup.n_worker_sl_steps} steps, "
-          f"manager={config.warmup.n_manager_sl_steps} steps")
+    print(f"  Stage A        : Demo BC from Minari")
+    print(f"  Demo datasets  : {config.warmup.minari_dataset_ids}")
+    print(f"  Demo cache     : {config.warmup.cache_path}  "
+          f"(rebuild={config.warmup.rebuild_cache})")
+    print(f"  Max/task       : {config.warmup.max_per_task:,}")
+    print(f"  Worker BC      : {config.warmup.n_worker_bc_steps:,} steps")
+    print(f"  Manager BC     : {config.warmup.n_manager_bc_steps:,} steps")
+    print(f"  BC LR / batch  : {config.warmup.bc_lr} / {config.warmup.bc_batch_size}")
     print(f"  Stage B steps  : {config.training.total_env_steps:,}")
     print(f"  Batch size     : {config.buffer.batch_size}")
     print(f"  Buffer cap     : worker={config.buffer.worker_capacity:,}  "
@@ -293,7 +304,25 @@ def print_start_banner(config: Config, log_path: str):
 # Main training
 # =============================================================================
 
-def train(config: Config):
+def train(config: Config,
+          *,
+          warmup_only: bool = False,
+          skip_warmup: bool = False,
+          resume_from: Optional[str] = None,
+          eval_single_tasks_after_warmup: bool = False,
+          n_eps_per_task_single_eval: int = 20):
+    """
+    Args:
+      warmup_only                    : run Stage A only, then exit.
+      skip_warmup                    : skip Stage A (use --resume to load a
+                                       BC checkpoint and its proprio stats).
+      resume_from                    : path to a .pt saved by agent.save().
+      eval_single_tasks_after_warmup : after Stage A, run the per-task
+                                       deterministic eval (Step 2 diagnostic)
+                                       before Stage B (or before exiting if
+                                       warmup_only).
+      n_eps_per_task_single_eval     : number of eval episodes per task.
+    """
     logger = Logger(config.training.log_dir)
 
     np.random.seed(config.training.seed)
@@ -318,21 +347,67 @@ def train(config: Config):
 
     print_start_banner(config, logger.log_path)
 
-    # =========================================================================
-    # Stage A: task-grounded warmup
-    # =========================================================================
-    print(SEP2)
-    print(f"  STAGE A  —  Task-Grounded Warmup")
-    print(SEP2 + "\n")
+    # Optional resume
+    if resume_from is not None:
+        if not os.path.exists(resume_from):
+            raise FileNotFoundError(f"--resume not found: {resume_from}")
+        agent.load(resume_from)
+        print(f"\n  [Resume] Loaded checkpoint: {resume_from}")
+        print(f"  [Resume] total_env_steps={agent.total_env_steps:,}  "
+              f"total_options={agent.total_options:,}  "
+              f"proprio_stats_n={agent.worker_buf.proprio_stats.n:,}\n")
 
-    t0 = time.time()
-    warmup_stats = run_stage_a_warmup(agent, config, verbose=True)
-    warmup_elapsed = time.time() - t0
-    print(f"\n  Stage A complete in {format_time(warmup_elapsed)}.")
-    for k, v in warmup_stats.items():
-        if isinstance(v, (int, float)):
-            writer.add_scalar(f'warmup/{k}', v, 0)
-    print(f"{SEP}\n")
+    # =========================================================================
+    # Stage A: demo BC warmup
+    # =========================================================================
+    if not skip_warmup:
+        print(SEP2)
+        print(f"  STAGE A  —  Demo BC Warmup")
+        print(SEP2 + "\n")
+
+        t0 = time.time()
+        warmup_stats = run_stage_a_warmup(agent, config, verbose=True)
+        warmup_elapsed = time.time() - t0
+        print(f"\n  Stage A complete in {format_time(warmup_elapsed)}.")
+        for k, v in warmup_stats.items():
+            if isinstance(v, (int, float)):
+                writer.add_scalar(f'warmup/{k}', v, 0)
+        print(f"{SEP}\n")
+    else:
+        print(f"\n  [Stage A] Skipped (--skip_warmup). "
+              f"Worker buffer size = {len(agent.worker_buf):,}\n")
+
+    # =========================================================================
+    # Single-task diagnostic eval (Step 2)
+    # =========================================================================
+    if eval_single_tasks_after_warmup:
+        print(SEP2)
+        print(f"  SINGLE-TASK DIAGNOSTIC EVAL  ({n_eps_per_task_single_eval} eps/task)")
+        print(f"  (Manager is bypassed; worker is commanded per task.)")
+        print(SEP2 + "\n")
+
+        st_results = run_single_task_eval(
+            agent, config,
+            n_episodes_per_task=n_eps_per_task_single_eval,
+            record_videos=config.training.record_video,
+            verbose=True,
+        )
+        for k, v in st_results.items():
+            if isinstance(v, dict):
+                writer.add_scalar(f'single_task_eval/{k}/success_rate',
+                                  v['success_rate'], 0)
+                writer.add_scalar(f'single_task_eval/{k}/mean_err_final',
+                                  v['mean_err_final'], 0)
+            elif isinstance(v, (int, float)):
+                writer.add_scalar(f'single_task_eval/{k}', v, 0)
+        print(f"\n{SEP}\n")
+
+    if warmup_only:
+        print(f"\n  --warmup_only set; exiting before Stage B.\n")
+        writer.close()
+        logger.close()
+        env.close()
+        return
 
     # =========================================================================
     # Stage B: joint HRL training
@@ -568,24 +643,43 @@ def train(config: Config):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SMGW — FrankaKitchen-v1")
+    # Core
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--total_steps', type=int, default=None,
-                        help='Override config.training.total_env_steps')
+    parser.add_argument('--log_dir', type=str, default=None)
     parser.add_argument('--encoder', type=str, default='r3m',
                         choices=['r3m', 'dinov2'])
+    parser.add_argument('--tasks', type=str, nargs='+', default=None,
+                        help='List of tasks (default: microwave kettle light_switch slide_cabinet)')
+
+    # Stage A (demo BC) controls
+    parser.add_argument('--warmup_only', action='store_true',
+                        help='Run Stage A only, then exit. Useful for Step 2.')
+    parser.add_argument('--skip_warmup', action='store_true',
+                        help='Skip Stage A. Combine with --resume.')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to a BC / checkpoint .pt to load before training.')
+    parser.add_argument('--rebuild_demo_cache', action='store_true',
+                        help='Force re-render the demo image cache.')
+    parser.add_argument('--max_per_task', type=int, default=None,
+                        help='Cap demo transitions per task for balance.')
+    parser.add_argument('--n_worker_bc_steps', type=int, default=None)
+    parser.add_argument('--n_manager_bc_steps', type=int, default=None)
+    parser.add_argument('--bc_lr', type=float, default=None)
+
+    # Single-task diagnostic eval (Step 2)
+    parser.add_argument('--eval_single_tasks', action='store_true',
+                        help='Run per-task deterministic eval after Stage A.')
+    parser.add_argument('--single_task_n_eps', type=int, default=20)
+
+    # Stage B (online HRL) controls
+    parser.add_argument('--total_steps', type=int, default=None,
+                        help='Override config.training.total_env_steps')
     parser.add_argument('--subgoal_horizon', type=int, default=None)
-    parser.add_argument('--log_dir', type=str, default=None)
-    parser.add_argument('--tasks', type=str, nargs='+', default=None)
     parser.add_argument('--action_chunk', type=int, default=None,
-                        help='Worker action chunk length (1 = single-step SAC). '
-                             'Use this flag to run the chunk-ablation experiment.')
-    parser.add_argument('--no_warmup_demo', action='store_true',
-                        help='Skip loading the demo GIF during Stage A.')
-    parser.add_argument('--demo_gif', type=str, default=None)
+                        help='Worker action chunk length (1 = single-step SAC).')
     parser.add_argument('--no_video', action='store_true')
-    parser.add_argument('--n_probe_eps', type=int, default=None,
-                        help='Per-task probe episodes in Stage A.')
+
     args = parser.parse_args()
 
     config = Config()
@@ -603,18 +697,29 @@ if __name__ == "__main__":
     if args.action_chunk is not None:
         assert args.action_chunk >= 1, "action_chunk must be >= 1"
         config.worker.action_chunk_len = args.action_chunk
-    if args.demo_gif is not None:
-        config.warmup.demo_gif_path = args.demo_gif
+    if args.rebuild_demo_cache:
+        config.warmup.rebuild_cache = True
+    if args.max_per_task is not None:
+        config.warmup.max_per_task = args.max_per_task
+    if args.n_worker_bc_steps is not None:
+        config.warmup.n_worker_bc_steps = args.n_worker_bc_steps
+    if args.n_manager_bc_steps is not None:
+        config.warmup.n_manager_bc_steps = args.n_manager_bc_steps
+    if args.bc_lr is not None:
+        config.warmup.bc_lr = args.bc_lr
     if args.no_video:
         config.training.record_video = False
-    if args.no_warmup_demo:
-        config.warmup.use_demo_gif_for_context = False
-    if args.n_probe_eps is not None:
-        config.warmup.n_probe_episodes_per_task = args.n_probe_eps
 
-    config.__post_init__()  # re-run to update encoder raw_dim if needed
+    config.__post_init__()
 
     if config.training.device == 'cuda':
         assert torch.cuda.is_available(), "CUDA not available — use --device cpu"
 
-    train(config)
+    train(
+        config,
+        warmup_only=args.warmup_only,
+        skip_warmup=args.skip_warmup,
+        resume_from=args.resume,
+        eval_single_tasks_after_warmup=args.eval_single_tasks,
+        n_eps_per_task_single_eval=args.single_task_n_eps,
+    )

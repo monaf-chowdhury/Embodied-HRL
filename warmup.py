@@ -1,327 +1,204 @@
 """
-warmup.py — Stage A: Task-grounded warmup for SMGW.
+warmup.py — Stage A: Demo BC pretraining for SMGW.
 
-Goal: give the worker and manager clean, labelled supervision BEFORE
-online RL starts, so Stage B starts from a non-trivial initialization.
-Addresses Core Problem 3 (noisy warmup labels) by:
+This replaces the previous random-walk warmup. The new version:
+  1. Loads the Minari kitchen demos via demo_loader.
+  2. BC-trains the worker actor on (state, image, task_id) -> demo_action
+     with MSE over the pre-tanh action mean. Task labels come from the
+     demo's completion timeline (see demo_loader.py).
+  3. BC-trains the manager on (state, image, completion_mask) -> task_id
+     where the label is the task about to complete in the demo.
+  4. Populates the worker replay buffer with the demo transitions so Stage B
+     starts with a non-empty buffer of purposeful data.
 
-  1. Running PER-TASK random-walk probes with a known task_id.
-     For each task k, we reset the env, FIX the manager's choice to k,
-     take short random-walk actions, and record transitions tagged with
-     (task_id = k, task_target = g_k, task_cur = state[idx_k]).
-     The TASK LABEL IS KNOWN BY CONSTRUCTION — not inferred from max-delta.
+Why this is different (and better) than the previous warmup:
+  - Old warmup used random actions as BC targets. A small actor trained to
+    regress random actions has learned nothing useful.
+  - New warmup uses real teleoperated actions that actually cause the
+    objects to move toward the goals. The actor learns a real prior.
+  - The manager label used to be "the task that happened to complete
+    during random rollout" - almost always no label. Now it's "the task
+    that completes next in a demo" - ~4 labels per episode, hundreds of
+    episodes.
 
-  2. Building a warmup worker dataset from those probes and running a
-     small behavioural-cloning pretraining pass: regress actor mean
-     toward the random-walk actions, which at least teaches the
-     actor to produce valid-magnitude outputs conditioned on the
-     task target / current slice pair.
-     (Yes, random actions are poor targets — but for Stage A all we
-      need is a small calibrated initial actor. Stage B does the real
-      learning. If you have demonstrations, you can swap random-walk
-      for demo actions here with no other changes.)
-
-  3. Building a warmup manager dataset where the label is the task
-     whose completion bit flipped during the probe. If no task
-     completed (the common case with random actions), we skip that
-     probe — we do not fabricate labels.
-
-  4. Running a small supervised pass on the manager (cross-entropy
-     over the 4 tasks, with completion mask applied).
-
-  5. (Optional) Loading the demo GIF as *visual context* for the worker
-     buffer. The demo is NOT used as a subgoal target — its role is
-     only to widen the distribution of z_t values the worker and
-     manager see during warmup, so they are less brittle at Stage B.
-
-Stage A is cheap: O(few thousand env steps) and a small number of
-supervised gradient steps.
+Verifying BC worked:
+  After Stage A completes, call run_single_task_eval() (in
+  single_task_eval.py) to measure how often the deterministic BC worker
+  completes each task when commanded. Target: 40-70% on the easier tasks
+  (microwave, slide cabinet).
 """
 from __future__ import annotations
 import os
 import numpy as np
 import torch
-from typing import Dict, List, Optional
+import torch.nn.functional as F
+from typing import Dict
 
 from config import Config
-from env_wrapper import FrankaKitchenImageWrapper
-from agent import SMGWAgent, build_task_state_flat
+from utils import TaskSpec
+from agent import SMGWAgent
+from demo_loader import load_demo_bc_dataset, DemoBCDataset, safe_atanh
 
 
 # =============================================================================
-# A tiny in-memory dataset used for Stage-A supervised passes
+# BC training steps
 # =============================================================================
 
-class _WarmupDataset:
+def _worker_bc_step(agent: SMGWAgent,
+                    batch: Dict[str, np.ndarray],
+                    lr_override: float = None) -> float:
     """
-    Minimal storage of (worker samples, manager samples) collected during
-    Stage A. Kept in RAM for the Stage-A SL pass, then discarded.
+    One BC gradient step for the worker actor.
+
+    We regress the actor's pre-tanh raw mean onto atanh(demo_action). This
+    is the mathematically correct BC target for a tanh-squashed Gaussian:
+    the MODE of the policy is tanh(mean), so pushing mean toward
+    atanh(demo_action) pushes the mode toward demo_action.
     """
-    def __init__(self, z_dim: int, proprio_dim: int, action_dim: int,
-                 action_chunk_len: int, max_goal_dim: int, n_tasks: int):
-        self.z_dim = z_dim
-        self.proprio_dim = proprio_dim
-        self.action_dim = action_dim
-        self.H = action_chunk_len
-        self.max_goal_dim = max_goal_dim
-        self.n_tasks = n_tasks
+    device = agent.device
+    z = torch.from_numpy(batch['z']).to(device)
+    p = torch.from_numpy(batch['proprio']).to(device)
+    tt = torch.from_numpy(batch['task_target']).to(device)
+    tc = torch.from_numpy(batch['task_cur']).to(device)
+    tm = torch.from_numpy(batch['task_mask']).to(device)
+    tid = torch.from_numpy(batch['task_id']).long().to(device)
+    a_demo = torch.from_numpy(batch['action']).to(device)
+    te = agent.spec.text_embeddings[tid]
 
-        # Worker (chunk-level) samples
-        self.w_z: List[np.ndarray] = []
-        self.w_p: List[np.ndarray] = []
-        self.w_tt: List[np.ndarray] = []
-        self.w_tc: List[np.ndarray] = []
-        self.w_tm: List[np.ndarray] = []
-        self.w_id: List[int] = []
-        self.w_a: List[np.ndarray] = []
+    h = agent.worker_actor.trunk(z, p, tt, tc, tm, te)
+    mean_raw = agent.worker_actor.mean_head(h)
 
-        # Manager (option-level) samples with KNOWN task labels
-        self.m_z: List[np.ndarray] = []
-        self.m_p: List[np.ndarray] = []
-        self.m_ts: List[np.ndarray] = []
-        self.m_c: List[np.ndarray] = []
-        self.m_label: List[int] = []
+    # Chunked worker: tile the single-step demo action across chunk slots so
+    # the BC loss at least shapes the first slot. Online Stage B will refine
+    # the later chunk slots from real rollouts.
+    if agent.worker_actor.H > 1:
+        a_demo_flat = a_demo.repeat(1, agent.worker_actor.H)
+    else:
+        a_demo_flat = a_demo
 
-    # ---------------- writers ----------------
+    target = torch.from_numpy(
+        safe_atanh(a_demo_flat.detach().cpu().numpy())
+    ).to(device)
 
-    def add_worker(self, z, p, tt, tc, tm, tid, a_flat):
-        self.w_z.append(z.astype(np.float32))
-        self.w_p.append(p.astype(np.float32))
-        self.w_tt.append(tt.astype(np.float32))
-        self.w_tc.append(tc.astype(np.float32))
-        self.w_tm.append(tm.astype(np.float32))
-        self.w_id.append(int(tid))
-        self.w_a.append(a_flat.astype(np.float32))
+    loss = F.mse_loss(mean_raw, target)
 
-    def add_manager(self, z, p, ts, c, label):
-        self.m_z.append(z.astype(np.float32))
-        self.m_p.append(p.astype(np.float32))
-        self.m_ts.append(ts.astype(np.float32))
-        self.m_c.append(c.astype(np.float32))
-        self.m_label.append(int(label))
+    agent.worker_actor_opt.zero_grad()
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(agent.worker_actor.parameters(), 1.0)
+    if lr_override is not None:
+        for g in agent.worker_actor_opt.param_groups:
+            g['_saved_lr'] = g['lr']
+            g['lr'] = lr_override
+    agent.worker_actor_opt.step()
+    if lr_override is not None:
+        for g in agent.worker_actor_opt.param_groups:
+            g['lr'] = g.pop('_saved_lr')
+    return float(loss.item())
 
-    # ---------------- batching ----------------
 
-    def sample_worker_batch(self, batch_size: int,
-                            proprio_normalizer=None) -> Dict[str, np.ndarray]:
-        """
-        proprio_normalizer : callable(raw_proprio: np.ndarray) -> np.ndarray
-            If provided, normalizes proprio to match the online SAC pipeline.
-        """
-        n = len(self.w_z)
-        idx = np.random.randint(0, n, size=batch_size)
-        p = np.stack([self.w_p[i] for i in idx])
-        if proprio_normalizer is not None:
-            # Apply per-row; the normalizer expects (D,) shapes, so loop.
-            p_out = np.stack([proprio_normalizer(p[b]) for b in range(p.shape[0])])
-        else:
-            p_out = p.astype(np.float32)
-        return {
-            'z':           np.stack([self.w_z[i] for i in idx]),
-            'proprio':     p_out,
-            'task_target': np.stack([self.w_tt[i] for i in idx]),
-            'task_cur':    np.stack([self.w_tc[i] for i in idx]),
-            'task_mask':   np.stack([self.w_tm[i] for i in idx]),
-            'task_id':     np.array([self.w_id[i] for i in idx], dtype=np.int64),
-            'action':      np.stack([self.w_a[i] for i in idx]),
-        }
+def _manager_bc_step(agent: SMGWAgent,
+                     batch: Dict[str, np.ndarray],
+                     lr_override: float = None) -> float:
+    """One BC gradient step for the manager (CE over the 4 tasks)."""
+    device = agent.device
+    z = torch.from_numpy(batch['m_z']).to(device)
+    p = torch.from_numpy(batch['m_proprio']).to(device)
+    ts = torch.from_numpy(batch['m_task_state']).to(device)
+    c = torch.from_numpy(batch['m_completion']).to(device)
+    y = torch.from_numpy(batch['m_label']).long().to(device)
 
-    def sample_manager_batch(self, batch_size: int,
-                             proprio_normalizer=None) -> Dict[str, np.ndarray]:
-        n = len(self.m_z)
-        idx = np.random.randint(0, n, size=batch_size)
-        p = np.stack([self.m_p[i] for i in idx])
-        # NOTE: the manager uses raw proprio (it has its own torso with
-        # LayerNorm) — we pass raw proprio through as float32.
-        return {
-            'z':          np.stack([self.m_z[i] for i in idx]),
-            'proprio':    p.astype(np.float32),
-            'task_state': np.stack([self.m_ts[i] for i in idx]),
-            'completion': np.stack([self.m_c[i] for i in idx]),
-            'label':      np.array([self.m_label[i] for i in idx], dtype=np.int64),
-        }
+    q = agent.manager(z, p, ts, c, agent.spec.text_embeddings)
+    from networks import SemanticManager
+    q = q.masked_fill(c > 0.5, SemanticManager.MASK_FILL)
+    logp = F.log_softmax(q, dim=-1)
+    loss = F.nll_loss(logp, y)
 
-    def n_worker(self) -> int:
-        return len(self.w_z)
-
-    def n_manager(self) -> int:
-        return len(self.m_z)
+    agent.manager_opt.zero_grad()
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(agent.manager.parameters(), 1.0)
+    if lr_override is not None:
+        for g in agent.manager_opt.param_groups:
+            g['_saved_lr'] = g['lr']
+            g['lr'] = lr_override
+    agent.manager_opt.step()
+    if lr_override is not None:
+        for g in agent.manager_opt.param_groups:
+            g['lr'] = g.pop('_saved_lr')
+    return float(loss.item())
 
 
 # =============================================================================
-# Probing: per-task random-walk episodes with KNOWN task labels
+# Populate worker buffer with demo transitions
 # =============================================================================
 
-def _collect_probe_episodes(agent: SMGWAgent,
-                            env: FrankaKitchenImageWrapper,
-                            n_episodes_per_task: int,
-                            steps_per_episode: int) -> _WarmupDataset:
-    """
-    For each task k, run n_episodes_per_task episodes where we take random
-    actions for up to steps_per_episode steps. Every chunk is labelled with
-    task_id = k. If during the episode the env flips task k's completion
-    bit, we record an (option-level) manager sample labelled k.
-
-    We ALSO write a manager sample for every option where task k's
-    completion bit did NOT flip but some OTHER task did (we use the other
-    task as the label). This only adds supervision if luck made us
-    complete something; it never fabricates labels.
-    """
-    cfg = agent.config
+def _populate_worker_buffer_from_demos(agent: SMGWAgent,
+                                       ds: DemoBCDataset) -> int:
+    """Push every demo transition into the worker replay buffer."""
     H = agent.H_chunk
-    action_dim = agent.action_dim
-    K = cfg.manager.subgoal_horizon
+    n = ds.n_worker
+    if n == 0:
+        return 0
 
-    ds = _WarmupDataset(
-        z_dim=cfg.encoder.raw_dim, proprio_dim=cfg.worker.proprio_dim,
-        action_dim=action_dim, action_chunk_len=H,
-        max_goal_dim=agent.spec.max_goal_dim, n_tasks=agent.n_tasks,
-    )
+    if H > 1:
+        actions_flat = np.tile(ds.action, (1, H))
+    else:
+        actions_flat = ds.action
 
-    for task_id in range(agent.n_tasks):
-        task_name = agent.spec.name(task_id)
-        for ep in range(n_episodes_per_task):
-            img, state = env.reset()
-            z = agent.encoder.encode_numpy(img).squeeze()
-            proprio = state.copy()
-            completion = np.zeros(agent.n_tasks, dtype=np.float32)
+    for i in range(n):
+        agent.worker_buf.add(
+            z=ds.z[i],
+            proprio=ds.proprio[i],
+            task_target=ds.task_target[i],
+            task_cur=ds.task_cur[i],
+            task_mask=ds.task_mask[i],
+            task_id=int(ds.task_id[i]),
+            action_flat=actions_flat[i],
+            reward=float(ds.reward[i]),
+            z_next=ds.z_next[i],
+            proprio_next=ds.proprio_next[i],
+            task_cur_next=ds.task_cur[i],
+            done=0.0,
+        )
 
-            # Run several "options" inside the episode, each labelled with task_id
-            steps_done = 0
-            while steps_done < steps_per_episode:
-                # Record option-level context
-                ts_flat_start = build_task_state_flat(agent.spec, state)
-                z_start = z.copy()
-                state_start = state.copy()
-                completion_start = completion.copy()
-                completed_at_start = set(
-                    n for k_, n in enumerate(agent.tasks) if completion[k_] > 0.5
-                )
-
-                # Execute up to K env steps of random actions, in chunks of H
-                option_steps = 0
-                newly_completed_option = []
-                env_done = False
-                while option_steps < min(K, steps_per_episode - steps_done) and not env_done:
-                    # Sample a random chunk of H actions
-                    a_chunk = np.random.uniform(-1.0, 1.0,
-                                                size=(H, action_dim)).astype(np.float32)
-
-                    z_chunk_start = z.copy()
-                    state_chunk_start = state.copy()
-                    proprio_chunk_start = proprio.copy()
-
-                    for h in range(H):
-                        if option_steps >= K or steps_done >= steps_per_episode:
-                            break
-                        a_step = a_chunk[h]
-                        next_img, _, done_env, info = env.step(a_step)
-                        next_state = np.asarray(info['state'], dtype=np.float64)
-                        next_z = agent.encoder.encode_numpy(next_img).squeeze()
-                        now_completed = info.get('tasks_completed_names', [])
-                        for n in now_completed:
-                            if n not in completed_at_start and n not in newly_completed_option:
-                                newly_completed_option.append(n)
-
-                        state, proprio, z = next_state, next_state, next_z
-                        option_steps += 1
-                        steps_done += 1
-                        if done_env:
-                            env_done = True
-                            break
-
-                    # Write worker warmup sample with KNOWN task_id
-                    tt = agent.spec.padded_goal_for(task_id)
-                    tm = agent.spec.padded_mask_for(task_id)
-                    tc = agent.spec.padded_state_slice_for(state_chunk_start, task_id)
-                    ds.add_worker(
-                        z=z_chunk_start, p=proprio_chunk_start,
-                        tt=tt, tc=tc, tm=tm, tid=task_id,
-                        a_flat=a_chunk.reshape(-1),
-                    )
-
-                # Update completion mask
-                completion_end = completion_start.copy()
-                completed_all = set(completed_at_start)
-                completed_all.update(newly_completed_option)
-                for k_, n in enumerate(agent.tasks):
-                    if n in completed_all:
-                        completion_end[k_] = 1.0
-                completion = completion_end
-
-                # Manager sample: use task_id as the known label IF it flipped;
-                # otherwise if some OTHER task flipped, use that as the label
-                # (this is still a clean label — we know what happened).
-                if task_name in newly_completed_option:
-                    ds.add_manager(z=z_start, p=state_start,
-                                   ts=ts_flat_start, c=completion_start,
-                                   label=task_id)
-                elif len(newly_completed_option) > 0:
-                    other = newly_completed_option[0]
-                    if other in agent.tasks:
-                        ds.add_manager(z=z_start, p=state_start,
-                                       ts=ts_flat_start, c=completion_start,
-                                       label=agent.tasks.index(other))
-                # If no task completed, we do NOT add a manager sample —
-                # we refuse to fabricate labels.
-
-                if env_done:
-                    break
-
-    return ds
+    return n
 
 
 # =============================================================================
-# Optional: prime the worker buffer with demo frames (context only)
+# Batch samplers with proper proprio normalisation
 # =============================================================================
 
-def _seed_from_demo_gif(agent: SMGWAgent, gif_path: str, max_frames: int):
-    """
-    Decode the demo GIF frames, encode to z, and add them as CONTEXT-ONLY
-    transitions. Because we don't know the demo's per-frame action, we
-    insert zero actions with zero reward; they serve purely as visual
-    context so the worker's trunk doesn't freeze on narrow warmup statistics.
+def _make_worker_sampler(ds: DemoBCDataset, agent: SMGWAgent):
+    n = ds.n_worker
+    def sample(bs: int) -> Dict[str, np.ndarray]:
+        idx = np.random.randint(0, n, size=bs)
+        p_raw = ds.proprio[idx]
+        p_norm = np.stack([
+            agent.worker_buf.normalize_proprio(p_raw[b]) for b in range(bs)
+        ]).astype(np.float32)
+        return {
+            'z':           ds.z[idx],
+            'proprio':     p_norm,
+            'task_target': ds.task_target[idx],
+            'task_cur':    ds.task_cur[idx],
+            'task_mask':   ds.task_mask[idx],
+            'task_id':     ds.task_id[idx],
+            'action':      ds.action[idx],
+        }
+    return sample
 
-    If the GIF is missing, we silently skip.
-    """
-    if not os.path.exists(gif_path):
-        print(f"  [Warmup] Demo GIF not found at {gif_path}; skipping demo seeding.")
-        return 0
 
-    try:
-        from PIL import Image
-        gif = Image.open(gif_path)
-    except Exception as e:
-        print(f"  [Warmup] Could not open demo GIF ({e}); skipping.")
-        return 0
-
-    frames = []
-    try:
-        i = 0
-        while True:
-            gif.seek(i)
-            f = gif.convert('RGB').resize((agent.config.encoder.img_size,
-                                           agent.config.encoder.img_size))
-            frames.append(np.array(f, dtype=np.uint8))
-            i += 1
-    except EOFError:
-        pass
-
-    if not frames:
-        return 0
-
-    if len(frames) > max_frames:
-        idx = np.linspace(0, len(frames) - 1, max_frames, dtype=int)
-        frames = [frames[i] for i in idx]
-
-    zs = agent.encoder.encode_numpy(np.stack(frames))
-    # We don't add these to worker_buf (no action/target); instead, store them
-    # on the agent so the encoder's "domain" has seen demo statistics. If you
-    # want them to serve as additional context for BC, you could extend
-    # _WarmupDataset to hold demo z's — but we keep Stage A minimal.
-    agent._demo_z_for_logging = zs
-    print(f"  [Warmup] Loaded {len(frames)} demo frames (context only, not used as subgoals).")
-    return len(frames)
+def _make_manager_sampler(ds: DemoBCDataset):
+    n = ds.n_manager
+    def sample(bs: int) -> Dict[str, np.ndarray]:
+        idx = np.random.randint(0, n, size=bs)
+        return {
+            'm_z':          ds.m_z[idx],
+            'm_proprio':    ds.m_proprio[idx],
+            'm_task_state': ds.m_task_state[idx],
+            'm_completion': ds.m_completion[idx],
+            'm_label':      ds.m_label[idx],
+        }
+    return sample
 
 
 # =============================================================================
@@ -332,95 +209,83 @@ def run_stage_a_warmup(agent: SMGWAgent,
                        config: Config,
                        verbose: bool = True) -> Dict[str, float]:
     """
-    Full Stage A:
-      1. Per-task random-walk probes with known task labels.
-      2. Optional demo GIF loading for visual context.
-      3. Supervised BC pass on the worker actor.
-      4. Supervised CE pass on the manager (with completion mask).
-      5. Populate the worker replay buffer with the probe transitions,
-         so Stage B starts with a non-empty buffer.
+    Stage A: demo BC pretraining.
 
-    Returns a dict of stage-A metrics.
+    Outline:
+      1. Load / build the demo dataset.
+      2. Push demo transitions into the worker replay buffer.
+      3. BC-train the worker actor.
+      4. BC-train the manager.
+      5. Optionally save a BC checkpoint.
     """
     cfg = config
     results: Dict[str, float] = {}
 
-    # -- Build a probe env --
-    probe_env = FrankaKitchenImageWrapper(
-        tasks_to_complete=cfg.training.tasks_to_complete,
-        img_size=cfg.encoder.img_size,
-        seed=cfg.training.seed + 1,          # different seed from main env
-    )
+    # 1. Build / load dataset
+    ds = load_demo_bc_dataset(cfg, agent.spec, agent.encoder,
+                              tasks_to_complete=cfg.training.tasks_to_complete)
+    results['demo_worker_samples'] = ds.n_worker
+    results['demo_manager_samples'] = ds.n_manager
 
+    # 2. Populate worker buffer (this builds proprio stats)
     if verbose:
-        print("  [Warmup] Collecting per-task random-walk probes…")
-    ds = _collect_probe_episodes(
-        agent=agent, env=probe_env,
-        n_episodes_per_task=cfg.warmup.n_probe_episodes_per_task,
-        steps_per_episode=cfg.warmup.probe_steps_per_episode,
-    )
-    probe_env.close()
+        print(f"\n  [Warmup] Populating worker buffer with "
+              f"{ds.n_worker:,} demo transitions...")
+    _populate_worker_buffer_from_demos(agent, ds)
     if verbose:
-        print(f"  [Warmup] Collected {ds.n_worker():,} worker chunks, "
-              f"{ds.n_manager():,} manager option samples.")
-    results['probe_worker_samples'] = ds.n_worker()
-    results['probe_manager_samples'] = ds.n_manager()
+        print(f"  [Warmup] Worker buffer now holds {len(agent.worker_buf):,} transitions.")
+        print(f"  [Warmup] Proprio running-stats N = {agent.worker_buf.proprio_stats.n:,}")
 
-    # -- Demo (optional, context only) --
-    if cfg.warmup.use_demo_gif_for_context:
-        _seed_from_demo_gif(agent, cfg.warmup.demo_gif_path,
-                            cfg.warmup.demo_max_frames)
-
-    # -- Feed probe transitions into the real worker buffer so Stage B
-    # doesn't start from an empty replay. We use action-space clamping
-    # so the BC-targets match the actual env range.
-    for i in range(ds.n_worker()):
-        agent.worker_buf.add(
-            z=ds.w_z[i], proprio=ds.w_p[i],
-            task_target=ds.w_tt[i], task_cur=ds.w_tc[i], task_mask=ds.w_tm[i],
-            task_id=ds.w_id[i],
-            action_flat=ds.w_a[i],
-            reward=0.0,                     # conservative: no reward signal from random actions
-            z_next=ds.w_z[i],               # we don't store next-state from probes;
-            proprio_next=ds.w_p[i],         # Stage-B online data will supply the real TD targets
-            task_cur_next=ds.w_tc[i],
-            done=1.0,                       # treat as terminal so TD bootstraps = 0
-        )
-
-    # -- Supervised BC on worker actor --
-    if ds.n_worker() > 0:
+    # 3. Worker BC
+    if ds.n_worker > 0:
         if verbose:
-            print(f"  [Warmup] Worker BC: {cfg.warmup.n_worker_sl_steps} steps "
-                  f"on {ds.n_worker():,} samples.")
-        bc_losses = []
-        for step in range(cfg.warmup.n_worker_sl_steps):
-            batch = ds.sample_worker_batch(
-                cfg.warmup.sl_batch_size,
-                proprio_normalizer=agent.worker_buf.normalize_proprio,
-            )
-            bc_losses.append(agent.worker_warmup_step(batch))
-        results['worker_bc_loss_final'] = float(np.mean(bc_losses[-100:])) \
-            if len(bc_losses) >= 100 else float(np.mean(bc_losses))
+            print(f"\n  [Warmup] Worker BC: {cfg.warmup.n_worker_bc_steps:,} steps, "
+                  f"batch {cfg.warmup.bc_batch_size}, LR {cfg.warmup.bc_lr}")
+        sampler = _make_worker_sampler(ds, agent)
+        losses = []
+        for step in range(cfg.warmup.n_worker_bc_steps):
+            batch = sampler(cfg.warmup.bc_batch_size)
+            losses.append(_worker_bc_step(agent, batch,
+                                          lr_override=cfg.warmup.bc_lr))
+            if verbose and (step + 1) % 1000 == 0:
+                recent = float(np.mean(losses[-500:]))
+                print(f"    step {step+1:>6,}/{cfg.warmup.n_worker_bc_steps:,}  "
+                      f"BC loss (last 500) = {recent:.5f}")
+        results['worker_bc_loss_final'] = float(np.mean(losses[-500:]))
         if verbose:
-            print(f"  [Warmup] Worker BC final loss: {results['worker_bc_loss_final']:.4f}")
-
-    # -- Supervised CE on manager --
-    if ds.n_manager() > 0:
-        if verbose:
-            print(f"  [Warmup] Manager CE: {cfg.warmup.n_manager_sl_steps} steps "
-                  f"on {ds.n_manager():,} samples.")
-        ce_losses = []
-        for step in range(cfg.warmup.n_manager_sl_steps):
-            batch = ds.sample_manager_batch(cfg.warmup.sl_batch_size)
-            ce_losses.append(agent.manager_warmup_step(batch))
-        results['manager_ce_loss_final'] = float(np.mean(ce_losses[-100:])) \
-            if len(ce_losses) >= 100 else float(np.mean(ce_losses))
-        if verbose:
-            print(f"  [Warmup] Manager CE final loss: {results['manager_ce_loss_final']:.4f}")
+            print(f"  [Warmup] Worker BC final loss: "
+                  f"{results['worker_bc_loss_final']:.5f}")
     else:
+        results['worker_bc_loss_final'] = float('nan')
+
+    # 4. Manager BC
+    if ds.n_manager > 0:
         if verbose:
-            print("  [Warmup] No manager samples collected — skipping CE pass. "
-                  "This is expected if no task happened to complete during probes. "
-                  "Manager will still be updated online in Stage B from the option buffer.")
+            print(f"\n  [Warmup] Manager BC: {cfg.warmup.n_manager_bc_steps:,} steps")
+        sampler = _make_manager_sampler(ds)
+        losses = []
+        for step in range(cfg.warmup.n_manager_bc_steps):
+            batch = sampler(cfg.warmup.bc_batch_size)
+            losses.append(_manager_bc_step(agent, batch,
+                                           lr_override=cfg.warmup.bc_lr))
+            if verbose and (step + 1) % 500 == 0:
+                recent = float(np.mean(losses[-200:]))
+                print(f"    step {step+1:>6,}/{cfg.warmup.n_manager_bc_steps:,}  "
+                      f"CE loss (last 200) = {recent:.5f}")
+        results['manager_bc_loss_final'] = float(np.mean(losses[-200:]))
+        if verbose:
+            print(f"  [Warmup] Manager BC final loss: "
+                  f"{results['manager_bc_loss_final']:.5f}")
+    else:
+        results['manager_bc_loss_final'] = float('nan')
+
+    # 5. Save BC checkpoint
+    if cfg.warmup.save_bc_checkpoint:
+        ckpt_path = cfg.warmup.bc_checkpoint_path
+        os.makedirs(os.path.dirname(ckpt_path) or ".", exist_ok=True)
+        agent.save(ckpt_path)
+        if verbose:
+            print(f"\n  [Warmup] Saved BC checkpoint -> {ckpt_path}")
+        results['bc_checkpoint_path'] = ckpt_path
 
     return results
