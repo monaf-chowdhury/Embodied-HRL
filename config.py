@@ -53,6 +53,8 @@ class ManagerConfig:
     gamma: float = 0.99          # option-level discount
     tau: float = 0.005
     target_update_every: int = 1
+    online_demo_ce_weight: float = 1.0
+    online_demo_ce_steps: int = 1_000_000
 
     # Exploration over the 4 tasks (ε-greedy over MASKED logits)
     epsilon_start: float = 1.0
@@ -68,8 +70,10 @@ class ManagerConfig:
     #               + dense_shaping * (task-space error reduction for selected task)
     #               - option_cost  per option step (small, encourages brevity)
     completion_bonus: float = 10.0
+    offtask_completion_bonus: float = 0.0
     dense_shaping_weight: float = 1.0
     option_cost: float = 0.02
+    chosen_failure_penalty: float = 0.1
     # Reward when the episode finishes all tasks (applied to final option)
     all_done_bonus: float = 20.0
 
@@ -196,6 +200,14 @@ class TrainingConfig:
     stage_a_only: bool = False
     deterministic_torch: bool = True
     deterministic_worker_rollout_steps: int = 200_000
+    worker_update_start_steps: int = 1_000_000
+    manager_freeze_steps: int = 200_000
+    scripted_manager_steps: int = 400_000
+    scripted_manager_prob_start: float = 1.0
+    scripted_manager_prob_end: float = 0.10
+    scripted_manager_mode: str = "stage_a_rank"
+    min_stage_a_task_success: float = 0.25
+    unlock_remaining_tasks_steps: int = 1_000_000
     log_every_episodes: int = 20
     tb_every_episodes: int = 5
 

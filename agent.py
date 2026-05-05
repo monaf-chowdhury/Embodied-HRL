@@ -63,6 +63,7 @@ class OptionResult:
     chosen_task_completed: bool        # did THE chosen task's bit flip?
     any_task_completed: bool           # did ANY new task's bit flip?
     new_completions: int               # count of bits that flipped during option
+    offtask_completions: int           # count of OTHER tasks that flipped
     steps_taken: int
     env_done: bool
     termination_reason: str            # "completed" | "close_enough" | "budget" | "env_done"
@@ -197,6 +198,8 @@ class SMGWAgent:
             max_goal_dim=max_goal_dim, n_tasks=self.n_tasks, z_dtype=z_dtype,
         )
         self.demo_dataset = None
+        self.stage_a_task_success = np.zeros(self.n_tasks, dtype=np.float32)
+        self.curriculum_task_order = list(range(self.n_tasks))
 
         # Counters
         self.total_env_steps = 0
@@ -421,6 +424,7 @@ class SMGWAgent:
 
                 # Online SAC update, spaced out
                 if (train_worker_online
+                        and self.total_env_steps >= cfg.training.worker_update_start_steps
                         and len(self.worker_buf) > cfg.buffer.batch_size
                         and self.total_env_steps % update_every_n_env_steps == 0):
                     loss_dict = self.update_worker()
@@ -494,13 +498,20 @@ class SMGWAgent:
                 completion_end[k_] = 1.0
         new_complete_count = int(round(completion_end.sum() - completion.sum()))
 
-        # Option-level return for the manager — grounded in completion bits
-        option_return = (self.config.manager.completion_bonus * new_complete_count
+        chosen_completion_count = int(chosen_completed)
+        offtask_completions = max(0, new_complete_count - chosen_completion_count)
+
+        # Option-level return for the manager.
+        # Important: the manager should get strong credit for completing the
+        # task it actually asked for, not for accidentally triggering an easy
+        # task while choosing the wrong option.
+        option_return = (self.config.manager.completion_bonus * chosen_completion_count
+                         + self.config.manager.offtask_completion_bonus * offtask_completions
                          + self.config.manager.dense_shaping_weight
                          * (err_start_option - err_end_option)
                          - self.config.manager.option_cost)
-        if not chosen_completed and new_complete_count == 0:
-            option_return -= self.config.worker.failure_penalty
+        if not chosen_completed:
+            option_return -= self.config.manager.chosen_failure_penalty
         if completion_end.sum() >= self.n_tasks:
             option_return += self.config.manager.all_done_bonus
 
@@ -513,6 +524,7 @@ class SMGWAgent:
             chosen_task_completed=chosen_completed,
             any_task_completed=(new_complete_count > 0),
             new_completions=new_complete_count,
+            offtask_completions=offtask_completions,
             steps_taken=steps_taken, env_done=env_done,
             termination_reason=termination_reason,
             option_return=float(option_return),
@@ -641,18 +653,45 @@ class SMGWAgent:
         q_all = self.manager(z, p, ts, c, self.spec.text_embeddings)
         q_sa = q_all.gather(1, act.unsqueeze(1))
 
-        # Bootstrap: max over NOT-YET-COMPLETED tasks at the next state
+        # Bootstrap with Double DQN over NOT-YET-COMPLETED tasks at the next state.
         with torch.no_grad():
-            q_next = self.manager_target.q_masked(zn, pn, tsn, cn,
-                                                   self.spec.text_embeddings)
+            q_next_online = self.manager.q_masked(
+                zn, pn, tsn, cn, self.spec.text_embeddings
+            )
+            next_act = q_next_online.argmax(dim=1, keepdim=True)
+            q_next_target_all = self.manager_target(
+                zn, pn, tsn, cn, self.spec.text_embeddings
+            )
+            q_next_target_all = q_next_target_all.masked_fill(
+                cn > 0.5, SemanticManager.MASK_FILL
+            )
             # If all tasks complete at next state, mask is -inf; treat value as 0.
             all_done = (cn.sum(dim=-1, keepdim=True) >= self.n_tasks).float()
-            q_next_max = q_next.max(dim=1, keepdim=True).values
+            q_next_max = q_next_target_all.gather(1, next_act)
             q_next_max = torch.where(all_done > 0.5,
                                      torch.zeros_like(q_next_max), q_next_max)
             target = r + self.config.manager.gamma * (1 - d) * q_next_max
 
-        loss = F.mse_loss(q_sa, target)
+        td_loss = F.mse_loss(q_sa, target)
+        demo_ce_loss = torch.tensor(0.0, device=self.device)
+        demo_ce_coef = 0.0
+        if (self.demo_dataset is not None
+                and self.demo_dataset.n_manager() > 0
+                and self.config.manager.online_demo_ce_weight > 0.0
+                and self.total_env_steps < self.config.manager.online_demo_ce_steps):
+            frac = 1.0 - (self.total_env_steps / max(self.config.manager.online_demo_ce_steps, 1))
+            demo_ce_coef = self.config.manager.online_demo_ce_weight * max(0.0, frac)
+            demo_batch = self.demo_dataset.sample_manager_batch(self.config.buffer.batch_size)
+            dz = torch.from_numpy(demo_batch['z']).to(self.device)
+            dp = torch.from_numpy(demo_batch['proprio']).to(self.device)
+            dts = torch.from_numpy(demo_batch['task_state']).to(self.device)
+            dc = torch.from_numpy(demo_batch['completion']).to(self.device)
+            dy = torch.from_numpy(demo_batch['label']).long().to(self.device)
+            dq = self.manager(dz, dp, dts, dc, self.spec.text_embeddings)
+            dq = dq.masked_fill(dc > 0.5, SemanticManager.MASK_FILL)
+            demo_ce_loss = F.nll_loss(F.log_softmax(dq, dim=-1), dy)
+
+        loss = td_loss + demo_ce_coef * demo_ce_loss
         self.manager_opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.manager.parameters(), 1.0)
@@ -663,6 +702,9 @@ class SMGWAgent:
 
         return {
             'manager_loss': float(loss.item()),
+            'manager_td_loss': float(td_loss.item()),
+            'manager_demo_ce_loss': float(demo_ce_loss.item()),
+            'manager_demo_ce_coef': float(demo_ce_coef),
             'manager_q_mean': float(q_all.mean().item()),
             'manager_q_sa_mean': float(q_sa.mean().item()),
         }

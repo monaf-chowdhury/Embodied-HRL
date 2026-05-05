@@ -388,6 +388,69 @@ def save_checkpoint_and_videos(agent: SMGWAgent, config: Config, label: str):
               f"Mean tasks done: {result['mean_tasks_completed']:.2f}/{agent.n_tasks}")
 
 
+def derive_stage_a_task_success(agent: SMGWAgent,
+                                single_task_eval: Dict[str, float]) -> np.ndarray:
+    rates = []
+    for task_name in agent.tasks:
+        safe_task = task_name.lower().replace(" ", "_")
+        rates.append(single_task_eval.get(f"single_task/{safe_task}_success_rate", 0.0))
+    return np.asarray(rates, dtype=np.float32)
+
+
+def scripted_manager_prob(config: Config, env_steps: int) -> float:
+    horizon = max(int(config.training.scripted_manager_steps), 0)
+    if horizon <= 0 or env_steps >= horizon:
+        return 0.0
+    frac = env_steps / max(horizon, 1)
+    start = float(config.training.scripted_manager_prob_start)
+    end = float(config.training.scripted_manager_prob_end)
+    return max(0.0, start + frac * (end - start))
+
+
+def unlocked_task_ids(agent: SMGWAgent,
+                      config: Config,
+                      completion: np.ndarray) -> list[int]:
+    remaining = [k for k in range(agent.n_tasks) if completion[k] < 0.5]
+    if agent.total_env_steps >= config.training.unlock_remaining_tasks_steps:
+        return remaining
+
+    threshold = float(config.training.min_stage_a_task_success)
+    supported = [
+        k for k in remaining
+        if float(agent.stage_a_task_success[k]) >= threshold
+    ]
+    return supported if supported else remaining
+
+
+def select_stage_b_task(agent: SMGWAgent,
+                        config: Config,
+                        z: np.ndarray,
+                        proprio: np.ndarray,
+                        state: np.ndarray,
+                        completion: np.ndarray) -> tuple[int, bool, float]:
+    prob = scripted_manager_prob(config, agent.total_env_steps)
+    unlocked = unlocked_task_ids(agent, config, completion)
+    if config.training.scripted_manager_mode == "stage_a_rank":
+        candidate_order = agent.curriculum_task_order
+    else:
+        candidate_order = list(range(agent.n_tasks))
+    remaining = [k for k in candidate_order if k in unlocked]
+
+    if prob > 0.0 and remaining and np.random.random() < prob:
+        return int(remaining[0]), True, prob
+
+    gated_completion = completion.copy()
+    for k in range(agent.n_tasks):
+        if k not in unlocked:
+            gated_completion[k] = 1.0
+
+    return (
+        int(agent.select_task(z, proprio, state, gated_completion, deterministic=False)),
+        False,
+        prob,
+    )
+
+
 # =============================================================================
 # Pretty-printed banners
 # =============================================================================
@@ -413,8 +476,10 @@ def print_start_banner(config: Config, log_path: str):
     print(f"  Max HL steps   : {config.manager.max_high_level_steps} per episode")
     print(SEP2)
     print(f"  Manager reward : completion={config.manager.completion_bonus}  "
+          f"offtask={config.manager.offtask_completion_bonus}  "
           f"dense={config.manager.dense_shaping_weight}  "
           f"option_cost={config.manager.option_cost}  "
+          f"demo_ce_weight={config.manager.online_demo_ce_weight}  "
           f"all_done={config.manager.all_done_bonus}")
     print(f"  Worker reward  : progress={config.worker.progress_weight}  "
           f"completion={config.worker.completion_bonus}  "
@@ -422,7 +487,14 @@ def print_start_banner(config: Config, log_path: str):
           f"failure={config.worker.failure_penalty}")
     print(f"  Stage B stabil.: deterministic_rollout_steps={config.training.deterministic_worker_rollout_steps:,}  "
           f"demo_bc_weight={config.worker.online_demo_bc_weight}  "
-          f"demo_bc_steps={config.worker.online_demo_bc_steps:,}")
+          f"demo_bc_steps={config.worker.online_demo_bc_steps:,}  "
+          f"worker_update_start={config.training.worker_update_start_steps:,}")
+    print(f"  Stage B curric.: freeze_manager_steps={config.training.manager_freeze_steps:,}  "
+          f"scripted_manager_steps={config.training.scripted_manager_steps:,}  "
+          f"scripted_prob={config.training.scripted_manager_prob_start:.2f}->{config.training.scripted_manager_prob_end:.2f}  "
+          f"mode={config.training.scripted_manager_mode}  "
+          f"min_stage_a_success={config.training.min_stage_a_task_success:.2f}  "
+          f"unlock_all={config.training.unlock_remaining_tasks_steps:,}")
     print(f"  NOTE: Zero latent-distance terms anywhere. All rewards are "
           f"grounded in benchmark completion bits and task-space errors.")
     print(SEP2)
@@ -512,8 +584,19 @@ def train(config: Config):
         deterministic=config.eval.deterministic_worker,
         record_dir=stage_a_video_dir,
     )
+    # Stage A updates the online networks directly. Before Stage B starts, the
+    # target networks must be synchronized to the warmed-up weights; otherwise
+    # online TD updates bootstrap against stale pre-warmup targets.
+    agent.manager_target.load_state_dict(agent.manager.state_dict())
+    agent.worker_critic_target.load_state_dict(agent.worker_critic.state_dict())
+    agent.stage_a_task_success = derive_stage_a_task_success(agent, single_task_eval)
+    agent.curriculum_task_order = list(np.argsort(-agent.stage_a_task_success))
     for k, v in single_task_eval.items():
         writer.add_scalar(f'stage_a_eval/{k}', v, 0)
+    order_names = [agent.tasks[k] for k in agent.curriculum_task_order]
+    order_scores = [float(agent.stage_a_task_success[k]) for k in agent.curriculum_task_order]
+    print(f"  [Stage B Curriculum] scripted order = {order_names}")
+    print(f"  [Stage B Curriculum] stage-A success = {[round(s, 3) for s in order_scores]}")
     print(f"{SEP}\n")
 
     if config.training.stage_a_only:
@@ -547,6 +630,8 @@ def train(config: Config):
     run_full_success = []
     run_tasks_completed = []
     run_options_per_ep = []
+    run_scripted_choices = []
+    run_unlocked_task_counts = []
 
     # Explicit eval trigger — fire when total_env_steps crosses next_eval_at
     next_eval_at = config.eval.eval_every_env_steps
@@ -567,6 +652,8 @@ def train(config: Config):
         ep_tasks_completed = 0
         ep_options = 0
         env_done = False
+        scripted_prob = scripted_manager_prob(config, agent.total_env_steps)
+        unlocked_now = unlocked_task_ids(agent, config, completion)
 
         # ---- Option loop ----
         while (not env_done
@@ -574,8 +661,11 @@ def train(config: Config):
                and completion.sum() < agent.n_tasks):
 
             # -- Manager picks a task --
-            task_id = agent.select_task(z, proprio, state, completion,
-                                        deterministic=False)
+            task_id, used_scripted_manager, scripted_prob = select_stage_b_task(
+                agent, config, z, proprio, state, completion
+            )
+            run_scripted_choices.append(float(used_scripted_manager))
+            unlocked_now = unlocked_task_ids(agent, config, completion)
 
             # -- Worker executes the option --
             result = agent.execute_option(
@@ -608,10 +698,11 @@ def train(config: Config):
                 last_worker_losses = result.last_worker_losses
 
             # -- Manager online update --
-            for _ in range(config.training.manager_updates_per_option):
-                loss = agent.update_manager()
-                if loss:
-                    last_manager_losses = loss
+            if agent.total_env_steps >= config.training.manager_freeze_steps:
+                for _ in range(config.training.manager_updates_per_option):
+                    loss = agent.update_manager()
+                    if loss:
+                        last_manager_losses = loss
 
             # -- Update epsilon schedule --
             agent._update_epsilon()
@@ -639,6 +730,7 @@ def train(config: Config):
         run_full_success.append(ep_tasks_completed >= agent.n_tasks)
         run_tasks_completed.append(ep_tasks_completed)
         run_options_per_ep.append(ep_options)
+        run_unlocked_task_counts.append(len(unlocked_now))
 
         # ---- Per-episode TB scalars ----
         if agent.total_episodes % config.training.tb_every_episodes == 0:
@@ -650,6 +742,17 @@ def train(config: Config):
             writer.add_scalar('train/ep_tasks_completed', ep_tasks_completed, s)
             writer.add_scalar('train/ep_options', ep_options, s)
             writer.add_scalar('train/epsilon', agent.epsilon, s)
+            writer.add_scalar('train/scripted_manager_prob', scripted_prob, s)
+            writer.add_scalar(
+                'train/scripted_manager_fraction',
+                float(np.mean(run_scripted_choices)) if run_scripted_choices else 0.0,
+                s,
+            )
+            writer.add_scalar(
+                'train/unlocked_task_count',
+                float(np.mean(run_unlocked_task_counts)) if run_unlocked_task_counts else 0.0,
+                s,
+            )
             writer.add_scalar('train/worker_buffer_size', len(agent.worker_buf), s)
             writer.add_scalar('train/manager_buffer_size', len(agent.manager_buf), s)
 
@@ -683,8 +786,14 @@ def train(config: Config):
             print(f"    Mean options/ep   {np.mean(run_options_per_ep):.1f}")
             print(SEP3)
             print(f"  Exploration  epsilon={agent.epsilon:.3f}")
+            print(f"  Curriculum   scripted_prob={scripted_prob:.3f}  "
+                  f"scripted_frac={np.mean(run_scripted_choices)*100:5.1f}%  "
+                  f"manager_updates={'on' if agent.total_env_steps >= config.training.manager_freeze_steps else 'frozen'}  "
+                  f"unlocked={np.mean(run_unlocked_task_counts):.1f}")
             print(f"  Buffers      worker={len(agent.worker_buf):>7,}  "
                   f"manager={len(agent.manager_buf):>6,}")
+            unlocked_names = [agent.tasks[k] for k in unlocked_task_ids(agent, config, completion)]
+            print(f"  Unlocked     {unlocked_names}")
             if last_worker_losses:
                 print(f"  Worker (SAC)  critic={last_worker_losses.get('worker_critic_loss', 0):.5f}  "
                       f"actor={last_worker_losses.get('worker_actor_loss', 0):.4f}  "
@@ -698,6 +807,8 @@ def train(config: Config):
             run_full_success.clear()
             run_tasks_completed.clear()
             run_options_per_ep.clear()
+            run_scripted_choices.clear()
+            run_unlocked_task_counts.clear()
 
         # ---- Periodic evaluation ----
         if agent.total_env_steps >= next_eval_at:
@@ -791,7 +902,16 @@ if __name__ == "__main__":
     parser.add_argument('--manager_ce_steps', type=int, default=None)
     parser.add_argument('--online_demo_bc_weight', type=float, default=None)
     parser.add_argument('--online_demo_bc_steps', type=int, default=None)
+    parser.add_argument('--manager_online_demo_ce_weight', type=float, default=None)
+    parser.add_argument('--manager_online_demo_ce_steps', type=int, default=None)
     parser.add_argument('--deterministic_worker_rollout_steps', type=int, default=None)
+    parser.add_argument('--manager_freeze_steps', type=int, default=None)
+    parser.add_argument('--scripted_manager_steps', type=int, default=None)
+    parser.add_argument('--scripted_manager_prob_start', type=float, default=None)
+    parser.add_argument('--scripted_manager_prob_end', type=float, default=None)
+    parser.add_argument('--worker_update_start_steps', type=int, default=None)
+    parser.add_argument('--min_stage_a_task_success', type=float, default=None)
+    parser.add_argument('--unlock_remaining_tasks_steps', type=int, default=None)
     parser.add_argument('--single_task_eval_episodes', type=int, default=None)
     parser.add_argument('--no_video', action='store_true')
     args = parser.parse_args()
@@ -831,8 +951,26 @@ if __name__ == "__main__":
         config.worker.online_demo_bc_weight = args.online_demo_bc_weight
     if args.online_demo_bc_steps is not None:
         config.worker.online_demo_bc_steps = args.online_demo_bc_steps
+    if args.manager_online_demo_ce_weight is not None:
+        config.manager.online_demo_ce_weight = args.manager_online_demo_ce_weight
+    if args.manager_online_demo_ce_steps is not None:
+        config.manager.online_demo_ce_steps = args.manager_online_demo_ce_steps
     if args.deterministic_worker_rollout_steps is not None:
         config.training.deterministic_worker_rollout_steps = args.deterministic_worker_rollout_steps
+    if args.manager_freeze_steps is not None:
+        config.training.manager_freeze_steps = args.manager_freeze_steps
+    if args.scripted_manager_steps is not None:
+        config.training.scripted_manager_steps = args.scripted_manager_steps
+    if args.scripted_manager_prob_start is not None:
+        config.training.scripted_manager_prob_start = args.scripted_manager_prob_start
+    if args.scripted_manager_prob_end is not None:
+        config.training.scripted_manager_prob_end = args.scripted_manager_prob_end
+    if args.worker_update_start_steps is not None:
+        config.training.worker_update_start_steps = args.worker_update_start_steps
+    if args.min_stage_a_task_success is not None:
+        config.training.min_stage_a_task_success = args.min_stage_a_task_success
+    if args.unlock_remaining_tasks_steps is not None:
+        config.training.unlock_remaining_tasks_steps = args.unlock_remaining_tasks_steps
     if args.single_task_eval_episodes is not None:
         config.eval.n_single_task_episodes = args.single_task_eval_episodes
     if args.no_video:
