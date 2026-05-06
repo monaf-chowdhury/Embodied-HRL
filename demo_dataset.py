@@ -182,8 +182,10 @@ class DemoPretrainDataset:
                             balance_by_task: bool = True) -> Dict[str, np.ndarray]:
         idx = self._sample_worker_indices(batch_size, balance_by_task=balance_by_task)
         p = self.w_p[idx]
+        p_next = self.w_p_next[idx]
         if proprio_normalizer is not None:
             p = np.stack([proprio_normalizer(row) for row in p], axis=0)
+            p_next = np.stack([proprio_normalizer(row) for row in p_next], axis=0)
         return {
             "z": self.w_z[idx].astype(np.float32),
             "proprio": p.astype(np.float32),
@@ -194,7 +196,7 @@ class DemoPretrainDataset:
             "action": self.w_a[idx],
             "reward": self.w_r[idx],
             "z_next": self.w_z_next[idx].astype(np.float32),
-            "proprio_next": self.w_p_next[idx].astype(np.float32),
+            "proprio_next": p_next.astype(np.float32),
             "task_cur_next": self.w_tc_next[idx].astype(np.float32),
             "done": self.w_done[idx],
         }

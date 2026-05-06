@@ -18,7 +18,7 @@ Output files:
     00_overview_dashboard.png     — 6-panel summary; look here first
     01_eval_success.png           — eval success rates over time
     02_training_episode.png       — per-episode env reward + options + tasks completed
-    03_manager_dqn.png            — manager loss, Q-values, epsilon
+    03_manager_dqn.png            — manager/controller diagnostics
     04_worker_sac.png             — worker critic/actor loss, alpha
     05_buffers.png                — buffer fills
     06_warmup.png                 — Stage-A BC/CE losses (if collected)
@@ -140,6 +140,13 @@ def _plot(ax, data: dict, tag: str,
     _style_ax(ax)
 
 
+def _plot_first_available(ax, data: dict, tags: list[str], **kwargs):
+    for tag in tags:
+        if tag in data:
+            return _plot(ax, data, tag, **kwargs)
+    return _plot(ax, data, tags[0], **kwargs)
+
+
 def _style_ax(ax):
     ax.grid(True, alpha=STYLE['grid_alpha'], linestyle='--', linewidth=0.6)
     ax.tick_params(labelsize=STYLE['tick_fs'])
@@ -186,7 +193,7 @@ def plot_overview(data: dict, out_dir: str, sw: int = 15):
 
     _plot(axes[2], data, 'eval/mean_tasks_completed',
           title='[3]  Eval Mean Tasks Completed',
-          ylabel='Tasks (of 4)', color=COLORS['gold'],
+          ylabel='Tasks', color=COLORS['gold'],
           smooth_window=1, ymin=0, ymax=4.1)
 
     _plot(axes[3], data, 'train/ep_tasks_completed',
@@ -197,9 +204,10 @@ def plot_overview(data: dict, out_dir: str, sw: int = 15):
           title='[5]  Worker Critic Loss',
           ylabel='MSE', color=COLORS['red'], smooth_window=sw)
 
-    _plot(axes[5], data, 'manager/manager_loss',
-          title='[6]  Manager DQN Loss',
-          ylabel='MSE', color=COLORS['purple'], smooth_window=sw)
+    _plot_first_available(axes[5], data,
+          ['manager/manager_loss', 'train/controller_fraction'],
+          title='[6]  High-Level Controller',
+          ylabel='MSE / fraction', color=COLORS['purple'], smooth_window=sw)
 
     fig.tight_layout()
     _save(fig, out_dir, '00_overview_dashboard.png')
@@ -215,7 +223,7 @@ def plot_eval_success(data: dict, out_dir: str, sw: int = 1):
                  fontsize=STYLE['suptitle_fs'], fontweight='bold')
 
     _plot(axes[0], data, 'eval/full_task_success_rate',
-          title='Full-Task Success (all 4)',
+          title='Full-Task Success (all configured tasks)',
           ylabel='%', color=COLORS['green'],
           pct=True, smooth_window=sw, ymin=0, ymax=105)
     _plot(axes[1], data, 'eval/any_task_success_rate',
@@ -260,17 +268,20 @@ def plot_training_episode(data: dict, out_dir: str, sw: int = 15):
 
 def plot_manager(data: dict, out_dir: str, sw: int = 15):
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    fig.suptitle('Semantic Manager (DQN)',
+    fig.suptitle('High-Level Controller',
                  fontsize=STYLE['suptitle_fs'], fontweight='bold')
 
-    _plot(axes[0], data, 'manager/manager_loss',
-          title='Q Loss', ylabel='MSE',
+    _plot_first_available(axes[0], data,
+          ['manager/manager_loss', 'train/controller_fraction'],
+          title='Manager Loss / Controller Fraction', ylabel='MSE / fraction',
           color=COLORS['red'], smooth_window=sw)
-    _plot(axes[1], data, 'manager/manager_q_mean',
-          title='Mean Q(s,*)', ylabel='Q-value',
+    _plot_first_available(axes[1], data,
+          ['manager/manager_q_mean', 'train/unlocked_task_count'],
+          title='Mean Q(s,*) / Unlocked Tasks', ylabel='Q-value / count',
           color=COLORS['purple'], smooth_window=sw)
-    _plot(axes[2], data, 'train/epsilon',
-          title='Exploration Epsilon', ylabel='eps',
+    _plot_first_available(axes[2], data,
+          ['train/epsilon', 'train/scripted_manager_fraction', 'train/controller_fraction'],
+          title='Exploration / Scripted Fraction', ylabel='eps / fraction',
           color=COLORS['gray'], smooth_window=sw, ymin=0, ymax=1.05)
 
     fig.tight_layout()

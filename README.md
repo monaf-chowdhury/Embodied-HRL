@@ -1,15 +1,20 @@
-# Visual HRL for Long-Horizon Manipulation
+# Visual Long-Horizon Manipulation
 
-**Feasibility-Frontier Visual HRL with Strict Execution for Franka Kitchen**
+**Flat task-conditioned offline-to-online training is now the recommended path; hierarchy is retained as an ablation**
 
 ## What This Is
 
-### SMGW — Semantic Manager, Grounded Worker
+The codebase supports two modes:
 
-Pivot from latent-landmark HRL to a semantically-structured hierarchy for
-FrankaKitchen-v1. The design decisions and why-each-file-exists reasoning are
-discussed in the conversation that produced this codebase; this README is a
-quick operational reference.
+- `flat_scripted`:
+  a task-conditioned policy is pretrained offline on demos and then
+  fine-tuned online while a scripted controller selects the next incomplete
+  task.
+- `hierarchical`:
+  the older semantic-manager / grounded-worker SMGW path, kept for ablations.
+
+At the moment, the evidence points to skill learning and skill retention as
+the main scientific bottleneck, so `flat_scripted` is the default.
 
 ## File layout
 
@@ -32,14 +37,17 @@ smgw/
 ## Quickstart
 
 ```bash
-# Stage A only: demo BC + deterministic single-task worker eval
+# Stage A only: offline BC/IQL + deterministic single-task worker eval
 python train.py --bc_only \
   --seed 42 \
   --log_dir logs/bc_only \
   --demo_datasets franka-complete franka-mixed franka-partial
 
-# Full run: Stage A demo BC -> Stage B online HRL
-python train.py --seed 42 --log_dir logs/smgw_demo_bc
+# Recommended full run: flat scripted chaining + online worker fine-tuning
+python train.py --mode flat_scripted --seed 42 --log_dir logs/flat_scripted
+
+# Hierarchical ablation
+python train.py --mode hierarchical --seed 42 --log_dir logs/hierarchical_ablation
 
 # Action-chunk ablation (π0-style chunks of length 4)
 python train.py --action_chunk 4 --log_dir logs/smgw_chunk4

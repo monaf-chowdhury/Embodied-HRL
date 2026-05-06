@@ -102,6 +102,9 @@ class WorkerConfig:
     online_demo_bc_weight: float = 20.0
     online_demo_bc_steps: int = 200_000
     online_demo_batch_size: int = 256
+    online_demo_mix_ratio_start: float = 0.75
+    online_demo_mix_ratio_end: float = 0.25
+    online_demo_mix_steps: int = 1_000_000
 
     # ----- Action chunk toggle -----
     # action_chunk_len = 1  → standard single-step SAC (baseline ablation)
@@ -169,7 +172,7 @@ class WarmupConfig:
     # Stage-A supervised pretraining passes
     n_worker_sl_steps: int = 20_000
     n_worker_iql_steps: int = 100_000
-    n_manager_sl_steps: int = 4_000
+    n_manager_sl_steps: int = 0
     sl_batch_size: int = 256
     iql_expectile: float = 0.7
     iql_adv_beta: float = 3.0
@@ -194,13 +197,14 @@ class EvalConfig:
 
 @dataclass
 class TrainingConfig:
+    mode: str = "flat_scripted"      # "flat_scripted" | "hierarchical"
     total_env_steps: int = 1_000_000
     worker_updates_per_env_step: int = 1
     manager_updates_per_option: int = 1
     stage_a_only: bool = False
     deterministic_torch: bool = True
     deterministic_worker_rollout_steps: int = 200_000
-    worker_update_start_steps: int = 1_000_000
+    worker_update_start_steps: int = 0
     manager_freeze_steps: int = 200_000
     scripted_manager_steps: int = 400_000
     scripted_manager_prob_start: float = 1.0
@@ -208,6 +212,7 @@ class TrainingConfig:
     scripted_manager_mode: str = "stage_a_rank"
     min_stage_a_task_success: float = 0.25
     unlock_remaining_tasks_steps: int = 1_000_000
+    controller_order_mode: str = "given_order"   # "given_order" | "stage_a_rank"
     log_every_episodes: int = 20
     tb_every_episodes: int = 5
 

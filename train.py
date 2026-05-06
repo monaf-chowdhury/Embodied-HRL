@@ -108,7 +108,7 @@ def evaluate(agent: SMGWAgent,
     * any_task_success_rate     — fraction of eps where ≥1 task completed
     * full_task_success_rate    — fraction of eps where ALL tasks completed  (MAIN metric)
     * mean_tasks_completed      — average number of tasks completed per ep
-    * mean_options_used         — average number of options (manager decisions)
+    * mean_options_used         — average number of task attempts / options
     * mean_chosen_task_success  — how often the chosen task actually got its bit flipped
     * mean_env_reward           — raw env reward per ep (for comparison with baselines)
 
@@ -150,8 +150,11 @@ def evaluate(agent: SMGWAgent,
                and n_options < config.manager.max_high_level_steps
                and completion.sum() < agent.n_tasks):
 
-            task_id = agent.select_task(z, proprio, state, completion,
-                                        deterministic=deterministic)
+            if config.training.mode == "hierarchical":
+                task_id = agent.select_task(z, proprio, state, completion,
+                                            deterministic=deterministic)
+            else:
+                task_id = select_flat_task(agent, config, completion)
 
             result = agent.execute_option(
                 env=env, task_id=task_id,
@@ -407,6 +410,12 @@ def scripted_manager_prob(config: Config, env_steps: int) -> float:
     return max(0.0, start + frac * (end - start))
 
 
+def task_order_for_controller(agent: SMGWAgent, config: Config) -> list[int]:
+    if config.training.controller_order_mode == "stage_a_rank":
+        return list(agent.curriculum_task_order)
+    return list(range(agent.n_tasks))
+
+
 def unlocked_task_ids(agent: SMGWAgent,
                       config: Config,
                       completion: np.ndarray) -> list[int]:
@@ -451,6 +460,20 @@ def select_stage_b_task(agent: SMGWAgent,
     )
 
 
+def select_flat_task(agent: SMGWAgent,
+                     config: Config,
+                     completion: np.ndarray) -> int:
+    unlocked = unlocked_task_ids(agent, config, completion)
+    controller_order = task_order_for_controller(agent, config)
+    remaining = [k for k in controller_order if k in unlocked and completion[k] < 0.5]
+    if remaining:
+        return int(remaining[0])
+    fallback = [k for k in controller_order if completion[k] < 0.5]
+    if fallback:
+        return int(fallback[0])
+    return 0
+
+
 # =============================================================================
 # Pretty-printed banners
 # =============================================================================
@@ -469,18 +492,23 @@ def print_start_banner(config: Config, log_path: str):
     print(f"  Encoder        : {config.encoder.name.upper()}  "
           f"({config.encoder.raw_dim}-d features, FROZEN)")
     print(f"  Tasks          : {config.training.tasks_to_complete}")
-    print(f"  Manager        : 4-way discrete, completion-mask gated")
+    if config.training.mode == "hierarchical":
+        print(f"  High-Level     : learned manager, completion-mask gated")
+    else:
+        print(f"  High-Level     : scripted controller ({config.training.controller_order_mode})")
     print(f"  Worker         : SAC, FiLM-conditioned, "
           f"chunk_len = {config.worker.action_chunk_len}")
     print(f"  Subgoal K      : {config.manager.subgoal_horizon} env steps / option")
     print(f"  Max HL steps   : {config.manager.max_high_level_steps} per episode")
     print(SEP2)
-    print(f"  Manager reward : completion={config.manager.completion_bonus}  "
-          f"offtask={config.manager.offtask_completion_bonus}  "
-          f"dense={config.manager.dense_shaping_weight}  "
-          f"option_cost={config.manager.option_cost}  "
-          f"demo_ce_weight={config.manager.online_demo_ce_weight}  "
-          f"all_done={config.manager.all_done_bonus}")
+    print(f"  Training mode  : {config.training.mode}")
+    if config.training.mode == "hierarchical":
+        print(f"  Manager reward : completion={config.manager.completion_bonus}  "
+              f"offtask={config.manager.offtask_completion_bonus}  "
+              f"dense={config.manager.dense_shaping_weight}  "
+              f"option_cost={config.manager.option_cost}  "
+              f"demo_ce_weight={config.manager.online_demo_ce_weight}  "
+              f"all_done={config.manager.all_done_bonus}")
     print(f"  Worker reward  : progress={config.worker.progress_weight}  "
           f"completion={config.worker.completion_bonus}  "
           f"action_cost={config.worker.action_cost}  "
@@ -488,13 +516,15 @@ def print_start_banner(config: Config, log_path: str):
     print(f"  Stage B stabil.: deterministic_rollout_steps={config.training.deterministic_worker_rollout_steps:,}  "
           f"demo_bc_weight={config.worker.online_demo_bc_weight}  "
           f"demo_bc_steps={config.worker.online_demo_bc_steps:,}  "
+          f"demo_mix={config.worker.online_demo_mix_ratio_start:.2f}->{config.worker.online_demo_mix_ratio_end:.2f}  "
           f"worker_update_start={config.training.worker_update_start_steps:,}")
     print(f"  Stage B curric.: freeze_manager_steps={config.training.manager_freeze_steps:,}  "
           f"scripted_manager_steps={config.training.scripted_manager_steps:,}  "
           f"scripted_prob={config.training.scripted_manager_prob_start:.2f}->{config.training.scripted_manager_prob_end:.2f}  "
           f"mode={config.training.scripted_manager_mode}  "
           f"min_stage_a_success={config.training.min_stage_a_task_success:.2f}  "
-          f"unlock_all={config.training.unlock_remaining_tasks_steps:,}")
+          f"unlock_all={config.training.unlock_remaining_tasks_steps:,}  "
+          f"controller={config.training.controller_order_mode}")
     print(f"  NOTE: Zero latent-distance terms anywhere. All rewards are "
           f"grounded in benchmark completion bits and task-space errors.")
     print(SEP2)
@@ -556,6 +586,9 @@ def train(config: Config):
     )
     agent = SMGWAgent(config)
 
+    if config.training.mode != "hierarchical":
+        config.warmup.n_manager_sl_steps = 0
+
     print_start_banner(config, logger.log_path)
 
     # =========================================================================
@@ -593,10 +626,11 @@ def train(config: Config):
     agent.curriculum_task_order = list(np.argsort(-agent.stage_a_task_success))
     for k, v in single_task_eval.items():
         writer.add_scalar(f'stage_a_eval/{k}', v, 0)
-    order_names = [agent.tasks[k] for k in agent.curriculum_task_order]
-    order_scores = [float(agent.stage_a_task_success[k]) for k in agent.curriculum_task_order]
-    print(f"  [Stage B Curriculum] scripted order = {order_names}")
-    print(f"  [Stage B Curriculum] stage-A success = {[round(s, 3) for s in order_scores]}")
+    controller_order = task_order_for_controller(agent, config)
+    order_names = [agent.tasks[k] for k in controller_order]
+    order_scores = [float(agent.stage_a_task_success[k]) for k in controller_order]
+    print(f"  [Controller] order = {order_names}")
+    print(f"  [Controller] stage-A success = {[round(s, 3) for s in order_scores]}")
     print(f"{SEP}\n")
 
     if config.training.stage_a_only:
@@ -616,7 +650,10 @@ def train(config: Config):
     # Stage B: joint HRL training
     # =========================================================================
     print(SEP2)
-    print(f"  STAGE B  —  Joint HRL (manager DQN + worker SAC)")
+    if config.training.mode == "hierarchical":
+        print(f"  STAGE B  —  Joint HRL (manager DQN + worker SAC)")
+    else:
+        print(f"  STAGE B  —  Flat Scripted Chaining + Online Worker Fine-Tuning")
     print(SEP2 + "\n")
 
     best_full_task_sr = -1.0
@@ -660,11 +697,15 @@ def train(config: Config):
                and ep_options < config.manager.max_high_level_steps
                and completion.sum() < agent.n_tasks):
 
-            # -- Manager picks a task --
-            task_id, used_scripted_manager, scripted_prob = select_stage_b_task(
-                agent, config, z, proprio, state, completion
-            )
-            run_scripted_choices.append(float(used_scripted_manager))
+            if config.training.mode == "hierarchical":
+                task_id, used_scripted_manager, scripted_prob = select_stage_b_task(
+                    agent, config, z, proprio, state, completion
+                )
+                run_scripted_choices.append(float(used_scripted_manager))
+            else:
+                task_id = select_flat_task(agent, config, completion)
+                used_scripted_manager = True
+                run_scripted_choices.append(1.0)
             unlocked_now = unlocked_task_ids(agent, config, completion)
 
             # -- Worker executes the option --
@@ -681,31 +722,34 @@ def train(config: Config):
                 update_every_n_env_steps=update_every_n,
             )
 
-            # -- Write option transition to manager buffer --
-            agent.manager_buf.add(
-                z=result.z_start, proprio=result.proprio_start,
-                task_state=result.task_state_start,
-                completion=result.completion_start,
-                action=result.chosen_task,
-                reward=result.option_return,
-                z_next=result.z_end, proprio_next=result.proprio_end,
-                task_state_next=result.task_state_end,
-                completion_next=result.completion_end,
-                done=float(result.env_done
-                           or (result.completion_end.sum() >= agent.n_tasks)),
-            )
+            if config.training.mode == "hierarchical":
+                # -- Write option transition to manager buffer --
+                agent.manager_buf.add(
+                    z=result.z_start, proprio=result.proprio_start,
+                    task_state=result.task_state_start,
+                    completion=result.completion_start,
+                    action=result.chosen_task,
+                    reward=result.option_return,
+                    z_next=result.z_end, proprio_next=result.proprio_end,
+                    task_state_next=result.task_state_end,
+                    completion_next=result.completion_end,
+                    done=float(result.env_done
+                               or (result.completion_end.sum() >= agent.n_tasks)),
+                )
             if result.last_worker_losses:
                 last_worker_losses = result.last_worker_losses
 
-            # -- Manager online update --
-            if agent.total_env_steps >= config.training.manager_freeze_steps:
-                for _ in range(config.training.manager_updates_per_option):
-                    loss = agent.update_manager()
-                    if loss:
-                        last_manager_losses = loss
+            if config.training.mode == "hierarchical":
+                # -- Manager online update --
+                if agent.total_env_steps >= config.training.manager_freeze_steps:
+                    for _ in range(config.training.manager_updates_per_option):
+                        loss = agent.update_manager()
+                        if loss:
+                            last_manager_losses = loss
 
-            # -- Update epsilon schedule --
-            agent._update_epsilon()
+            if config.training.mode == "hierarchical":
+                # -- Update epsilon schedule --
+                agent._update_epsilon()
 
             # -- Advance outer state --
             state = result.proprio_end
@@ -741,8 +785,12 @@ def train(config: Config):
                               float(ep_tasks_completed >= agent.n_tasks), s)
             writer.add_scalar('train/ep_tasks_completed', ep_tasks_completed, s)
             writer.add_scalar('train/ep_options', ep_options, s)
-            writer.add_scalar('train/epsilon', agent.epsilon, s)
-            writer.add_scalar('train/scripted_manager_prob', scripted_prob, s)
+            if config.training.mode == "hierarchical":
+                writer.add_scalar('train/epsilon', agent.epsilon, s)
+                writer.add_scalar('train/scripted_manager_prob', scripted_prob, s)
+            writer.add_scalar('train/controller_fraction',
+                              float(np.mean(run_scripted_choices)) if run_scripted_choices else 0.0,
+                              s)
             writer.add_scalar(
                 'train/scripted_manager_fraction',
                 float(np.mean(run_scripted_choices)) if run_scripted_choices else 0.0,
@@ -785,20 +833,26 @@ def train(config: Config):
             print(f"    Mean tasks done   {np.mean(run_tasks_completed):.2f} / {agent.n_tasks}")
             print(f"    Mean options/ep   {np.mean(run_options_per_ep):.1f}")
             print(SEP3)
-            print(f"  Exploration  epsilon={agent.epsilon:.3f}")
-            print(f"  Curriculum   scripted_prob={scripted_prob:.3f}  "
-                  f"scripted_frac={np.mean(run_scripted_choices)*100:5.1f}%  "
-                  f"manager_updates={'on' if agent.total_env_steps >= config.training.manager_freeze_steps else 'frozen'}  "
-                  f"unlocked={np.mean(run_unlocked_task_counts):.1f}")
-            print(f"  Buffers      worker={len(agent.worker_buf):>7,}  "
-                  f"manager={len(agent.manager_buf):>6,}")
+            if config.training.mode == "hierarchical":
+                print(f"  Exploration  epsilon={agent.epsilon:.3f}")
+                print(f"  Curriculum   scripted_prob={scripted_prob:.3f}  "
+                      f"scripted_frac={np.mean(run_scripted_choices)*100:5.1f}%  "
+                      f"manager_updates={'on' if agent.total_env_steps >= config.training.manager_freeze_steps else 'frozen'}  "
+                      f"unlocked={np.mean(run_unlocked_task_counts):.1f}")
+                print(f"  Buffers      worker={len(agent.worker_buf):>7,}  "
+                      f"manager={len(agent.manager_buf):>6,}")
+            else:
+                print(f"  Controller   scripted_frac={np.mean(run_scripted_choices)*100:5.1f}%  "
+                      f"unlocked={np.mean(run_unlocked_task_counts):.1f}")
+                print(f"  Buffers      worker={len(agent.worker_buf):>7,}  "
+                      f"manager=     0")
             unlocked_names = [agent.tasks[k] for k in unlocked_task_ids(agent, config, completion)]
             print(f"  Unlocked     {unlocked_names}")
             if last_worker_losses:
                 print(f"  Worker (SAC)  critic={last_worker_losses.get('worker_critic_loss', 0):.5f}  "
                       f"actor={last_worker_losses.get('worker_actor_loss', 0):.4f}  "
                       f"alpha={last_worker_losses.get('worker_alpha', 0):.4f}")
-            if last_manager_losses:
+            if config.training.mode == "hierarchical" and last_manager_losses:
                 print(f"  Manager (DQN) loss={last_manager_losses.get('manager_loss', 0):.5f}  "
                       f"q_mean={last_manager_losses.get('manager_q_mean', 0):.3f}")
 
@@ -861,7 +915,8 @@ def train(config: Config):
     print(f"  Total options     {agent.total_options:,}")
     print(f"  Total episodes    {agent.total_episodes:,}")
     print(f"  Best full-task SR {best_full_task_sr*100:.1f}%")
-    print(f"  Final epsilon     {agent.epsilon:.4f}")
+    if config.training.mode == "hierarchical":
+        print(f"  Final epsilon     {agent.epsilon:.4f}")
     print(f"  Log file          {logger.log_path}")
     print(f"{SEP}\n")
 
@@ -878,6 +933,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SMGW — FrankaKitchen-v1")
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--mode', type=str, default=None,
+                        choices=['flat_scripted', 'hierarchical'])
     parser.add_argument('--total_steps', type=int, default=None,
                         help='Override config.training.total_env_steps')
     parser.add_argument('--encoder', type=str, default='r3m',
@@ -902,6 +959,9 @@ if __name__ == "__main__":
     parser.add_argument('--manager_ce_steps', type=int, default=None)
     parser.add_argument('--online_demo_bc_weight', type=float, default=None)
     parser.add_argument('--online_demo_bc_steps', type=int, default=None)
+    parser.add_argument('--online_demo_mix_ratio_start', type=float, default=None)
+    parser.add_argument('--online_demo_mix_ratio_end', type=float, default=None)
+    parser.add_argument('--online_demo_mix_steps', type=int, default=None)
     parser.add_argument('--manager_online_demo_ce_weight', type=float, default=None)
     parser.add_argument('--manager_online_demo_ce_steps', type=int, default=None)
     parser.add_argument('--deterministic_worker_rollout_steps', type=int, default=None)
@@ -912,11 +972,15 @@ if __name__ == "__main__":
     parser.add_argument('--worker_update_start_steps', type=int, default=None)
     parser.add_argument('--min_stage_a_task_success', type=float, default=None)
     parser.add_argument('--unlock_remaining_tasks_steps', type=int, default=None)
+    parser.add_argument('--controller_order_mode', type=str, default=None,
+                        choices=['given_order', 'stage_a_rank'])
     parser.add_argument('--single_task_eval_episodes', type=int, default=None)
     parser.add_argument('--no_video', action='store_true')
     args = parser.parse_args()
 
     config = Config()
+    if args.mode is not None:
+        config.training.mode = args.mode
     config.training.seed = args.seed
     config.training.device = args.device
     if args.total_steps is not None:
@@ -951,6 +1015,12 @@ if __name__ == "__main__":
         config.worker.online_demo_bc_weight = args.online_demo_bc_weight
     if args.online_demo_bc_steps is not None:
         config.worker.online_demo_bc_steps = args.online_demo_bc_steps
+    if args.online_demo_mix_ratio_start is not None:
+        config.worker.online_demo_mix_ratio_start = args.online_demo_mix_ratio_start
+    if args.online_demo_mix_ratio_end is not None:
+        config.worker.online_demo_mix_ratio_end = args.online_demo_mix_ratio_end
+    if args.online_demo_mix_steps is not None:
+        config.worker.online_demo_mix_steps = args.online_demo_mix_steps
     if args.manager_online_demo_ce_weight is not None:
         config.manager.online_demo_ce_weight = args.manager_online_demo_ce_weight
     if args.manager_online_demo_ce_steps is not None:
@@ -971,6 +1041,8 @@ if __name__ == "__main__":
         config.training.min_stage_a_task_success = args.min_stage_a_task_success
     if args.unlock_remaining_tasks_steps is not None:
         config.training.unlock_remaining_tasks_steps = args.unlock_remaining_tasks_steps
+    if args.controller_order_mode is not None:
+        config.training.controller_order_mode = args.controller_order_mode
     if args.single_task_eval_episodes is not None:
         config.eval.n_single_task_episodes = args.single_task_eval_episodes
     if args.no_video:

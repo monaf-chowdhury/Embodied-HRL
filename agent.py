@@ -541,7 +541,48 @@ class SMGWAgent:
     def update_worker(self) -> Dict[str, float]:
         if len(self.worker_buf) < self.config.buffer.batch_size:
             return {}
-        b = self.worker_buf.sample(self.config.buffer.batch_size)
+
+        batch_size = self.config.buffer.batch_size
+        use_demo_mix = (
+            self.demo_dataset is not None
+            and self.demo_dataset.n_worker() > 0
+            and self.config.worker.online_demo_mix_ratio_start > 0.0
+        )
+        demo_count = 0
+        if use_demo_mix:
+            mix_steps = max(self.config.worker.online_demo_mix_steps, 1)
+            frac = min(max(self.total_env_steps / mix_steps, 0.0), 1.0)
+            mix_ratio = (
+                (1.0 - frac) * self.config.worker.online_demo_mix_ratio_start
+                + frac * self.config.worker.online_demo_mix_ratio_end
+            )
+            demo_count = int(round(batch_size * max(0.0, min(1.0, mix_ratio))))
+        online_count = batch_size - demo_count
+
+        if online_count > 0:
+            b_online = self.worker_buf.sample(online_count)
+        else:
+            b_online = None
+
+        if demo_count > 0:
+            b_demo = self.demo_dataset.sample_worker_batch(
+                demo_count,
+                proprio_normalizer=self.worker_buf.normalize_proprio,
+                balance_by_task=self.config.warmup.balance_worker_task_sampling,
+            )
+        else:
+            b_demo = None
+
+        if b_online is None:
+            b = b_demo
+        elif b_demo is None:
+            b = b_online
+        else:
+            b = {
+                k: np.concatenate([b_online[k], b_demo[k]], axis=0)
+                for k in b_online.keys()
+            }
+
         z = torch.from_numpy(b['z']).to(self.device)
         p = torch.from_numpy(b['proprio']).to(self.device)
         tt = torch.from_numpy(b['task_target']).to(self.device)
@@ -627,6 +668,8 @@ class SMGWAgent:
             'worker_mean_logp': float(logp.mean().item()),
             'worker_demo_bc_loss': float(demo_bc_loss.item()),
             'worker_demo_bc_coef': float(demo_bc_coef),
+            'worker_demo_mix_count': float(demo_count),
+            'worker_online_mix_count': float(online_count),
         }
 
     # =========================================================================
