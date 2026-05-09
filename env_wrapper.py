@@ -180,6 +180,128 @@ class FrankaKitchenImageWrapper:
         self.set_mujoco_state(qpos, qvel)
         return self.render_image()
 
+    # ---------------------- privileged geometry access ----------------------
+
+    def _model_names(self, kind: str) -> List[str]:
+        """
+        Return MuJoCo object names for `site`, `body`, or `geom`.
+
+        This is intentionally best-effort: different kitchen package versions
+        expose slightly different names, so callers should use fuzzy matching.
+        """
+        base = self._env.unwrapped
+        model = getattr(base, "model", None)
+        if model is None:
+            return []
+        n = int(getattr(model, f"n{kind}", 0))
+        names = []
+        typed_accessor = getattr(model, kind, None)
+        id2name = getattr(model, f"{kind}_id2name", None)
+        raw_names = getattr(model, "names", None)
+        name_adr = getattr(model, f"name_{kind}adr", None)
+        for i in range(n):
+            name = None
+            if callable(typed_accessor):
+                try:
+                    name = getattr(typed_accessor(i), "name", None)
+                except Exception:
+                    name = None
+            if name is None and callable(id2name):
+                try:
+                    name = id2name(i)
+                except Exception:
+                    name = None
+            if name is None and hasattr(model, "id2name"):
+                try:
+                    name = model.id2name(i, kind)
+                except Exception:
+                    name = None
+            if name is None and raw_names is not None and name_adr is not None:
+                try:
+                    adr = int(name_adr[i])
+                    raw = bytes(raw_names[adr:])
+                    name = raw.split(b"\x00", 1)[0].decode("utf-8")
+                except Exception:
+                    name = None
+            names.append(str(name or ""))
+        return names
+
+    def list_mujoco_names(self) -> Dict[str, List[str]]:
+        return {
+            "site": self._model_names("site"),
+            "body": self._model_names("body"),
+            "geom": self._model_names("geom"),
+        }
+
+    def xpos_by_name_patterns(self, patterns: List[str]) -> Optional[np.ndarray]:
+        """
+        Best-effort world position lookup. Searches sites first, then bodies,
+        then geoms. Returns the highest-scoring fuzzy match.
+        """
+        base = self._env.unwrapped
+        model = getattr(base, "model", None)
+        data = getattr(base, "data", None)
+        if model is None or data is None:
+            return None
+        pats = [p.lower() for p in patterns]
+        best_score = 0
+        best_pos = None
+        for kind, arr_name in (("site", "site_xpos"), ("body", "xpos"), ("geom", "geom_xpos")):
+            names = self._model_names(kind)
+            arr = getattr(data, arr_name, None)
+            if arr is None:
+                continue
+            for i, name in enumerate(names):
+                low = name.lower()
+                score = sum(1 for p in pats if p in low)
+                if score > best_score:
+                    try:
+                        best_pos = np.asarray(arr[i], dtype=np.float64).copy()
+                        best_score = score
+                    except Exception:
+                        continue
+        return best_pos
+
+    def contact_features_by_name_patterns(self,
+                                          patterns_a: List[str],
+                                          patterns_b: List[str]) -> np.ndarray:
+        """
+        Return [contact_flag, min_contact_dist] for contacts between two fuzzy
+        geom-name groups. If no matching contact exists, min_contact_dist=1.0.
+        """
+        base = self._env.unwrapped
+        data = getattr(base, "data", None)
+        if data is None:
+            return np.asarray([0.0, 1.0], dtype=np.float32)
+        geom_names = self._model_names("geom")
+        pats_a = [p.lower() for p in patterns_a]
+        pats_b = [p.lower() for p in patterns_b]
+
+        def matches(name: str, pats: List[str]) -> bool:
+            low = name.lower()
+            return any(p in low for p in pats)
+
+        min_dist = 1.0
+        found = False
+        for i in range(int(getattr(data, "ncon", 0))):
+            try:
+                con = data.contact[i]
+                g1 = int(con.geom1)
+                g2 = int(con.geom2)
+                n1 = geom_names[g1] if 0 <= g1 < len(geom_names) else ""
+                n2 = geom_names[g2] if 0 <= g2 < len(geom_names) else ""
+                pair_match = (
+                    matches(n1, pats_a) and matches(n2, pats_b)
+                ) or (
+                    matches(n1, pats_b) and matches(n2, pats_a)
+                )
+                if pair_match:
+                    found = True
+                    min_dist = min(min_dist, float(getattr(con, "dist", 0.0)))
+            except Exception:
+                continue
+        return np.asarray([1.0 if found else 0.0, min_dist], dtype=np.float32)
+
     # Back-compat alias for any legacy callers.
     _render_image = render_image
 

@@ -30,12 +30,14 @@ import datetime
 import argparse
 import numpy as np
 import torch
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Sequence
 from torch.utils.tensorboard import SummaryWriter
 
 from config import Config
 from env_wrapper import FrankaKitchenImageWrapper
 from agent import SMGWAgent
+from demo_dataset import sample_oracle_prefix_states
+from specialist import SpecialistSkillAgent, run_specialist_stage_a_warmup
 from warmup import run_stage_a_warmup
 from utils import save_video, format_time, format_steps
 
@@ -365,6 +367,161 @@ def evaluate_single_task_worker(agent: SMGWAgent,
 
     return results
 
+
+def evaluate_oracle_prefix_states(agent: SMGWAgent,
+                                  config: Config,
+                                  prefix_tasks: Sequence[str],
+                                  target_task: str,
+                                  n_states: int = 20,
+                                  deterministic: bool = True,
+                                  record_dir: Optional[str] = None,
+                                  n_videos: int = 0) -> Dict[str, float]:
+    """
+    Oracle prefix-state evaluation:
+      - sample demo states where exactly `prefix_tasks` are complete
+      - the replay-labelled active target is `target_task`
+      - run the frozen policy on `target_task` only from those states
+    """
+    samples, sample_stats = sample_oracle_prefix_states(
+        agent=agent,
+        config=config,
+        prefix_tasks=prefix_tasks,
+        target_task=target_task,
+        max_states=n_states,
+        verbose=True,
+    )
+
+    target_id = agent.tasks.index(target_task)
+    prefix_ids = [agent.tasks.index(name) for name in prefix_tasks]
+    env = FrankaKitchenImageWrapper(
+        tasks_to_complete=config.training.tasks_to_complete,
+        img_size=config.encoder.img_size,
+    )
+
+    success = []
+    option_counts = []
+    env_rewards = []
+    final_errors = []
+    best_errors = []
+    prefix_preserved = []
+    offtask_completion = []
+    termination_reasons: Dict[str, int] = {}
+    report_lines = [
+        "Stage A Oracle Prefix-State Evaluation",
+        f"target_task={target_task}",
+        f"prefix_tasks={list(prefix_tasks)}",
+        f"n_states={len(samples)}",
+        "",
+    ]
+
+    for sample_idx, sample in enumerate(samples):
+        collect_frames = record_dir is not None and sample_idx < n_videos
+        env.reset(seed=config.training.seed + 30_000 + sample_idx)
+        qpos, qvel = env.observation_to_qpos_qvel(sample["state"])
+        env.set_mujoco_state(qpos, qvel)
+        env._current_obs = {"observation": np.asarray(sample["state"], dtype=np.float64).copy()}
+        env._step_count = 0
+
+        state = np.asarray(sample["state"], dtype=np.float64).copy()
+        img = env.render_image()
+        z = agent.encoder.encode_numpy(img).squeeze()
+        completion = np.asarray(sample["completion"], dtype=np.float32).copy()
+
+        frames_accum = [img.copy()] if collect_frames else []
+        done = False
+        ep_success = False
+        ep_options = 0
+        ep_env_reward = 0.0
+        best_err = float(agent.spec.task_error(state, target_id))
+
+        while not done and not ep_success and ep_options < config.manager.max_high_level_steps:
+            result = agent.execute_option(
+                env=env,
+                task_id=target_id,
+                start_img=img,
+                start_state=state,
+                start_z=z,
+                completion=completion,
+                deterministic_worker=deterministic,
+                collect_frames=collect_frames,
+                train_worker_online=False,
+            )
+            state = result.proprio_end
+            z = result.z_end
+            completion = result.completion_end
+            done = result.env_done
+            ep_options += 1
+            ep_env_reward += result.env_reward_sum
+            cur_err = float(agent.spec.task_error(state, target_id))
+            best_err = min(best_err, cur_err)
+            ep_success = bool(
+                result.chosen_task_completed
+                or completion[target_id] > 0.5
+                or agent.spec.is_close(state, target_id)
+            )
+            termination_reasons[result.termination_reason] = (
+                termination_reasons.get(result.termination_reason, 0) + 1
+            )
+            if collect_frames and result.frames:
+                frames_accum.extend(result.frames[1:])
+            if not done:
+                img = env.render_image()
+
+        final_err = float(agent.spec.task_error(state, target_id))
+        prefix_ok = bool(np.all(completion[prefix_ids] > 0.5)) if prefix_ids else True
+        extra_complete = [
+            agent.tasks[k] for k in range(agent.n_tasks)
+            if k not in prefix_ids and k != target_id and completion[k] > 0.5
+        ]
+
+        success.append(float(ep_success))
+        option_counts.append(float(ep_options))
+        env_rewards.append(float(ep_env_reward))
+        final_errors.append(final_err)
+        best_errors.append(best_err)
+        prefix_preserved.append(float(prefix_ok))
+        offtask_completion.append(float(len(extra_complete) > 0))
+
+        if collect_frames and frames_accum:
+            os.makedirs(record_dir, exist_ok=True)
+            sample_name = f"sample_{sample_idx:03d}"
+            suffix = "success" if ep_success else "fail"
+            video_path = os.path.join(record_dir, f"{sample_name}_{suffix}.mp4")
+            save_video(frames_accum, video_path, fps=config.training.video_fps)
+
+        report_lines.append(
+            f"sample={sample_idx:03d} success={int(ep_success)} options={ep_options} "
+            f"final_error={final_err:.6f} best_error={best_err:.6f} "
+            f"prefix_preserved={int(prefix_ok)} offtask_completed={int(len(extra_complete) > 0)} "
+            f"dataset={str(sample['dataset_id'])} episode={str(sample['episode_id'])} "
+            f"step={int(sample['step_index'])}"
+        )
+
+    env.close()
+
+    result = {
+        "prefix_eval/success_rate": float(np.mean(success)) if success else 0.0,
+        "prefix_eval/mean_options": float(np.mean(option_counts)) if option_counts else 0.0,
+        "prefix_eval/mean_env_reward": float(np.mean(env_rewards)) if env_rewards else 0.0,
+        "prefix_eval/mean_final_error": float(np.mean(final_errors)) if final_errors else 0.0,
+        "prefix_eval/mean_best_error": float(np.mean(best_errors)) if best_errors else 0.0,
+        "prefix_eval/prefix_preservation_rate": float(np.mean(prefix_preserved)) if prefix_preserved else 0.0,
+        "prefix_eval/offtask_completion_rate": float(np.mean(offtask_completion)) if offtask_completion else 0.0,
+        "prefix_eval/n_states": float(len(samples)),
+        "prefix_eval/termination_reasons": termination_reasons,
+    }
+    for k, v in sample_stats.items():
+        result[f"prefix_eval_sampler/{k}"] = float(v)
+
+    if record_dir is not None:
+        os.makedirs(record_dir, exist_ok=True)
+        report_path = os.path.join(record_dir, "summary.txt")
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(report_lines) + "\n")
+        result["prefix_eval/report_path"] = report_path
+
+    return result
+
 # =============================================================================
 # Save checkpoint and record eval videos
 # =============================================================================
@@ -496,8 +653,12 @@ def print_start_banner(config: Config, log_path: str):
         print(f"  High-Level     : learned manager, completion-mask gated")
     else:
         print(f"  High-Level     : scripted controller ({config.training.controller_order_mode})")
-    print(f"  Worker         : SAC, FiLM-conditioned, "
-          f"chunk_len = {config.worker.action_chunk_len}")
+    if config.training.mode == "specialist_skills":
+        print(f"  Worker         : per-skill visual students  "
+              f"(chunk_len = {config.worker.action_chunk_len})")
+    else:
+        print(f"  Worker         : SAC, FiLM-conditioned, "
+              f"chunk_len = {config.worker.action_chunk_len}")
     print(f"  Subgoal K      : {config.manager.subgoal_horizon} env steps / option")
     print(f"  Max HL steps   : {config.manager.max_high_level_steps} per episode")
     print(SEP2)
@@ -513,28 +674,59 @@ def print_start_banner(config: Config, log_path: str):
           f"completion={config.worker.completion_bonus}  "
           f"action_cost={config.worker.action_cost}  "
           f"failure={config.worker.failure_penalty}")
-    print(f"  Stage B stabil.: deterministic_rollout_steps={config.training.deterministic_worker_rollout_steps:,}  "
-          f"demo_bc_weight={config.worker.online_demo_bc_weight}  "
-          f"demo_bc_steps={config.worker.online_demo_bc_steps:,}  "
-          f"demo_mix={config.worker.online_demo_mix_ratio_start:.2f}->{config.worker.online_demo_mix_ratio_end:.2f}  "
-          f"worker_update_start={config.training.worker_update_start_steps:,}")
-    print(f"  Stage B curric.: freeze_manager_steps={config.training.manager_freeze_steps:,}  "
-          f"scripted_manager_steps={config.training.scripted_manager_steps:,}  "
-          f"scripted_prob={config.training.scripted_manager_prob_start:.2f}->{config.training.scripted_manager_prob_end:.2f}  "
-          f"mode={config.training.scripted_manager_mode}  "
-          f"min_stage_a_success={config.training.min_stage_a_task_success:.2f}  "
-          f"unlock_all={config.training.unlock_remaining_tasks_steps:,}  "
-          f"controller={config.training.controller_order_mode}")
+    if config.training.mode == "specialist_skills":
+        print(f"  Chaining stage  : scripted controller over remaining tasks  "
+              f"(order={config.training.controller_order_mode})")
+        print(f"  Online stage    : conservative per-skill fine-tuning scaffold  "
+              f"(currently frozen eval by default)")
+    else:
+        print(f"  Stage B stabil.: deterministic_rollout_steps={config.training.deterministic_worker_rollout_steps:,}  "
+              f"demo_bc_weight={config.worker.online_demo_bc_weight}  "
+              f"demo_bc_steps={config.worker.online_demo_bc_steps:,}  "
+              f"demo_mix={config.worker.online_demo_mix_ratio_start:.2f}->{config.worker.online_demo_mix_ratio_end:.2f}  "
+              f"worker_update_start={config.training.worker_update_start_steps:,}")
+        print(f"  Stage B curric.: freeze_manager_steps={config.training.manager_freeze_steps:,}  "
+              f"scripted_manager_steps={config.training.scripted_manager_steps:,}  "
+              f"scripted_prob={config.training.scripted_manager_prob_start:.2f}->{config.training.scripted_manager_prob_end:.2f}  "
+              f"mode={config.training.scripted_manager_mode}  "
+              f"min_stage_a_success={config.training.min_stage_a_task_success:.2f}  "
+              f"unlock_all={config.training.unlock_remaining_tasks_steps:,}  "
+              f"controller={config.training.controller_order_mode}")
     print(f"  NOTE: Zero latent-distance terms anywhere. All rewards are "
           f"grounded in benchmark completion bits and task-space errors.")
     print(SEP2)
     print(f"  Stage A demos  : {config.warmup.dataset_ids}")
     print(f"  Stage A cache  : {config.warmup.cache_dir}  "
           f"(rebuild={config.warmup.rebuild_cache})")
-    print(f"  Stage A BC/IQL : worker_bc={config.warmup.n_worker_sl_steps}  "
-          f"worker_iql={config.warmup.n_worker_iql_steps}  "
-          f"manager_ce={config.warmup.n_manager_sl_steps}  "
-          f"(batch={config.warmup.sl_batch_size})")
+    if config.training.mode == "specialist_skills":
+        print(f"  Stage A skill  : teacher_bc={config.specialist.n_teacher_bc_steps}  "
+              f"teacher_iql={config.specialist.n_teacher_iql_steps}  "
+              f"teacher_online={config.specialist.n_teacher_online_steps}  "
+              f"student_distill={config.specialist.n_student_distill_steps}  "
+              f"rollout_distill={config.specialist.n_student_rollout_distill_steps}  "
+              f"dagger={config.specialist.n_student_dagger_steps}  "
+              f"(batch={config.specialist.batch_size})")
+        print(f"  Teacher reward : task={config.specialist.teacher_online_reward_task_weight:.2f}  "
+              f"approach={config.specialist.teacher_online_reward_approach_weight:.2f}  "
+              f"completion={config.specialist.teacher_online_reward_completion:.2f}  "
+              f"action_cost={config.specialist.teacher_online_reward_action_cost:.4f}")
+        print(f"  Teacher policy : affordance-aware privileged input  "
+              f"residual_online={config.specialist.teacher_residual_online}  "
+              f"residual_scale={config.specialist.teacher_residual_scale:.3f}  "
+              f"online_noise={config.specialist.teacher_online_exploration_std:.3f}")
+    else:
+        print(f"  Stage A BC/IQL : worker_bc={config.warmup.n_worker_sl_steps}  "
+              f"worker_iql={config.warmup.n_worker_iql_steps}  "
+              f"manager_ce={config.warmup.n_manager_sl_steps}  "
+              f"(batch={config.warmup.sl_batch_size})")
+    if config.warmup.focus_task:
+        print(f"  Stage A focus  : task='{config.warmup.focus_task}'  "
+              f"weight={config.warmup.focus_task_weight:.2f}  "
+              f"tail_start={config.warmup.focus_task_tail_start:.2f}  "
+              f"tail_weight={config.warmup.focus_task_tail_weight:.2f}")
+        if config.warmup.n_focus_refine_steps > 0:
+            print(f"  Stage A refine : steps={config.warmup.n_focus_refine_steps}  "
+                  f"min_seg_prog={config.warmup.focus_refine_min_seg_prog:.2f}")
     print(f"  Stage B steps  : {config.training.total_env_steps:,}")
     print(f"  Batch size     : {config.buffer.batch_size}")
     print(f"  Buffer cap     : worker={config.buffer.worker_capacity:,}  "
@@ -584,7 +776,10 @@ def train(config: Config):
         seed=config.training.seed,
         terminate_on_tasks_completed=False,
     )
-    agent = SMGWAgent(config)
+    if config.training.mode == "specialist_skills":
+        agent = SpecialistSkillAgent(config)
+    else:
+        agent = SMGWAgent(config)
 
     if config.training.mode != "hierarchical":
         config.warmup.n_manager_sl_steps = 0
@@ -599,7 +794,10 @@ def train(config: Config):
     print(SEP2 + "\n")
 
     t0 = time.time()
-    warmup_stats = run_stage_a_warmup(agent, config, verbose=True)
+    if config.training.mode == "specialist_skills":
+        warmup_stats = run_specialist_stage_a_warmup(agent, config, verbose=True)
+    else:
+        warmup_stats = run_stage_a_warmup(agent, config, verbose=True)
     warmup_elapsed = time.time() - t0
     print(f"\n  Stage A complete in {format_time(warmup_elapsed)}.")
     for k, v in warmup_stats.items():
@@ -620,8 +818,9 @@ def train(config: Config):
     # Stage A updates the online networks directly. Before Stage B starts, the
     # target networks must be synchronized to the warmed-up weights; otherwise
     # online TD updates bootstrap against stale pre-warmup targets.
-    agent.manager_target.load_state_dict(agent.manager.state_dict())
-    agent.worker_critic_target.load_state_dict(agent.worker_critic.state_dict())
+    if config.training.mode != "specialist_skills":
+        agent.manager_target.load_state_dict(agent.manager.state_dict())
+        agent.worker_critic_target.load_state_dict(agent.worker_critic.state_dict())
     agent.stage_a_task_success = derive_stage_a_task_success(agent, single_task_eval)
     agent.curriculum_task_order = list(np.argsort(-agent.stage_a_task_success))
     for k, v in single_task_eval.items():
@@ -631,6 +830,107 @@ def train(config: Config):
     order_scores = [float(agent.stage_a_task_success[k]) for k in controller_order]
     print(f"  [Controller] order = {order_names}")
     print(f"  [Controller] stage-A success = {[round(s, 3) for s in order_scores]}")
+
+    if config.training.prefix_eval_only:
+        target_task = config.training.prefix_target_task.strip()
+        prefix_tasks = list(config.training.prefix_condition_tasks)
+        if not target_task:
+            raise ValueError(
+                "prefix_eval_only requires config.training.prefix_target_task "
+                "(or --prefix_target_task on the CLI)."
+            )
+        prefix_video_dir = None
+        if config.training.record_video:
+            safe_target = target_task.lower().replace(" ", "_")
+            safe_prefix = "__".join(t.lower().replace(" ", "_") for t in prefix_tasks) or "reset"
+            prefix_video_dir = os.path.join(
+                config.training.log_dir,
+                "videos",
+                f"prefix_eval_{safe_target}__from__{safe_prefix}",
+            )
+        print(SEP2)
+        print("  STAGE A PREFIX EVAL  —  Oracle prefix states, frozen worker")
+        print(SEP2)
+        print(f"  Target task         : {target_task}")
+        print(f"  Prefix tasks        : {prefix_tasks}")
+        prefix_eval = evaluate_oracle_prefix_states(
+            agent=agent,
+            config=config,
+            prefix_tasks=prefix_tasks,
+            target_task=target_task,
+            n_states=config.training.prefix_eval_n_states,
+            deterministic=True,
+            record_dir=prefix_video_dir,
+            n_videos=config.training.video_n_episodes if config.training.record_video else 0,
+        )
+        for k, v in prefix_eval.items():
+            if isinstance(v, (int, float)):
+                writer.add_scalar(k, v, 0)
+        print(f"  Success rate        : {prefix_eval['prefix_eval/success_rate']*100:5.1f}%")
+        print(f"  Mean options        : {prefix_eval['prefix_eval/mean_options']:.2f}")
+        print(f"  Mean final error    : {prefix_eval['prefix_eval/mean_final_error']:.6f}")
+        print(f"  Mean best error     : {prefix_eval['prefix_eval/mean_best_error']:.6f}")
+        print(f"  Prefix preserved    : {prefix_eval['prefix_eval/prefix_preservation_rate']*100:5.1f}%")
+        print(f"  Off-task completion : {prefix_eval['prefix_eval/offtask_completion_rate']*100:5.1f}%")
+        print(f"  Sampled states      : {int(prefix_eval['prefix_eval/n_states'])}")
+        print(f"  Termination mix     : {prefix_eval['prefix_eval/termination_reasons']}")
+        if "prefix_eval/report_path" in prefix_eval:
+            print(f"  Report              : {prefix_eval['prefix_eval/report_path']}")
+        print(SEP2)
+        print(f"{SEP}\n")
+        writer.close()
+        env.close()
+        print(f"\n{SEP}")
+        print("  STAGE A PREFIX EVAL COMPLETE")
+        print(SEP2)
+        print(f"  Mean single-task SR  {single_task_eval.get('single_task/mean_success_rate', 0.0)*100:.1f}%")
+        print(f"  Prefix success rate  {prefix_eval.get('prefix_eval/success_rate', 0.0)*100:.1f}%")
+        print(f"  Log file             {logger.log_path}")
+        print(f"{SEP}\n")
+        logger.close()
+        return
+
+    if config.training.scripted_eval_only:
+        scripted_video_dir = None
+        if config.training.record_video:
+            scripted_video_dir = os.path.join(
+                config.training.log_dir, 'videos', 'stage_a_scripted_chain'
+            )
+        print(SEP2)
+        print("  STAGE A CHAIN EVAL  —  Frozen worker, scripted chaining")
+        print(SEP2)
+        chain_eval = evaluate(
+            agent,
+            config,
+            deterministic=True,
+            record_dir=scripted_video_dir,
+            n_videos=config.training.video_n_episodes if config.training.record_video else 0,
+        )
+        for k, v in chain_eval.items():
+            if isinstance(v, (int, float)):
+                writer.add_scalar(f'stage_a_chain_eval/{k}', v, 0)
+        print(f"  Any-task success    {chain_eval['any_task_success_rate']*100:5.1f}%")
+        print(f"  Full-task success   {chain_eval['full_task_success_rate']*100:5.1f}%")
+        print(f"  Mean tasks done     {chain_eval['mean_tasks_completed']:.2f} / {agent.n_tasks}")
+        print(f"  Mean options used   {chain_eval['mean_options_used']:.1f}")
+        print(f"  Chosen-task SR      {chain_eval['mean_chosen_task_success']*100:5.1f}%")
+        print(f"  Mean env reward     {chain_eval['mean_env_reward']:.4f}  "
+              f"+-  {chain_eval['std_env_reward']:.4f}")
+        print(f"  Termination mix     {chain_eval['termination_reasons']}")
+        print(SEP2)
+        print(f"{SEP}\n")
+        writer.close()
+        env.close()
+        print(f"\n{SEP}")
+        print("  STAGE A SCRIPTED EVAL COMPLETE")
+        print(SEP2)
+        print(f"  Mean single-task SR   {single_task_eval.get('single_task/mean_success_rate', 0.0)*100:.1f}%")
+        print(f"  Scripted full-task SR {chain_eval.get('full_task_success_rate', 0.0)*100:.1f}%")
+        print(f"  Log file              {logger.log_path}")
+        print(f"{SEP}\n")
+        logger.close()
+        return
+
     print(f"{SEP}\n")
 
     if config.training.stage_a_only:
@@ -639,9 +939,51 @@ def train(config: Config):
         print(f"\n{SEP}")
         print("  STAGE A ONLY RUN COMPLETE")
         print(SEP2)
-        print(f"  Worker BC loss     {warmup_stats.get('worker_bc_loss_final', float('nan')):.4f}")
+        if config.training.mode == "specialist_skills":
+            print("  Specialist skills  offline teacher/student training complete")
+        else:
+            print(f"  Worker BC loss     {warmup_stats.get('worker_bc_loss_final', float('nan')):.4f}")
         print(f"  Mean single-task SR {single_task_eval.get('single_task/mean_success_rate', 0.0)*100:.1f}%")
         print(f"  Log file           {logger.log_path}")
+        print(f"{SEP}\n")
+        logger.close()
+        return
+
+    if config.training.mode == "specialist_skills":
+        scripted_video_dir = None
+        if config.training.record_video:
+            scripted_video_dir = os.path.join(
+                config.training.log_dir, 'videos', 'stage_a_scripted_chain'
+            )
+        print(SEP2)
+        print("  STAGE A CHAIN EVAL  —  Frozen specialist students, scripted chaining")
+        print(SEP2)
+        chain_eval = evaluate(
+            agent,
+            config,
+            deterministic=True,
+            record_dir=scripted_video_dir,
+            n_videos=config.training.video_n_episodes if config.training.record_video else 0,
+        )
+        for k, v in chain_eval.items():
+            if isinstance(v, (int, float)):
+                writer.add_scalar(f'stage_a_chain_eval/{k}', v, 0)
+        print(f"  Any-task success    {chain_eval['any_task_success_rate']*100:5.1f}%")
+        print(f"  Full-task success   {chain_eval['full_task_success_rate']*100:5.1f}%")
+        print(f"  Mean tasks done     {chain_eval['mean_tasks_completed']:.2f} / {agent.n_tasks}")
+        print(f"  Mean options used   {chain_eval['mean_options_used']:.1f}")
+        print(f"  Chosen-task SR      {chain_eval['mean_chosen_task_success']*100:5.1f}%")
+        print(f"  Mean env reward     {chain_eval['mean_env_reward']:.4f}  "
+              f"+-  {chain_eval['std_env_reward']:.4f}")
+        print(f"  Termination mix     {chain_eval['termination_reasons']}")
+        writer.close()
+        env.close()
+        print(f"\n{SEP}")
+        print("  SPECIALIST STAGE A COMPLETE")
+        print(SEP2)
+        print(f"  Mean single-task SR   {single_task_eval.get('single_task/mean_success_rate', 0.0)*100:.1f}%")
+        print(f"  Scripted full-task SR {chain_eval.get('full_task_success_rate', 0.0)*100:.1f}%")
+        print(f"  Log file              {logger.log_path}")
         print(f"{SEP}\n")
         logger.close()
         return
@@ -934,7 +1276,7 @@ if __name__ == "__main__":
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--mode', type=str, default=None,
-                        choices=['flat_scripted', 'hierarchical'])
+                        choices=['specialist_skills', 'flat_scripted', 'hierarchical'])
     parser.add_argument('--total_steps', type=int, default=None,
                         help='Override config.training.total_env_steps')
     parser.add_argument('--encoder', type=str, default='r3m',
@@ -947,6 +1289,16 @@ if __name__ == "__main__":
                              'Use this flag to run the chunk-ablation experiment.')
     parser.add_argument('--bc_only', action='store_true',
                         help='Run Stage A demo BC + single-task worker eval, then exit.')
+    parser.add_argument('--scripted_eval_only', action='store_true',
+                        help='Run Stage A warmup, then evaluate the frozen worker under scripted chaining and exit.')
+    parser.add_argument('--prefix_eval_only', action='store_true',
+                        help='Run Stage A warmup, then evaluate the frozen worker from oracle demo prefix states and exit.')
+    parser.add_argument('--prefix_target_task', type=str, default=None,
+                        help='Target task for oracle prefix-state evaluation, e.g. \"light switch\".')
+    parser.add_argument('--prefix_condition_tasks', type=str, nargs='*', default=None,
+                        help='Tasks that must already be complete in oracle prefix-state evaluation.')
+    parser.add_argument('--prefix_eval_states', type=int, default=None,
+                        help='Maximum number of oracle prefix states to evaluate.')
     parser.add_argument('--demo_source', type=str, default=None,
                         choices=['auto', 'minari', 'd4rl'])
     parser.add_argument('--demo_datasets', type=str, nargs='+', default=None,
@@ -957,6 +1309,18 @@ if __name__ == "__main__":
     parser.add_argument('--worker_bc_steps', type=int, default=None)
     parser.add_argument('--worker_iql_steps', type=int, default=None)
     parser.add_argument('--manager_ce_steps', type=int, default=None)
+    parser.add_argument('--focus_task', type=str, default=None,
+                        help='Optional Stage-A focus task to oversample during offline worker training.')
+    parser.add_argument('--focus_task_weight', type=float, default=None,
+                        help='Relative oversampling weight for focus_task during offline worker training.')
+    parser.add_argument('--focus_task_tail_start', type=float, default=None,
+                        help='Normalized segment progress threshold after which focus-task samples receive extra weight.')
+    parser.add_argument('--focus_task_tail_weight', type=float, default=None,
+                        help='Extra weight multiplier for later-timestep focus-task samples.')
+    parser.add_argument('--focus_refine_steps', type=int, default=None,
+                        help='Extra BC-only refinement steps on the focus-task tail after IQL.')
+    parser.add_argument('--focus_refine_min_seg_prog', type=float, default=None,
+                        help='Minimum normalized segment progress for focus-task refinement samples.')
     parser.add_argument('--online_demo_bc_weight', type=float, default=None)
     parser.add_argument('--online_demo_bc_steps', type=int, default=None)
     parser.add_argument('--online_demo_mix_ratio_start', type=float, default=None)
@@ -975,6 +1339,29 @@ if __name__ == "__main__":
     parser.add_argument('--controller_order_mode', type=str, default=None,
                         choices=['given_order', 'stage_a_rank'])
     parser.add_argument('--single_task_eval_episodes', type=int, default=None)
+    parser.add_argument('--teacher_bc_steps', type=int, default=None)
+    parser.add_argument('--teacher_iql_steps', type=int, default=None)
+    parser.add_argument('--teacher_online_steps', type=int, default=None)
+    parser.add_argument('--teacher_online_rollout_episodes', type=int, default=None)
+    parser.add_argument('--teacher_online_prefix_states', type=int, default=None)
+    parser.add_argument('--teacher_reward_task_weight', type=float, default=None)
+    parser.add_argument('--teacher_reward_approach_weight', type=float, default=None)
+    parser.add_argument('--teacher_reward_completion', type=float, default=None)
+    parser.add_argument('--teacher_reward_action_cost', type=float, default=None)
+    parser.add_argument('--teacher_online_exploration_std', type=float, default=None)
+    parser.add_argument('--teacher_residual_scale', type=float, default=None)
+    parser.add_argument('--disable_teacher_residual_online', action='store_true',
+                        help='Let online teacher IQL update the whole teacher actor instead of a bounded residual.')
+    parser.add_argument('--student_distill_steps', type=int, default=None)
+    parser.add_argument('--student_rollout_distill_steps', type=int, default=None)
+    parser.add_argument('--student_dagger_steps', type=int, default=None)
+    parser.add_argument('--student_demo_bc_weight', type=float, default=None)
+    parser.add_argument('--specialist_batch_size', type=int, default=None)
+    parser.add_argument('--teacher_eval_episodes', type=int, default=None)
+    parser.add_argument('--teacher_rollout_episodes', type=int, default=None)
+    parser.add_argument('--teacher_prefix_states', type=int, default=None)
+    parser.add_argument('--dagger_rollout_episodes', type=int, default=None)
+    parser.add_argument('--dagger_prefix_states', type=int, default=None)
     parser.add_argument('--no_video', action='store_true')
     args = parser.parse_args()
 
@@ -997,6 +1384,16 @@ if __name__ == "__main__":
         config.worker.action_chunk_len = args.action_chunk
     if args.bc_only:
         config.training.stage_a_only = True
+    if args.scripted_eval_only:
+        config.training.scripted_eval_only = True
+    if args.prefix_eval_only:
+        config.training.prefix_eval_only = True
+    if args.prefix_target_task is not None:
+        config.training.prefix_target_task = args.prefix_target_task
+    if args.prefix_condition_tasks is not None:
+        config.training.prefix_condition_tasks = args.prefix_condition_tasks
+    if args.prefix_eval_states is not None:
+        config.training.prefix_eval_n_states = args.prefix_eval_states
     if args.demo_source is not None:
         config.warmup.dataset_source = args.demo_source
     if args.demo_datasets is not None:
@@ -1011,6 +1408,18 @@ if __name__ == "__main__":
         config.warmup.n_worker_iql_steps = args.worker_iql_steps
     if args.manager_ce_steps is not None:
         config.warmup.n_manager_sl_steps = args.manager_ce_steps
+    if args.focus_task is not None:
+        config.warmup.focus_task = args.focus_task
+    if args.focus_task_weight is not None:
+        config.warmup.focus_task_weight = args.focus_task_weight
+    if args.focus_task_tail_start is not None:
+        config.warmup.focus_task_tail_start = args.focus_task_tail_start
+    if args.focus_task_tail_weight is not None:
+        config.warmup.focus_task_tail_weight = args.focus_task_tail_weight
+    if args.focus_refine_steps is not None:
+        config.warmup.n_focus_refine_steps = args.focus_refine_steps
+    if args.focus_refine_min_seg_prog is not None:
+        config.warmup.focus_refine_min_seg_prog = args.focus_refine_min_seg_prog
     if args.online_demo_bc_weight is not None:
         config.worker.online_demo_bc_weight = args.online_demo_bc_weight
     if args.online_demo_bc_steps is not None:
@@ -1045,6 +1454,50 @@ if __name__ == "__main__":
         config.training.controller_order_mode = args.controller_order_mode
     if args.single_task_eval_episodes is not None:
         config.eval.n_single_task_episodes = args.single_task_eval_episodes
+    if args.teacher_bc_steps is not None:
+        config.specialist.n_teacher_bc_steps = args.teacher_bc_steps
+    if args.teacher_iql_steps is not None:
+        config.specialist.n_teacher_iql_steps = args.teacher_iql_steps
+    if args.teacher_online_steps is not None:
+        config.specialist.n_teacher_online_steps = args.teacher_online_steps
+    if args.teacher_online_rollout_episodes is not None:
+        config.specialist.teacher_online_rollout_episodes = args.teacher_online_rollout_episodes
+    if args.teacher_online_prefix_states is not None:
+        config.specialist.teacher_online_prefix_states = args.teacher_online_prefix_states
+    if args.teacher_reward_task_weight is not None:
+        config.specialist.teacher_online_reward_task_weight = args.teacher_reward_task_weight
+    if args.teacher_reward_approach_weight is not None:
+        config.specialist.teacher_online_reward_approach_weight = args.teacher_reward_approach_weight
+    if args.teacher_reward_completion is not None:
+        config.specialist.teacher_online_reward_completion = args.teacher_reward_completion
+    if args.teacher_reward_action_cost is not None:
+        config.specialist.teacher_online_reward_action_cost = args.teacher_reward_action_cost
+    if args.teacher_online_exploration_std is not None:
+        config.specialist.teacher_online_exploration_std = args.teacher_online_exploration_std
+    if args.teacher_residual_scale is not None:
+        config.specialist.teacher_residual_scale = args.teacher_residual_scale
+    if args.disable_teacher_residual_online:
+        config.specialist.teacher_residual_online = False
+    if args.student_distill_steps is not None:
+        config.specialist.n_student_distill_steps = args.student_distill_steps
+    if args.student_rollout_distill_steps is not None:
+        config.specialist.n_student_rollout_distill_steps = args.student_rollout_distill_steps
+    if args.student_dagger_steps is not None:
+        config.specialist.n_student_dagger_steps = args.student_dagger_steps
+    if args.student_demo_bc_weight is not None:
+        config.specialist.student_demo_bc_weight = args.student_demo_bc_weight
+    if args.specialist_batch_size is not None:
+        config.specialist.batch_size = args.specialist_batch_size
+    if args.teacher_eval_episodes is not None:
+        config.specialist.teacher_eval_episodes = args.teacher_eval_episodes
+    if args.teacher_rollout_episodes is not None:
+        config.specialist.teacher_rollout_episodes = args.teacher_rollout_episodes
+    if args.teacher_prefix_states is not None:
+        config.specialist.teacher_prefix_states = args.teacher_prefix_states
+    if args.dagger_rollout_episodes is not None:
+        config.specialist.dagger_rollout_episodes = args.dagger_rollout_episodes
+    if args.dagger_prefix_states is not None:
+        config.specialist.dagger_prefix_states = args.dagger_prefix_states
     if args.no_video:
         config.training.record_video = False
 

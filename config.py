@@ -168,6 +168,12 @@ class WarmupConfig:
     min_segment_len: int = 1
     seed_worker_replay_with_demos: bool = True
     balance_worker_task_sampling: bool = True
+    focus_task: str = ""
+    focus_task_weight: float = 1.0
+    focus_task_tail_start: float = 0.5
+    focus_task_tail_weight: float = 1.0
+    n_focus_refine_steps: int = 0
+    focus_refine_min_seg_prog: float = 0.75
 
     # Stage-A supervised pretraining passes
     n_worker_sl_steps: int = 20_000
@@ -192,16 +198,69 @@ class EvalConfig:
 
 
 # =============================================================================
+# Specialist skills (teacher/student per task)
+# =============================================================================
+
+@dataclass
+class SpecialistConfig:
+    hidden_dim: int = 256
+    n_layers: int = 3
+    batch_size: int = 256
+
+    # Privileged teacher: offline BC + IQL on task-specific demo data
+    n_teacher_bc_steps: int = 30_000
+    n_teacher_iql_steps: int = 100_000
+    iql_expectile: float = 0.7
+    iql_adv_beta: float = 3.0
+    iql_max_weight: float = 20.0
+
+    # Privileged teacher simulator fine-tuning. This is the first stage that
+    # uses geometry-aware reward; students still train only by imitation.
+    n_teacher_online_steps: int = 20_000
+    teacher_online_rollout_episodes: int = 30
+    teacher_online_prefix_states: int = 10
+    teacher_online_reward_task_weight: float = 5.0
+    teacher_online_reward_approach_weight: float = 2.0
+    teacher_online_reward_completion: float = 10.0
+    teacher_online_reward_action_cost: float = 0.005
+    teacher_online_exploration_std: float = 0.15
+    teacher_residual_online: bool = True
+    teacher_residual_scale: float = 0.25
+
+    # Visual student: distill from teacher on the same demo data
+    n_student_distill_steps: int = 50_000
+    student_demo_bc_weight: float = 1.0
+    n_student_rollout_distill_steps: int = 20_000
+    n_student_dagger_steps: int = 20_000
+
+    # Teacher/student diagnostics and rollout aggregation
+    teacher_eval_episodes: int = 10
+    teacher_rollout_episodes: int = 10
+    teacher_prefix_states: int = 10
+    dagger_rollout_episodes: int = 10
+    dagger_prefix_states: int = 10
+
+    # Conservative online fine-tuning is deferred; keep the interface now.
+    n_online_finetune_steps: int = 0
+    online_demo_mix_ratio: float = 0.5
+
+
+# =============================================================================
 # Training
 # =============================================================================
 
 @dataclass
 class TrainingConfig:
-    mode: str = "flat_scripted"      # "flat_scripted" | "hierarchical"
+    mode: str = "specialist_skills"      # "specialist_skills" | "flat_scripted" | "hierarchical"
     total_env_steps: int = 1_000_000
     worker_updates_per_env_step: int = 1
     manager_updates_per_option: int = 1
     stage_a_only: bool = False
+    scripted_eval_only: bool = False
+    prefix_eval_only: bool = False
+    prefix_target_task: str = ""
+    prefix_condition_tasks: List[str] = field(default_factory=list)
+    prefix_eval_n_states: int = 20
     deterministic_torch: bool = True
     deterministic_worker_rollout_steps: int = 200_000
     worker_update_start_steps: int = 0
@@ -246,6 +305,7 @@ class Config:
     buffer: BufferConfig = field(default_factory=BufferConfig)
     warmup: WarmupConfig = field(default_factory=WarmupConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
+    specialist: SpecialistConfig = field(default_factory=SpecialistConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
 
     def __post_init__(self):

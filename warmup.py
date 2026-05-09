@@ -40,6 +40,17 @@ def run_stage_a_warmup(agent: SMGWAgent,
     ds, ds_stats = build_or_load_demo_dataset(agent, cfg, verbose=verbose)
     results.update(ds_stats)
     agent.demo_dataset = ds
+    focus_task_id = None
+    if cfg.warmup.focus_task:
+        if cfg.warmup.focus_task not in agent.tasks:
+            raise ValueError(
+                f"warmup.focus_task='{cfg.warmup.focus_task}' is not in configured tasks {agent.tasks}."
+            )
+        focus_task_id = agent.tasks.index(cfg.warmup.focus_task)
+        results["focus_task_id"] = float(focus_task_id)
+        results["focus_task_weight"] = float(cfg.warmup.focus_task_weight)
+        results["focus_task_tail_start"] = float(cfg.warmup.focus_task_tail_start)
+        results["focus_task_tail_weight"] = float(cfg.warmup.focus_task_tail_weight)
 
     if ds.n_worker() == 0:
         raise RuntimeError(
@@ -82,6 +93,10 @@ def run_stage_a_warmup(agent: SMGWAgent,
             cfg.warmup.sl_batch_size,
             proprio_normalizer=agent.worker_buf.normalize_proprio,
             balance_by_task=cfg.warmup.balance_worker_task_sampling,
+            focus_task_id=focus_task_id,
+            focus_task_weight=cfg.warmup.focus_task_weight,
+            focus_task_tail_start=cfg.warmup.focus_task_tail_start,
+            focus_task_tail_weight=cfg.warmup.focus_task_tail_weight,
         )
         bc_losses.append(agent.worker_warmup_step(batch))
     results["worker_bc_loss_final"] = float(np.mean(bc_losses[-100:])) \
@@ -101,6 +116,10 @@ def run_stage_a_warmup(agent: SMGWAgent,
                 cfg.warmup.sl_batch_size,
                 proprio_normalizer=agent.worker_buf.normalize_proprio,
                 balance_by_task=cfg.warmup.balance_worker_task_sampling,
+                focus_task_id=focus_task_id,
+                focus_task_weight=cfg.warmup.focus_task_weight,
+                focus_task_tail_start=cfg.warmup.focus_task_tail_start,
+                focus_task_tail_weight=cfg.warmup.focus_task_tail_weight,
             )
             iql_metrics.append(agent.worker_iql_step(batch))
         for key in iql_metrics[-1].keys():
@@ -111,6 +130,28 @@ def run_stage_a_warmup(agent: SMGWAgent,
                   f"value={results.get('worker_iql_value_loss_final', float('nan')):.4f}  "
                   f"critic={results.get('worker_iql_critic_loss_final', float('nan')):.4f}  "
                   f"actor={results.get('worker_iql_actor_loss_final', float('nan')):.4f}")
+
+    if focus_task_id is not None and cfg.warmup.n_focus_refine_steps > 0:
+        if verbose:
+            print(f"  [Warmup] Focus refine BC: {cfg.warmup.n_focus_refine_steps} steps "
+                  f"on task='{cfg.warmup.focus_task}' tail samples "
+                  f"(seg_prog>={cfg.warmup.focus_refine_min_seg_prog:.2f}).")
+        refine_losses = []
+        for _ in range(cfg.warmup.n_focus_refine_steps):
+            batch = ds.sample_worker_focus_batch(
+                task_id=focus_task_id,
+                batch_size=cfg.warmup.sl_batch_size,
+                proprio_normalizer=agent.worker_buf.normalize_proprio,
+                min_seg_prog=cfg.warmup.focus_refine_min_seg_prog,
+            )
+            refine_losses.append(agent.worker_warmup_step(batch))
+        results["worker_focus_refine_loss_final"] = float(np.mean(refine_losses[-100:])) \
+            if len(refine_losses) >= 100 else float(np.mean(refine_losses))
+        results["worker_focus_refine_loss_best"] = float(np.min(refine_losses))
+        if verbose:
+            print(f"  [Warmup] Focus refine BC final loss: "
+                  f"{results['worker_focus_refine_loss_final']:.4f}  "
+                  f"(best {results['worker_focus_refine_loss_best']:.4f})")
 
     if ds.n_manager() > 0 and cfg.warmup.n_manager_sl_steps > 0:
         if verbose:
@@ -128,6 +169,11 @@ def run_stage_a_warmup(agent: SMGWAgent,
         print("  [Warmup] No demo-derived manager labels found; skipping manager CE.")
 
     if verbose:
+        if focus_task_id is not None:
+            print(f"  [Warmup] Focus task sampling: task='{cfg.warmup.focus_task}'  "
+                  f"weight={cfg.warmup.focus_task_weight:.2f}  "
+                  f"tail_start={cfg.warmup.focus_task_tail_start:.2f}  "
+                  f"tail_weight={cfg.warmup.focus_task_tail_weight:.2f}")
         print("  [Warmup] Worker labels by task:")
         for task_name in agent.tasks:
             safe_task = task_name.lower().replace(" ", "_")

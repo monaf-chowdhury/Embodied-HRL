@@ -565,10 +565,18 @@ class SMGWAgent:
             b_online = None
 
         if demo_count > 0:
+            focus_task_id = None
+            if self.config.warmup.focus_task:
+                if self.config.warmup.focus_task in self.tasks:
+                    focus_task_id = self.tasks.index(self.config.warmup.focus_task)
             b_demo = self.demo_dataset.sample_worker_batch(
                 demo_count,
                 proprio_normalizer=self.worker_buf.normalize_proprio,
                 balance_by_task=self.config.warmup.balance_worker_task_sampling,
+                focus_task_id=focus_task_id,
+                focus_task_weight=self.config.warmup.focus_task_weight,
+                focus_task_tail_start=self.config.warmup.focus_task_tail_start,
+                focus_task_tail_weight=self.config.warmup.focus_task_tail_weight,
             )
         else:
             b_demo = None
@@ -626,10 +634,18 @@ class SMGWAgent:
                 and self.total_env_steps < self.config.worker.online_demo_bc_steps):
             frac = 1.0 - (self.total_env_steps / max(self.config.worker.online_demo_bc_steps, 1))
             demo_bc_coef = self.config.worker.online_demo_bc_weight * max(0.0, frac)
+            focus_task_id = None
+            if self.config.warmup.focus_task:
+                if self.config.warmup.focus_task in self.tasks:
+                    focus_task_id = self.tasks.index(self.config.warmup.focus_task)
             demo_batch = self.demo_dataset.sample_worker_batch(
                 self.config.worker.online_demo_batch_size,
                 proprio_normalizer=self.worker_buf.normalize_proprio,
                 balance_by_task=self.config.warmup.balance_worker_task_sampling,
+                focus_task_id=focus_task_id,
+                focus_task_weight=self.config.warmup.focus_task_weight,
+                focus_task_tail_start=self.config.warmup.focus_task_tail_start,
+                focus_task_tail_weight=self.config.warmup.focus_task_tail_weight,
             )
             dz = torch.from_numpy(demo_batch['z']).to(self.device)
             dp = torch.from_numpy(demo_batch['proprio']).to(self.device)
