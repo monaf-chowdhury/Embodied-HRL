@@ -1,5 +1,5 @@
 """
-encoder.py — Frozen visual backbone for SMGW.
+encoder.py — Frozen visual backbone for lean FrankaKitchen skills.
 
 The encoder produces z_t ∈ R^{raw_dim}, used ONLY as observation context
 for the manager and worker. It is NEVER used to define subgoals or to

@@ -237,6 +237,14 @@ class TaskSpec:
         return self._text_source
 
 
+def build_task_state_flat(spec: TaskSpec, full_state: np.ndarray) -> np.ndarray:
+    """Flatten all padded task-state slices for logging/legacy cached fields."""
+    return np.concatenate(
+        [spec.padded_state_slice_for(full_state, k) for k in range(spec.n_tasks)],
+        axis=0,
+    ).astype(np.float32)
+
+
 # =============================================================================
 # Frozen text embedder
 # =============================================================================

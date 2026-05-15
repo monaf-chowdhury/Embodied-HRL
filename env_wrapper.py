@@ -1,5 +1,5 @@
 """
-env_wrapper.py — Franka Kitchen image-observation wrapper for SMGW.
+env_wrapper.py — Franka Kitchen image/state wrapper.
 
 Changes vs. the original codebase:
   * Returns image AND full state on every step, so the agent never has to
@@ -8,8 +8,7 @@ Changes vs. the original codebase:
     the 59-d vector our task indices expect.
   * Exposes info['tasks_completed_names'] (list of task NAMES completed
     this episode), which we use to build the completion mask in the agent.
-  * Removes the HierarchicalKitchenWrapper (old latent-based executor);
-    option execution now lives inside agent.execute_option().
+  * Option execution lives in the active skill agent.
 """
 import os
 import numpy as np
@@ -328,7 +327,7 @@ class FrankaKitchenImageWrapper:
         if not self._verified_obs_dim:
             assert state.size >= 39, (
                 f"FrankaKitchen-v1 returned state of size {state.size}; "
-                f"SMGW task_spec indices expect the 59-d D4RL-compatible "
+                f"TaskSpec indices expect the 59-d D4RL-compatible "
                 f"layout (indices up to 38). Verify gymnasium-robotics version."
             )
             self._verified_obs_dim = True

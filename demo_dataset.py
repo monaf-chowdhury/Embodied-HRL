@@ -17,9 +17,9 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from agent import SMGWAgent, build_task_state_flat
 from config import Config
 from env_wrapper import FrankaKitchenImageWrapper
+from utils import build_task_state_flat
 
 
 _DATASET_ALIASES: Dict[str, List[str]] = {
@@ -378,7 +378,7 @@ class DemoPretrainDataset:
         }
 
 
-def build_or_load_demo_dataset(agent: SMGWAgent,
+def build_or_load_demo_dataset(agent,
                                config: Config,
                                verbose: bool = True) -> Tuple[DemoPretrainDataset, Dict[str, float]]:
     os.makedirs(config.warmup.cache_dir, exist_ok=True)
@@ -476,7 +476,7 @@ def build_or_load_demo_dataset(agent: SMGWAgent,
     return merged, stats
 
 
-def sample_oracle_prefix_states(agent: SMGWAgent,
+def sample_oracle_prefix_states(agent,
                                 config: Config,
                                 prefix_tasks: Sequence[str],
                                 target_task: str,
@@ -593,7 +593,7 @@ def sample_oracle_prefix_states(agent: SMGWAgent,
     return samples, stats
 
 
-def _prefix_episode_views(agent: SMGWAgent,
+def _prefix_episode_views(agent,
                           replay_env: FrankaKitchenImageWrapper,
                           episode: DemoEpisode,
                           min_segment_len: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -715,7 +715,7 @@ def _load_from_d4rl(dataset_id: str) -> List[DemoEpisode]:
     return episodes
 
 
-def _build_dataset_from_episodes(agent: SMGWAgent,
+def _build_dataset_from_episodes(agent,
                                  config: Config,
                                  episodes: Sequence[DemoEpisode],
                                  render_env: FrankaKitchenImageWrapper,
@@ -832,7 +832,7 @@ def _build_dataset_from_episodes(agent: SMGWAgent,
     return ds, stats
 
 
-def _label_episode_from_replay(agent: SMGWAgent,
+def _label_episode_from_replay(agent,
                                replay_env: FrankaKitchenImageWrapper,
                                episode: DemoEpisode,
                                min_segment_len: int
@@ -927,7 +927,7 @@ def _chunk_actions(actions: np.ndarray, start: int, end: int, chunk_len: int) ->
     return chunk.reshape(-1)
 
 
-def _chunk_reward(agent: SMGWAgent,
+def _chunk_reward(agent,
                   states: np.ndarray,
                   next_states: np.ndarray,
                   actions: np.ndarray,
@@ -950,7 +950,7 @@ def _chunk_reward(agent: SMGWAgent,
     return float(reward)
 
 
-def _encode_states(agent: SMGWAgent,
+def _encode_states(agent,
                    render_env: FrankaKitchenImageWrapper,
                    states: np.ndarray,
                    batch_size: int) -> np.ndarray:

@@ -1,17 +1,16 @@
 """
-plots.py — Diagnostic plots for SMGW training runs.
+plots.py — Diagnostic plots for lean FrankaKitchen skill-learning runs.
 
 Reads TensorBoard event files and generates PNG plots covering:
   * eval full-task vs any-task success rates (the headline chart)
   * task-completion dynamics during training
-  * manager DQN losses + Q-values
-  * worker SAC losses + entropy alpha
+  * optional legacy manager/worker panels when those tags exist
   * buffer fills + option length
   * stage-A warmup sanity (BC / CE losses)
 
 Usage:
-    python plots.py --log_dir logs/smgw_run1/
-    python plots.py --log_dir logs/smgw_run1/ --out_dir plots/run1/ --smooth 20
+    python plots.py --log_dir logs/lean_skills/
+    python plots.py --log_dir logs/lean_skills/ --out_dir plots/run1/ --smooth 20
     python plots.py --log_dir logs/ --compare         # overlay multiple runs
 
 Output files:
@@ -19,7 +18,7 @@ Output files:
     01_eval_success.png           — eval success rates over time
     02_training_episode.png       — per-episode env reward + options + tasks completed
     03_manager_dqn.png            — manager/controller diagnostics
-    04_worker_sac.png             — worker critic/actor loss, alpha
+    04_worker_sac.png             — legacy worker panel if tags exist
     05_buffers.png                — buffer fills
     06_warmup.png                 — Stage-A BC/CE losses (if collected)
     comparison.png                — multi-run overlay (--compare mode)
@@ -176,7 +175,7 @@ def _save(fig, out_dir: str, filename: str):
 def plot_overview(data: dict, out_dir: str, sw: int = 15):
     fig = plt.figure(figsize=(20, 11))
     fig.patch.set_facecolor('white')
-    fig.suptitle('SMGW — Training Overview Dashboard',
+    fig.suptitle('Lean Skill Learning — Training Overview Dashboard',
                  fontsize=STYLE['suptitle_fs'] + 2, fontweight='bold', y=0.98)
     gs = GridSpec(2, 3, figure=fig, hspace=0.50, wspace=0.35)
     axes = [fig.add_subplot(gs[r, c]) for r in range(2) for c in range(3)]
@@ -263,7 +262,7 @@ def plot_training_episode(data: dict, out_dir: str, sw: int = 15):
 
 
 # =============================================================================
-# Plot 03 — Manager DQN
+# Plot 03 — Optional legacy controller panel
 # =============================================================================
 
 def plot_manager(data: dict, out_dir: str, sw: int = 15):
@@ -289,12 +288,12 @@ def plot_manager(data: dict, out_dir: str, sw: int = 15):
 
 
 # =============================================================================
-# Plot 04 — Worker SAC
+# Plot 04 — Optional legacy worker panel
 # =============================================================================
 
 def plot_worker(data: dict, out_dir: str, sw: int = 15):
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    fig.suptitle('Grounded Worker (SAC)',
+    fig.suptitle('Worker / Skill Optimisation',
                  fontsize=STYLE['suptitle_fs'], fontweight='bold')
 
     _plot(axes[0], data, 'worker/worker_critic_loss',
