@@ -27,9 +27,9 @@ class WorkerConfig:
     gamma: float = 0.99
 
     # Demo-transition reward for IQL. Dense progress should stay auxiliary.
-    progress_weight: float = 5.0
-    completion_bonus: float = 5.0
-    action_cost: float = 0.005
+    progress_weight: float = 0.5
+    completion_bonus: float = 10.0
+    action_cost: float = 0.001
     failure_penalty: float = 0.1
 
 
@@ -74,6 +74,7 @@ class SpecialistConfig:
     iql_expectile: float = 0.7
     iql_adv_beta: float = 3.0
     iql_max_weight: float = 20.0
+    log_interval: int = 500
 
 
 @dataclass

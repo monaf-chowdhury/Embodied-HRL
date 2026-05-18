@@ -33,18 +33,22 @@ SEP3 = "." * 76
 
 
 class TeeLogger:
-    def __init__(self, path: str):
+    def __init__(self, path: str, console_print=None):
         self.path = path
+        self.console_print = console_print or print
         os.makedirs(os.path.dirname(path), exist_ok=True)
         self.f = open(path, "w", encoding="utf-8")
 
     def write(self, text: str):
-        print(text, end="")
+        self.console_print(text, end="")
         self.f.write(text)
         self.f.flush()
 
     def line(self, text: str = ""):
         self.write(text + "\n")
+
+    def flush(self):
+        self.f.flush()
 
     def close(self):
         self.f.close()
@@ -334,8 +338,12 @@ def print_banner(config: Config, log_path: str):
     print(f"  Cache          : {config.warmup.cache_dir}  rebuild={config.warmup.rebuild_cache}")
     print(f"  BC/IQL steps   : bc={config.specialist.n_teacher_bc_steps}  "
           f"iql={config.specialist.n_teacher_iql_steps}  batch={config.specialist.batch_size}")
+    print(f"  TB log interval: every {config.specialist.log_interval} optimizer steps")
     print(f"  Dense reward   : progress={config.worker.progress_weight}  "
           f"completion={config.worker.completion_bonus}  action_cost={config.worker.action_cost}")
+    print(f"  Reward eqn     : r = {config.worker.progress_weight} * delta_error "
+          f"+ {config.worker.completion_bonus} * completion "
+          f"- {config.worker.action_cost} * ||a||^2")
     print(f"  Eval episodes  : single={config.eval.n_single_task_episodes}  chain={config.eval.n_eval_episodes}")
     print(f"  Device         : {config.training.device}")
     print(f"  Log dir        : {config.training.log_dir}")
@@ -350,16 +358,27 @@ def train(config: Config):
         config.training.log_dir,
         f"train_log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
     )
-    logger = TeeLogger(log_path)
     import builtins
     orig_print = builtins.print
-    builtins.print = lambda *args, **kwargs: logger.line(" ".join(str(a) for a in args))
+    logger = TeeLogger(log_path, console_print=orig_print)
+
+    def tee_print(*args, sep=" ", end="\n", file=None, flush=False):
+        # Preserve normal print semantics while teeing stdout into the log file.
+        # If a library prints to an explicit file handle, leave it alone.
+        if file is not None:
+            orig_print(*args, sep=sep, end=end, file=file, flush=flush)
+            return
+        logger.write(sep.join(str(a) for a in args) + end)
+        if flush:
+            logger.flush()
+
+    builtins.print = tee_print
     writer = SummaryWriter(config.training.log_dir)
     try:
         print_banner(config, log_path)
         agent = SkillAgent(config)
         t0 = time.time()
-        stats = train_offline_skills(agent, config, verbose=True)
+        stats = train_offline_skills(agent, config, verbose=True, writer=writer)
         print(f"\n  Stage A complete in {format_time(time.time() - t0)}.")
         for k, v in stats.items():
             if isinstance(v, (int, float)):
@@ -447,6 +466,7 @@ def parse_args() -> Config:
     parser.add_argument("--bc_steps", "--teacher_bc_steps", dest="bc_steps", type=int, default=None)
     parser.add_argument("--iql_steps", "--teacher_iql_steps", dest="iql_steps", type=int, default=None)
     parser.add_argument("--batch_size", "--specialist_batch_size", dest="batch_size", type=int, default=None)
+    parser.add_argument("--log_interval", type=int, default=None)
     parser.add_argument("--single_task_eval_episodes", type=int, default=None)
     parser.add_argument("--chain_eval_episodes", type=int, default=None)
     parser.add_argument("--controller_order_mode", type=str, default=None, choices=["given_order", "stage_a_rank"])
@@ -479,6 +499,8 @@ def parse_args() -> Config:
         cfg.specialist.n_teacher_iql_steps = args.iql_steps
     if args.batch_size is not None:
         cfg.specialist.batch_size = args.batch_size
+    if args.log_interval is not None:
+        cfg.specialist.log_interval = args.log_interval
     if args.single_task_eval_episodes is not None:
         cfg.eval.n_single_task_episodes = args.single_task_eval_episodes
     if args.chain_eval_episodes is not None:

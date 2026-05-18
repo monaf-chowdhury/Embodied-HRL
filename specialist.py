@@ -438,7 +438,10 @@ def _safe_name(name: str) -> str:
     return name.replace(" ", "_").replace("/", "_")
 
 
-def train_offline_skills(agent: SkillAgent, config: Config, verbose: bool = True) -> Dict[str, float]:
+def train_offline_skills(agent: SkillAgent,
+                         config: Config,
+                         verbose: bool = True,
+                         writer=None) -> Dict[str, float]:
     if verbose:
         print(f"  [Stage A] Building demo dataset from: {', '.join(config.warmup.dataset_ids)}")
     ds, stats = build_or_load_demo_dataset(agent, config, verbose=verbose)
@@ -455,12 +458,16 @@ def train_offline_skills(agent: SkillAgent, config: Config, verbose: bool = True
             continue
 
         bc_losses: List[float] = []
-        for _ in range(config.specialist.n_teacher_bc_steps):
+        log_interval = max(1, int(config.specialist.log_interval))
+        for step in range(1, config.specialist.n_teacher_bc_steps + 1):
             batch = ds.sample_worker_task_batch(
                 task_id, config.specialist.batch_size,
                 proprio_normalizer=agent.normalize_proprio,
             )
-            bc_losses.append(agent.bc_step(task_id, batch))
+            loss = agent.bc_step(task_id, batch)
+            bc_losses.append(loss)
+            if writer is not None and (step == 1 or step % log_interval == 0 or step == config.specialist.n_teacher_bc_steps):
+                writer.add_scalar(f"skill/{safe}/bc_loss", float(loss), step)
         results[f"bc/{safe}_loss_final"] = float(np.mean(bc_losses[-100:]))
         results[f"bc/{safe}_loss_best"] = float(np.min(bc_losses))
         if verbose:
@@ -469,12 +476,17 @@ def train_offline_skills(agent: SkillAgent, config: Config, verbose: bool = True
 
         iql_metrics: List[Dict[str, float]] = []
         if config.specialist.n_teacher_iql_steps > 0:
-            for _ in range(config.specialist.n_teacher_iql_steps):
+            for step in range(1, config.specialist.n_teacher_iql_steps + 1):
                 batch = ds.sample_worker_task_batch(
                     task_id, config.specialist.batch_size,
                     proprio_normalizer=agent.normalize_proprio,
                 )
-                iql_metrics.append(agent.iql_step(task_id, batch))
+                metrics = agent.iql_step(task_id, batch)
+                iql_metrics.append(metrics)
+                if writer is not None and (step == 1 or step % log_interval == 0 or step == config.specialist.n_teacher_iql_steps):
+                    tb_step = config.specialist.n_teacher_bc_steps + step
+                    for key, value in metrics.items():
+                        writer.add_scalar(f"skill/{safe}/{key}", float(value), tb_step)
             for key in iql_metrics[-1].keys():
                 results[f"{key}/{safe}_final"] = float(np.mean([m[key] for m in iql_metrics[-100:]]))
             if verbose:

@@ -168,6 +168,53 @@ def _save(fig, out_dir: str, filename: str):
     print(f"  Saved  ->  {path}")
 
 
+def _skill_names(data: dict) -> list[str]:
+    names = set()
+    for tag in data:
+        parts = tag.split('/')
+        if len(parts) >= 3 and parts[0] == 'skill':
+            names.add(parts[1])
+            continue
+        if len(parts) >= 2 and parts[0] == 'single_task':
+            metric = parts[1]
+            for suffix in ('_success_rate', '_mean_options', '_mean_env_reward', '_mean_final_error'):
+                if metric.endswith(suffix):
+                    names.add(metric[:-len(suffix)])
+                    break
+    return sorted(names)
+
+
+def _plot_skill_family(ax, data: dict, metric: str, title: str, ylabel: str,
+                       sw: int = 15, pct: bool = False, ymin=None, ymax=None):
+    skills = _skill_names(data)
+    plotted = False
+    palette = list(COLORS.values())
+    for i, skill in enumerate(skills):
+        tag = f'skill/{skill}/{metric}'
+        if tag not in data:
+            continue
+        steps, values = data[tag]
+        y = values * 100.0 if pct else values
+        ys = smooth(y, sw)
+        color = palette[i % len(palette)]
+        ax.plot(steps, y, alpha=STYLE['raw_alpha'], color=color, linewidth=STYLE['raw_lw'])
+        ax.plot(steps, ys, alpha=STYLE['smooth_alpha'], color=color,
+                linewidth=STYLE['smooth_lw'], label=skill.replace('_', ' '))
+        plotted = True
+    if not plotted:
+        ax.text(0.5, 0.5, f'No skill data\n({metric})',
+                ha='center', va='center', transform=ax.transAxes,
+                color='gray', fontsize=STYLE['label_fs'])
+    if ymin is not None or ymax is not None:
+        ax.set_ylim(ymin, ymax)
+    ax.set_title(title, fontsize=STYLE['title_fs'], fontweight='bold')
+    ax.set_xlabel('Optimizer Steps', fontsize=STYLE['label_fs'])
+    ax.set_ylabel(ylabel, fontsize=STYLE['label_fs'])
+    if plotted:
+        ax.legend(fontsize=STYLE['tick_fs'])
+    _style_ax(ax)
+
+
 # =============================================================================
 # Plot 00 — Overview Dashboard
 # =============================================================================
@@ -352,6 +399,84 @@ def plot_warmup(data: dict, out_dir: str):
 
 
 # =============================================================================
+# Plot 07 — Skill optimisation curves
+# =============================================================================
+
+def plot_skill_losses(data: dict, out_dir: str, sw: int = 15):
+    fig, axes = plt.subplots(2, 3, figsize=(20, 10))
+    axes = axes.flatten()
+    fig.suptitle('Per-Skill Offline Optimisation',
+                 fontsize=STYLE['suptitle_fs'], fontweight='bold')
+
+    _plot_skill_family(axes[0], data, 'bc_loss',
+                       title='BC Action MSE', ylabel='MSE', sw=sw)
+    _plot_skill_family(axes[1], data, 'iql_value_loss',
+                       title='IQL Value Loss', ylabel='Loss', sw=sw)
+    _plot_skill_family(axes[2], data, 'iql_critic_loss',
+                       title='IQL Critic Loss', ylabel='MSE', sw=sw)
+    _plot_skill_family(axes[3], data, 'iql_actor_loss',
+                       title='IQL Actor Loss', ylabel='Loss', sw=sw)
+    _plot_skill_family(axes[4], data, 'iql_adv_mean',
+                       title='IQL Advantage Mean', ylabel='Advantage', sw=sw)
+    _plot_skill_family(axes[5], data, 'iql_weight_mean',
+                       title='IQL Weight Mean', ylabel='Weight', sw=sw)
+
+    fig.tight_layout()
+    _save(fig, out_dir, '07_skill_losses.png')
+
+
+# =============================================================================
+# Plot 08 — Skill eval summary
+# =============================================================================
+
+def plot_skill_eval(data: dict, out_dir: str):
+    skills = _skill_names(data)
+    if not skills:
+        return
+    labels = [s.replace('_', ' ') for s in skills]
+
+    def scalar(tag: str, default=np.nan):
+        if tag not in data:
+            return default
+        return float(data[tag][1][-1])
+
+    success = np.array([scalar(f'single_task/{s}_success_rate') for s in skills])
+    options = np.array([scalar(f'single_task/{s}_mean_options') for s in skills])
+    errors = np.array([scalar(f'single_task/{s}_mean_final_error') for s in skills])
+    rewards = np.array([scalar(f'single_task/{s}_mean_env_reward') for s in skills])
+
+    fig, axes = plt.subplots(1, 4, figsize=(22, 5))
+    fig.suptitle('Per-Skill Evaluation Summary',
+                 fontsize=STYLE['suptitle_fs'], fontweight='bold')
+    x = np.arange(len(skills))
+
+    axes[0].bar(x, success * 100.0, color=COLORS['green'])
+    axes[0].set_title('Single-Task Success', fontsize=STYLE['title_fs'], fontweight='bold')
+    axes[0].set_ylabel('%', fontsize=STYLE['label_fs'])
+    axes[0].set_ylim(0, 105)
+
+    axes[1].bar(x, options, color=COLORS['purple'])
+    axes[1].set_title('Mean Options', fontsize=STYLE['title_fs'], fontweight='bold')
+    axes[1].set_ylabel('Options', fontsize=STYLE['label_fs'])
+
+    axes[2].bar(x, errors, color=COLORS['red'])
+    axes[2].set_title('Final Task Error', fontsize=STYLE['title_fs'], fontweight='bold')
+    axes[2].set_ylabel('Error', fontsize=STYLE['label_fs'])
+
+    axes[3].bar(x, rewards, color=COLORS['blue'])
+    axes[3].set_title('Env Reward', fontsize=STYLE['title_fs'], fontweight='bold')
+    axes[3].set_ylabel('Reward', fontsize=STYLE['label_fs'])
+
+    for ax in axes:
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=25, ha='right')
+        _style_ax(ax)
+
+    fig.tight_layout()
+    _save(fig, out_dir, '08_skill_eval.png')
+
+
+# =============================================================================
 # Multi-run comparison
 # =============================================================================
 
@@ -441,6 +566,8 @@ def main():
     plot_worker(data, out_dir, sw=sw)
     plot_buffers(data, out_dir, sw=5)
     plot_warmup(data, out_dir)
+    plot_skill_losses(data, out_dir, sw=sw)
+    plot_skill_eval(data, out_dir)
 
     print(f"\n{'-'*60}")
     print(f"  All plots saved to: {out_dir}/")
