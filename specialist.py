@@ -438,6 +438,10 @@ def _safe_name(name: str) -> str:
     return name.replace(" ", "_").replace("/", "_")
 
 
+def _clone_state_dict_cpu(module: nn.Module) -> Dict[str, torch.Tensor]:
+    return {k: v.detach().cpu().clone() for k, v in module.state_dict().items()}
+
+
 def train_offline_skills(agent: SkillAgent,
                          config: Config,
                          verbose: bool = True,
@@ -458,6 +462,9 @@ def train_offline_skills(agent: SkillAgent,
             continue
 
         bc_losses: List[float] = []
+        best_bc_loss = float("inf")
+        best_bc_step = 0
+        best_actor_state = _clone_state_dict_cpu(agent.skills[task_id].actor)
         log_interval = max(1, int(config.specialist.log_interval))
         for step in range(1, config.specialist.n_teacher_bc_steps + 1):
             batch = ds.sample_worker_task_batch(
@@ -466,16 +473,28 @@ def train_offline_skills(agent: SkillAgent,
             )
             loss = agent.bc_step(task_id, batch)
             bc_losses.append(loss)
+            if loss < best_bc_loss:
+                best_bc_loss = float(loss)
+                best_bc_step = step
+                best_actor_state = _clone_state_dict_cpu(agent.skills[task_id].actor)
             if writer is not None and (step == 1 or step % log_interval == 0 or step == config.specialist.n_teacher_bc_steps):
                 writer.add_scalar(f"skill/{safe}/bc_loss", float(loss), step)
         results[f"bc/{safe}_loss_final"] = float(np.mean(bc_losses[-100:]))
-        results[f"bc/{safe}_loss_best"] = float(np.min(bc_losses))
+        results[f"bc/{safe}_loss_best"] = float(best_bc_loss)
+        results[f"bc/{safe}_best_step"] = float(best_bc_step)
         if verbose:
             print(f"    BC final={results[f'bc/{safe}_loss_final']:.4f}  "
-                  f"best={results[f'bc/{safe}_loss_best']:.4f}")
+                  f"best={results[f'bc/{safe}_loss_best']:.4f} @ step {best_bc_step}")
 
         iql_metrics: List[Dict[str, float]] = []
         if config.specialist.n_teacher_iql_steps > 0:
+            skill = agent.skills[task_id]
+            skill.actor.load_state_dict({
+                k: v.to(agent.device) for k, v in best_actor_state.items()
+            })
+            skill.actor_opt = torch.optim.Adam(
+                skill.actor.parameters(), lr=config.worker.actor_lr
+            )
             for step in range(1, config.specialist.n_teacher_iql_steps + 1):
                 batch = ds.sample_worker_task_batch(
                     task_id, config.specialist.batch_size,

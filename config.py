@@ -21,7 +21,7 @@ class ManagerConfig:
 @dataclass
 class WorkerConfig:
     proprio_dim: int = 59
-    action_chunk_len: int = 1
+    action_chunk_len: int = 4
     actor_lr: float = 3e-4
     critic_lr: float = 3e-4
     gamma: float = 0.99
@@ -58,7 +58,7 @@ class WarmupConfig:
 
 @dataclass
 class EvalConfig:
-    n_eval_episodes: int = 15
+    n_eval_episodes: int = 20
     n_single_task_episodes: int = 20
 
 
@@ -114,6 +114,6 @@ class Config:
         if self.encoder.name == "r3m":
             self.encoder.raw_dim = 2048
         elif self.encoder.name == "dinov2":
-            self.encoder.raw_dim = 768
+            self.encoder.raw_dim = 384
         else:
             raise ValueError(f"Unknown encoder '{self.encoder.name}'")

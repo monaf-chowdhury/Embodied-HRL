@@ -28,10 +28,13 @@ class VisualEncoder(nn.Module):
 
         if config.name == "r3m":
             self.backbone = self._load_r3m()
+            self.output_dim = 2048
         elif config.name == "dinov2":
             self.backbone = self._load_dinov2()
+            self.output_dim = 384
         else:
             raise ValueError(f"Unknown encoder: {config.name}")
+        self.config.raw_dim = self.output_dim
 
         if config.freeze:
             for p in self.backbone.parameters():

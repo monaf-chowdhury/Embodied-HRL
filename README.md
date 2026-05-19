@@ -207,15 +207,17 @@ There is no learned manager in this branch.
 python train.py \
   --seed 42 \
   --device cuda \
-  --encoder r3m \
+  --encoder dinov2 \
   --bc_steps 30000 \
   --iql_steps 100000 \
   --batch_size 256 \
   --single_task_eval_episodes 20 \
   --chain_eval_episodes 15 \
-  --log_dir logs/lean_skills_all_four \
+  --log_interval 500 \
+  --rebuild_demo_cache \
   --demo_datasets franka-complete franka-mixed franka-partial \
-  --tasks microwave kettle "light switch" "slide cabinet"
+  --tasks microwave kettle "light switch" "slide cabinet" \
+  --log_dir logs/lean_skills_sparse_dominant_dinov2 
 ```
 
 ## Prefix-State Diagnostic
@@ -234,6 +236,14 @@ python train.py \
   --log_dir logs/prefix_light_after_mw_kettle \
   --demo_datasets franka-complete franka-mixed franka-partial \
   --tasks microwave kettle "light switch" "slide cabinet"
+```
+
+## Plotting
+
+```bash
+python plots.py --log_dir logs/lean_skills_sparse_dominant --smooth 15
+python plots.py --log_dir logs/prefix_light_sparse_dominant --smooth 15
+python plots.py --log_dir logs/prefix_slide_sparse_dominant --smooth 15
 ```
 
 ## What To Watch

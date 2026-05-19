@@ -178,6 +178,11 @@ def evaluate_scripted_chain(agent: SkillAgent,
     order = task_order(agent, config.training.controller_order_mode)
     any_success, full_success, tasks_done, options_used, chosen_sr, rewards = [], [], [], [], [], []
     terminations: Dict[str, int] = {}
+    task_episode_completed = np.zeros(agent.n_tasks, dtype=np.float64)
+    task_first_option_sum = np.zeros(agent.n_tasks, dtype=np.float64)
+    task_first_option_count = np.zeros(agent.n_tasks, dtype=np.float64)
+    final_budget_episodes = 0
+    final_env_done_episodes = 0
 
     env = FrankaKitchenImageWrapper(
         tasks_to_complete=config.training.tasks_to_complete,
@@ -193,11 +198,13 @@ def evaluate_scripted_chain(agent: SkillAgent,
             n_opts = 0
             ep_reward = 0.0
             chosen_successes = 0
+            first_completion_option = np.full(agent.n_tasks, np.nan, dtype=np.float32)
             frames = [img.copy()] if record_dir and ep < config.training.video_n_episodes else []
 
             while not done and completion.sum() < agent.n_tasks and n_opts < config.manager.max_high_level_steps:
                 remaining = [k for k in order if completion[k] < 0.5]
                 task_id = int(remaining[0]) if remaining else int(order[0])
+                completion_before = completion.copy()
                 result = agent.execute_option(
                     env=env,
                     task_id=task_id,
@@ -216,24 +223,34 @@ def evaluate_scripted_chain(agent: SkillAgent,
                 ep_reward += result.env_reward_sum
                 chosen_successes += int(result.chosen_task_completed)
                 terminations[result.termination_reason] = terminations.get(result.termination_reason, 0) + 1
+                newly_completed = np.flatnonzero((completion > 0.5) & (completion_before < 0.5))
+                for completed_task in newly_completed:
+                    if np.isnan(first_completion_option[completed_task]):
+                        first_completion_option[completed_task] = float(n_opts)
                 if frames and result.frames:
                     frames.extend(result.frames[1:])
                 if not done:
                     img = env.render_image()
 
             done_count = int(completion.sum())
+            final_budget_episodes += int((not done) and done_count < agent.n_tasks and n_opts >= config.manager.max_high_level_steps)
+            final_env_done_episodes += int(done and done_count < agent.n_tasks)
             any_success.append(float(done_count >= 1))
             full_success.append(float(done_count >= agent.n_tasks))
             tasks_done.append(float(done_count))
             options_used.append(float(n_opts))
             chosen_sr.append(float(chosen_successes / max(n_opts, 1)))
             rewards.append(float(ep_reward))
+            task_episode_completed += (completion > 0.5).astype(np.float64)
+            seen = ~np.isnan(first_completion_option)
+            task_first_option_sum[seen] += first_completion_option[seen]
+            task_first_option_count[seen] += 1.0
             if frames:
                 save_video(frames, os.path.join(record_dir, f"ep_{ep:03d}.mp4"), fps=config.training.video_fps)
     finally:
         env.close()
 
-    return {
+    out = {
         "eval/any_task_success_rate": float(np.mean(any_success)),
         "eval/full_task_success_rate": float(np.mean(full_success)),
         "eval/mean_tasks_completed": float(np.mean(tasks_done)),
@@ -241,8 +258,20 @@ def evaluate_scripted_chain(agent: SkillAgent,
         "eval/mean_chosen_task_success": float(np.mean(chosen_sr)),
         "eval/mean_env_reward": float(np.mean(rewards)),
         "eval/std_env_reward": float(np.std(rewards)),
+        "eval/final_budget_episode_rate": float(final_budget_episodes / max(n_episodes, 1)),
+        "eval/final_env_done_failure_rate": float(final_env_done_episodes / max(n_episodes, 1)),
         "eval/termination_reasons": terminations,
     }
+    for task_id, task_name in enumerate(agent.tasks):
+        safe = task_name.replace(" ", "_")
+        out[f"eval/task/{safe}_completion_rate"] = float(task_episode_completed[task_id] / max(n_episodes, 1))
+        if task_first_option_count[task_id] > 0:
+            out[f"eval/task/{safe}_mean_first_option"] = float(
+                task_first_option_sum[task_id] / task_first_option_count[task_id]
+            )
+        else:
+            out[f"eval/task/{safe}_mean_first_option"] = float("nan")
+    return out
 
 
 def evaluate_prefix(agent: SkillAgent,
@@ -429,12 +458,21 @@ def train(config: Config):
             chain_dir = os.path.join(config.training.log_dir, "videos", "scripted_chain") if config.training.record_video else None
             chain = evaluate_scripted_chain(agent, config, config.eval.n_eval_episodes, record_dir=chain_dir)
             for k, v in chain.items():
-                if isinstance(v, (int, float)):
+                if isinstance(v, (int, float)) and np.isfinite(float(v)):
                     writer.add_scalar(k, float(v), 0)
             print(f"  Any-task success   : {chain['eval/any_task_success_rate']*100:5.1f}%")
             print(f"  Full-task success  : {chain['eval/full_task_success_rate']*100:5.1f}%")
             print(f"  Mean tasks done    : {chain['eval/mean_tasks_completed']:.2f}/{agent.n_tasks}")
             print(f"  Chosen-task SR     : {chain['eval/mean_chosen_task_success']*100:5.1f}%")
+            print(f"  Budget fail eps    : {chain['eval/final_budget_episode_rate']*100:5.1f}%")
+            print(f"  Env-horizon fail   : {chain['eval/final_env_done_failure_rate']*100:5.1f}%")
+            print("  Per-task chain completion:")
+            for name in agent.tasks:
+                safe = name.replace(" ", "_")
+                rate = chain[f"eval/task/{safe}_completion_rate"] * 100.0
+                first_opt = chain[f"eval/task/{safe}_mean_first_option"]
+                first_str = f"{first_opt:.1f}" if np.isfinite(first_opt) else "n/a"
+                print(f"    {name:<14} completion={rate:5.1f}%  first_option={first_str}")
             print(f"  Termination mix    : {chain['eval/termination_reasons']}")
 
         ckpt_dir = os.path.join(config.training.log_dir, "checkpoints")
