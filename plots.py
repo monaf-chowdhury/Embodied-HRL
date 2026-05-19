@@ -215,6 +215,15 @@ def _plot_skill_family(ax, data: dict, metric: str, title: str, ylabel: str,
     _style_ax(ax)
 
 
+def _plot_skill_family_first_available(ax, data: dict, metrics: list[str],
+                                       title: str, ylabel: str, sw: int = 15):
+    skills = _skill_names(data)
+    for metric in metrics:
+        if any(f'skill/{skill}/{metric}' in data for skill in skills):
+            return _plot_skill_family(ax, data, metric, title, ylabel, sw=sw)
+    return _plot_skill_family(ax, data, metrics[0], title, ylabel, sw=sw)
+
+
 # =============================================================================
 # Plot 00 — Overview Dashboard
 # =============================================================================
@@ -410,16 +419,26 @@ def plot_skill_losses(data: dict, out_dir: str, sw: int = 15):
 
     _plot_skill_family(axes[0], data, 'bc_loss',
                        title='BC Action MSE', ylabel='MSE', sw=sw)
-    _plot_skill_family(axes[1], data, 'iql_value_loss',
-                       title='IQL Value Loss', ylabel='Loss', sw=sw)
-    _plot_skill_family(axes[2], data, 'iql_critic_loss',
-                       title='IQL Critic Loss', ylabel='MSE', sw=sw)
-    _plot_skill_family(axes[3], data, 'iql_actor_loss',
-                       title='IQL Actor Loss', ylabel='Loss', sw=sw)
-    _plot_skill_family(axes[4], data, 'iql_adv_mean',
-                       title='IQL Advantage Mean', ylabel='Advantage', sw=sw)
-    _plot_skill_family(axes[5], data, 'iql_weight_mean',
-                       title='IQL Weight Mean', ylabel='Weight', sw=sw)
+    _plot_skill_family_first_available(
+        axes[1], data,
+        ['iql_value_loss', 'awr_value_loss', 'bet_cls_loss'],
+        title='Value / Classification Loss', ylabel='Loss', sw=sw)
+    _plot_skill_family_first_available(
+        axes[2], data,
+        ['iql_critic_loss', 'td3bc_critic_loss', 'awr_critic_loss', 'bet_residual_loss'],
+        title='Critic / Residual Loss', ylabel='Loss', sw=sw)
+    _plot_skill_family_first_available(
+        axes[3], data,
+        ['iql_actor_loss', 'td3bc_actor_loss', 'awr_actor_loss', 'bet_loss'],
+        title='Actor / Total Loss', ylabel='Loss', sw=sw)
+    _plot_skill_family_first_available(
+        axes[4], data,
+        ['iql_adv_mean', 'td3bc_bc_loss', 'awr_weight_mean'],
+        title='Advantage / BC / Weight', ylabel='Value', sw=sw)
+    _plot_skill_family_first_available(
+        axes[5], data,
+        ['iql_weight_mean', 'td3bc_lambda'],
+        title='Policy Weight / Lambda', ylabel='Weight', sw=sw)
 
     fig.tight_layout()
     _save(fig, out_dir, '07_skill_losses.png')

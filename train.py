@@ -358,22 +358,46 @@ def print_banner(config: Config, log_path: str):
     print(f"\n{SEP}")
     print("  Lean Skill Learning — FrankaKitchen-v1")
     print(f"  Started        : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  Seed           : {config.training.seed}  deterministic_torch={config.training.deterministic_torch}")
     print(f"  Encoder        : {config.encoder.name.upper()} ({config.encoder.raw_dim}-d, frozen)")
+    print(f"  Image size     : {config.encoder.img_size}")
     print(f"  Tasks          : {config.training.tasks_to_complete}")
-    print(f"  Policy         : one visual BC/IQL policy per task")
+    print(f"  Policy         : one visual policy per task")
     print(f"  Controller     : scripted next-incomplete task")
     print(SEP2)
     print(f"  Demos          : {config.warmup.dataset_ids}")
+    print(f"  Demo source    : {config.warmup.dataset_source}")
     print(f"  Cache          : {config.warmup.cache_dir}  rebuild={config.warmup.rebuild_cache}")
-    print(f"  BC/IQL steps   : bc={config.specialist.n_teacher_bc_steps}  "
-          f"iql={config.specialist.n_teacher_iql_steps}  batch={config.specialist.batch_size}")
+    print(f"  Render batch   : {config.warmup.render_batch_size}  max_eps_per_dataset={config.warmup.max_episodes_per_dataset}")
+    print(f"  Offline algo   : {config.specialist.offline_algo}")
+    print(f"  Skill net      : hidden={config.specialist.hidden_dim}  layers={config.specialist.n_layers}  "
+          f"chunk={config.worker.action_chunk_len}")
+    print(f"  Optimizer      : actor_lr={config.worker.actor_lr}  critic_lr={config.worker.critic_lr}  "
+          f"gamma={config.worker.gamma}")
+    print(f"  Train steps    : bc={config.specialist.n_teacher_bc_steps}  "
+          f"offline_rl={config.specialist.n_offline_rl_steps}  bet={config.specialist.bet_steps}  "
+          f"batch={config.specialist.batch_size}")
+    print(f"  Option budget  : subgoal_horizon={config.manager.subgoal_horizon}  "
+          f"max_high_level_steps={config.manager.max_high_level_steps}")
     print(f"  TB log interval: every {config.specialist.log_interval} optimizer steps")
+    print(f"  IQL params     : expectile={config.specialist.iql_expectile}  "
+          f"adv_beta={config.specialist.iql_adv_beta}  max_weight={config.specialist.iql_max_weight}")
+    print(f"  TD3+BC params  : alpha={config.specialist.td3bc_alpha}  tau={config.specialist.td3bc_tau}  "
+          f"policy_noise={config.specialist.td3bc_policy_noise}  noise_clip={config.specialist.td3bc_noise_clip}  "
+          f"policy_freq={config.specialist.td3bc_policy_freq}")
+    print(f"  AWR params     : temperature={config.specialist.awr_temperature}  "
+          f"max_weight={config.specialist.awr_max_weight}")
+    print(f"  BeT params     : steps={config.specialist.bet_steps}  bins={config.specialist.bet_num_bins}  "
+          f"offset_weight={config.specialist.bet_offset_weight}")
     print(f"  Dense reward   : progress={config.worker.progress_weight}  "
           f"completion={config.worker.completion_bonus}  action_cost={config.worker.action_cost}")
     print(f"  Reward eqn     : r = {config.worker.progress_weight} * delta_error "
           f"+ {config.worker.completion_bonus} * completion "
           f"- {config.worker.action_cost} * ||a||^2")
-    print(f"  Eval episodes  : single={config.eval.n_single_task_episodes}  chain={config.eval.n_eval_episodes}")
+    print(f"  Eval episodes  : single={config.eval.n_single_task_episodes}  chain={config.eval.n_eval_episodes}  "
+          f"prefix_states={config.training.prefix_eval_n_states}")
+    print(f"  Video          : record={config.training.record_video}  n={config.training.video_n_episodes}  "
+          f"fps={config.training.video_fps}")
     print(f"  Device         : {config.training.device}")
     print(f"  Log dir        : {config.training.log_dir}")
     print(f"  Train log      : {log_path}")
@@ -502,8 +526,24 @@ def parse_args() -> Config:
     parser.add_argument("--demo_cache_dir", type=str, default=None)
     parser.add_argument("--rebuild_demo_cache", action="store_true")
     parser.add_argument("--bc_steps", "--teacher_bc_steps", dest="bc_steps", type=int, default=None)
-    parser.add_argument("--iql_steps", "--teacher_iql_steps", dest="iql_steps", type=int, default=None)
+    parser.add_argument("--iql_steps", "--teacher_iql_steps", "--offline_rl_steps", dest="offline_rl_steps", type=int, default=None)
+    parser.add_argument("--offline_algo", type=str, default=None,
+                        choices=["bc", "bc_iql", "iql", "td3bc", "td3_bc", "awr", "bet", "behavior_transformer", "sequence_bc"])
     parser.add_argument("--batch_size", "--specialist_batch_size", dest="batch_size", type=int, default=None)
+    parser.add_argument("--hidden_dim", type=int, default=None)
+    parser.add_argument("--n_layers", type=int, default=None)
+    parser.add_argument("--action_chunk", "--action_chunk_len", dest="action_chunk", type=int, default=None)
+    parser.add_argument("--subgoal_horizon", type=int, default=None)
+    parser.add_argument("--max_high_level_steps", type=int, default=None)
+    parser.add_argument("--iql_expectile", type=float, default=None)
+    parser.add_argument("--iql_adv_beta", type=float, default=None)
+    parser.add_argument("--iql_max_weight", type=float, default=None)
+    parser.add_argument("--td3bc_alpha", type=float, default=None)
+    parser.add_argument("--awr_temperature", type=float, default=None)
+    parser.add_argument("--awr_max_weight", type=float, default=None)
+    parser.add_argument("--bet_steps", type=int, default=None)
+    parser.add_argument("--bet_num_bins", type=int, default=None)
+    parser.add_argument("--bet_offset_weight", type=float, default=None)
     parser.add_argument("--log_interval", type=int, default=None)
     parser.add_argument("--single_task_eval_episodes", type=int, default=None)
     parser.add_argument("--chain_eval_episodes", type=int, default=None)
@@ -533,10 +573,41 @@ def parse_args() -> Config:
         cfg.warmup.rebuild_cache = True
     if args.bc_steps is not None:
         cfg.specialist.n_teacher_bc_steps = args.bc_steps
-    if args.iql_steps is not None:
-        cfg.specialist.n_teacher_iql_steps = args.iql_steps
+    if args.offline_rl_steps is not None:
+        cfg.specialist.n_offline_rl_steps = args.offline_rl_steps
+        cfg.specialist.n_teacher_iql_steps = args.offline_rl_steps
+    if args.offline_algo is not None:
+        cfg.specialist.offline_algo = args.offline_algo
     if args.batch_size is not None:
         cfg.specialist.batch_size = args.batch_size
+    if args.hidden_dim is not None:
+        cfg.specialist.hidden_dim = args.hidden_dim
+    if args.n_layers is not None:
+        cfg.specialist.n_layers = args.n_layers
+    if args.action_chunk is not None:
+        cfg.worker.action_chunk_len = args.action_chunk
+    if args.subgoal_horizon is not None:
+        cfg.manager.subgoal_horizon = args.subgoal_horizon
+    if args.max_high_level_steps is not None:
+        cfg.manager.max_high_level_steps = args.max_high_level_steps
+    if args.iql_expectile is not None:
+        cfg.specialist.iql_expectile = args.iql_expectile
+    if args.iql_adv_beta is not None:
+        cfg.specialist.iql_adv_beta = args.iql_adv_beta
+    if args.iql_max_weight is not None:
+        cfg.specialist.iql_max_weight = args.iql_max_weight
+    if args.td3bc_alpha is not None:
+        cfg.specialist.td3bc_alpha = args.td3bc_alpha
+    if args.awr_temperature is not None:
+        cfg.specialist.awr_temperature = args.awr_temperature
+    if args.awr_max_weight is not None:
+        cfg.specialist.awr_max_weight = args.awr_max_weight
+    if args.bet_steps is not None:
+        cfg.specialist.bet_steps = args.bet_steps
+    if args.bet_num_bins is not None:
+        cfg.specialist.bet_num_bins = args.bet_num_bins
+    if args.bet_offset_weight is not None:
+        cfg.specialist.bet_offset_weight = args.bet_offset_weight
     if args.log_interval is not None:
         cfg.specialist.log_interval = args.log_interval
     if args.single_task_eval_episodes is not None:

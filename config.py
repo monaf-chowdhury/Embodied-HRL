@@ -5,7 +5,7 @@ from typing import List
 
 @dataclass
 class EncoderConfig:
-    name: str = "r3m"            # "r3m" or "dinov2"
+    name: str = "dinov2"         # "r3m" or "dinov2"
     freeze: bool = True
     raw_dim: int = 2048
     img_size: int = 224
@@ -67,13 +67,32 @@ class SpecialistConfig:
     hidden_dim: int = 256
     n_layers: int = 3
     batch_size: int = 256
+    offline_algo: str = "bc_iql"  # "bc" | "bc_iql" | "td3bc" | "awr" | "bet"
 
     # Per-skill visual policy: BC first, optional IQL second.
     n_teacher_bc_steps: int = 30_000
-    n_teacher_iql_steps: int = 100_000
+    n_offline_rl_steps: int = 100_000
+    n_teacher_iql_steps: int = 100_000  # Backward-compatible alias.
     iql_expectile: float = 0.7
     iql_adv_beta: float = 3.0
     iql_max_weight: float = 20.0
+
+    # TD3+BC.
+    td3bc_alpha: float = 2.5
+    td3bc_tau: float = 0.005
+    td3bc_policy_noise: float = 0.2
+    td3bc_noise_clip: float = 0.5
+    td3bc_policy_freq: int = 2
+
+    # AWR.
+    awr_temperature: float = 1.0
+    awr_max_weight: float = 20.0
+
+    # BeT-style discretized action-chunk BC.
+    bet_steps: int = 80_000
+    bet_num_bins: int = 64
+    bet_offset_weight: float = 5.0
+
     log_interval: int = 500
 
 
@@ -117,3 +136,4 @@ class Config:
             self.encoder.raw_dim = 384
         else:
             raise ValueError(f"Unknown encoder '{self.encoder.name}'")
+        self.specialist.n_teacher_iql_steps = self.specialist.n_offline_rl_steps

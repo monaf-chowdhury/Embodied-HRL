@@ -24,6 +24,7 @@ from demo_dataset import build_or_load_demo_dataset
 from encoder import VisualEncoder
 from env_wrapper import FrankaKitchenImageWrapper
 from networks import build_mlp
+from offline_algorithms import make_offline_algorithm
 from utils import TaskSpec, build_frozen_text_embeddings, build_task_state_flat
 
 
@@ -438,10 +439,6 @@ def _safe_name(name: str) -> str:
     return name.replace(" ", "_").replace("/", "_")
 
 
-def _clone_state_dict_cpu(module: nn.Module) -> Dict[str, torch.Tensor]:
-    return {k: v.detach().cpu().clone() for k, v in module.state_dict().items()}
-
-
 def train_offline_skills(agent: SkillAgent,
                          config: Config,
                          verbose: bool = True,
@@ -461,63 +458,46 @@ def train_offline_skills(agent: SkillAgent,
         if n == 0:
             continue
 
-        bc_losses: List[float] = []
-        best_bc_loss = float("inf")
-        best_bc_step = 0
-        best_actor_state = _clone_state_dict_cpu(agent.skills[task_id].actor)
-        log_interval = max(1, int(config.specialist.log_interval))
-        for step in range(1, config.specialist.n_teacher_bc_steps + 1):
-            batch = ds.sample_worker_task_batch(
-                task_id, config.specialist.batch_size,
-                proprio_normalizer=agent.normalize_proprio,
-            )
-            loss = agent.bc_step(task_id, batch)
-            bc_losses.append(loss)
-            if loss < best_bc_loss:
-                best_bc_loss = float(loss)
-                best_bc_step = step
-                best_actor_state = _clone_state_dict_cpu(agent.skills[task_id].actor)
-            if writer is not None and (step == 1 or step % log_interval == 0 or step == config.specialist.n_teacher_bc_steps):
-                writer.add_scalar(f"skill/{safe}/bc_loss", float(loss), step)
-        results[f"bc/{safe}_loss_final"] = float(np.mean(bc_losses[-100:]))
-        results[f"bc/{safe}_loss_best"] = float(best_bc_loss)
-        results[f"bc/{safe}_best_step"] = float(best_bc_step)
+        algo = make_offline_algorithm(
+            config.specialist.offline_algo,
+            agent,
+            config,
+            writer=writer,
+            verbose=verbose,
+        )
+        algo_result = algo.train_task(ds, task_id, task_name)
+        results.update(algo_result.metrics)
         if verbose:
-            print(f"    BC final={results[f'bc/{safe}_loss_final']:.4f}  "
-                  f"best={results[f'bc/{safe}_loss_best']:.4f} @ step {best_bc_step}")
-
-        iql_metrics: List[Dict[str, float]] = []
-        if config.specialist.n_teacher_iql_steps > 0:
-            skill = agent.skills[task_id]
-            skill.actor.load_state_dict({
-                k: v.to(agent.device) for k, v in best_actor_state.items()
-            })
-            skill.actor_opt = torch.optim.Adam(
-                skill.actor.parameters(), lr=config.worker.actor_lr
-            )
-            for step in range(1, config.specialist.n_teacher_iql_steps + 1):
-                batch = ds.sample_worker_task_batch(
-                    task_id, config.specialist.batch_size,
-                    proprio_normalizer=agent.normalize_proprio,
-                )
-                metrics = agent.iql_step(task_id, batch)
-                iql_metrics.append(metrics)
-                if writer is not None and (step == 1 or step % log_interval == 0 or step == config.specialist.n_teacher_iql_steps):
-                    tb_step = config.specialist.n_teacher_bc_steps + step
-                    for key, value in metrics.items():
-                        writer.add_scalar(f"skill/{safe}/{key}", float(value), tb_step)
-            for key in iql_metrics[-1].keys():
-                results[f"{key}/{safe}_final"] = float(np.mean([m[key] for m in iql_metrics[-100:]]))
-            if verbose:
-                print(f"    IQL value={results[f'iql_value_loss/{safe}_final']:.4f}  "
-                      f"critic={results[f'iql_critic_loss/{safe}_final']:.4f}  "
-                      f"actor={results[f'iql_actor_loss/{safe}_final']:.4f}")
+            _print_skill_metrics(task_name, safe, config.specialist.offline_algo, algo_result.metrics)
 
     if verbose:
         print("  [Stage A] Worker labels by task:")
         for k, name in enumerate(agent.tasks):
             print(f"    {name:<14} {int(ds.worker_task_counts[k]):,}")
     return results
+
+
+def _print_skill_metrics(task_name: str, safe: str, algo: str, metrics: Dict[str, float]):
+    del task_name
+    if f"bc/{safe}_loss_final" in metrics:
+        print(f"    BC final={metrics[f'bc/{safe}_loss_final']:.4f}  "
+              f"best={metrics[f'bc/{safe}_loss_best']:.4f} @ step {int(metrics[f'bc/{safe}_best_step'])}")
+    algo = algo.lower().replace("-", "_")
+    if algo in ("bc_iql", "iql") and f"iql_value_loss/{safe}_final" in metrics:
+        print(f"    IQL value={metrics[f'iql_value_loss/{safe}_final']:.4f}  "
+              f"critic={metrics[f'iql_critic_loss/{safe}_final']:.4f}  "
+              f"actor={metrics[f'iql_actor_loss/{safe}_final']:.4f}")
+    elif algo in ("td3bc", "td3_bc") and f"td3bc_critic_loss/{safe}_final" in metrics:
+        print(f"    TD3+BC critic={metrics[f'td3bc_critic_loss/{safe}_final']:.4f}  "
+              f"actor={metrics[f'td3bc_actor_loss/{safe}_final']:.4f}  "
+              f"bc={metrics[f'td3bc_bc_loss/{safe}_final']:.4f}")
+    elif algo == "awr" and f"awr_critic_loss/{safe}_final" in metrics:
+        print(f"    AWR value={metrics[f'awr_value_loss/{safe}_final']:.4f}  "
+              f"critic={metrics[f'awr_critic_loss/{safe}_final']:.4f}  "
+              f"actor={metrics[f'awr_actor_loss/{safe}_final']:.4f}")
+    elif algo in ("bet", "behavior_transformer", "sequence_bc") and f"bet/{safe}_loss_final" in metrics:
+        print(f"    BeT loss={metrics[f'bet/{safe}_loss_final']:.4f}  "
+              f"best={metrics[f'bet/{safe}_loss_best']:.4f} @ step {int(metrics[f'bet/{safe}_best_step'])}")
 
 
 __all__ = ["SkillAgent", "train_offline_skills", "OptionResult"]
