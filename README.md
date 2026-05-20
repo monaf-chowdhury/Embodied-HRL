@@ -203,6 +203,30 @@ There is no learned manager in this branch.
 
 ## Main Command
 
+`Cache Rule`
+If you change encoder, action_chunk, tasks, image size, reward weights, then rebuild the cache. Just add `--rebuild_demo_cache` this flag towards the end of the command. 
+
+Algorithm choice alone does not require rebuilding. You do not need --rebuild_demo_cache for every algorithm ablations. Reuse cache if these are unchanged:
+
+### Using shell
+```bash
+bash run.sh --offline_algo bc
+bash run.sh --offline_algo bc_iql
+bash run.sh --offline_algo td3bc
+bash run.sh --offline_algo awr
+bash run.sh --offline_algo bet
+```
+You can also pass extra train.py args through the script 
+```bash
+bash run.sh --offline_algo bc_iql --rebuild_demo_cache
+bash run.sh --offline_algo td3bc --td3bc_alpha 2.0
+bash run.sh --offline_algo awr --awr_temperature 0.5
+bash run.sh --offline_algo bet --bet_num_bins 128 --bet_steps 100000
+bash run.sh --offline_algo bc_iql --chain_eval_episodes 100 --no_video
+```
+
+### From the terminal 
+
 ```bash
 python train.py \
   --seed 42 \

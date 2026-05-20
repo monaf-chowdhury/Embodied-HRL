@@ -292,7 +292,8 @@ class AWRAlgorithm(OfflineAlgorithm):
             skill.value_opt.step()
 
             with torch.no_grad():
-                target_q = r + self.config.worker.gamma * (1.0 - d) * skill.value(xn)
+                next_v = skill.value_target(xn) if self.config.specialist.iql_use_value_target else skill.value(xn)
+                target_q = r + self.config.worker.gamma * (1.0 - d) * next_v
             q1, q2 = skill.critic(x, a)
             critic_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
             skill.critic_opt.zero_grad()
@@ -310,12 +311,20 @@ class AWRAlgorithm(OfflineAlgorithm):
             actor_loss.backward()
             torch.nn.utils.clip_grad_norm_(skill.actor.parameters(), 1.0)
             skill.actor_opt.step()
+            if self.config.specialist.iql_use_value_target:
+                self.agent._soft_update(
+                    skill.value,
+                    skill.value_target,
+                    float(self.config.specialist.iql_value_target_tau),
+                )
 
             metrics = {
                 "awr_value_loss": float(value_loss.item()),
                 "awr_critic_loss": float(critic_loss.item()),
                 "awr_actor_loss": float(actor_loss.item()),
                 "awr_weight_mean": float(weights.mean().item()),
+                "awr_weight_max": float(weights.max().item()),
+                "awr_target_q_mean": float(target_q.mean().item()),
             }
             metrics_list.append(metrics)
             if self.should_log(step, n_steps):

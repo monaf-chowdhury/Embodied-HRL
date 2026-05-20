@@ -381,7 +381,10 @@ def print_banner(config: Config, log_path: str):
           f"max_high_level_steps={config.manager.max_high_level_steps}")
     print(f"  TB log interval: every {config.specialist.log_interval} optimizer steps")
     print(f"  IQL params     : expectile={config.specialist.iql_expectile}  "
-          f"adv_beta={config.specialist.iql_adv_beta}  max_weight={config.specialist.iql_max_weight}")
+          f"adv_beta={config.specialist.iql_adv_beta}  max_weight={config.specialist.iql_max_weight}  "
+          f"adv_norm={config.specialist.iql_normalize_advantage}  "
+          f"value_target={config.specialist.iql_use_value_target}  "
+          f"value_target_tau={config.specialist.iql_value_target_tau}")
     print(f"  TD3+BC params  : alpha={config.specialist.td3bc_alpha}  tau={config.specialist.td3bc_tau}  "
           f"policy_noise={config.specialist.td3bc_policy_noise}  noise_clip={config.specialist.td3bc_noise_clip}  "
           f"policy_freq={config.specialist.td3bc_policy_freq}")
@@ -538,6 +541,9 @@ def parse_args() -> Config:
     parser.add_argument("--iql_expectile", type=float, default=None)
     parser.add_argument("--iql_adv_beta", type=float, default=None)
     parser.add_argument("--iql_max_weight", type=float, default=None)
+    parser.add_argument("--iql_use_value_target", action="store_true")
+    parser.add_argument("--iql_value_target_tau", type=float, default=None)
+    parser.add_argument("--iql_normalize_advantage", "--iql_adv_normalize", action="store_true")
     parser.add_argument("--td3bc_alpha", type=float, default=None)
     parser.add_argument("--awr_temperature", type=float, default=None)
     parser.add_argument("--awr_max_weight", type=float, default=None)
@@ -596,6 +602,12 @@ def parse_args() -> Config:
         cfg.specialist.iql_adv_beta = args.iql_adv_beta
     if args.iql_max_weight is not None:
         cfg.specialist.iql_max_weight = args.iql_max_weight
+    if args.iql_use_value_target:
+        cfg.specialist.iql_use_value_target = True
+    if args.iql_value_target_tau is not None:
+        cfg.specialist.iql_value_target_tau = args.iql_value_target_tau
+    if args.iql_normalize_advantage:
+        cfg.specialist.iql_normalize_advantage = True
     if args.td3bc_alpha is not None:
         cfg.specialist.td3bc_alpha = args.td3bc_alpha
     if args.awr_temperature is not None:

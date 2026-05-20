@@ -76,6 +76,9 @@ class SpecialistConfig:
     iql_expectile: float = 0.7
     iql_adv_beta: float = 3.0
     iql_max_weight: float = 20.0
+    iql_use_value_target: bool = False
+    iql_value_target_tau: float = 0.05
+    iql_normalize_advantage: bool = False
 
     # TD3+BC.
     td3bc_alpha: float = 2.5

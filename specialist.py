@@ -10,6 +10,7 @@ No hierarchy, no teacher/student, no residual stack. Keep this file boring.
 """
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -130,6 +131,7 @@ class Skill:
     actor: SkillActor
     critic: TwinQ
     value: ValueNet
+    value_target: ValueNet
     actor_opt: torch.optim.Optimizer
     critic_opt: torch.optim.Optimizer
     value_opt: torch.optim.Optimizer
@@ -165,11 +167,15 @@ class SkillAgent:
             actor = SkillActor(self.policy_input_dim, hidden, layers, self.action_dim).to(self.device)
             critic = TwinQ(self.policy_input_dim, hidden, layers, self.action_dim).to(self.device)
             value = ValueNet(self.policy_input_dim, hidden, layers).to(self.device)
+            value_target = copy.deepcopy(value).to(self.device).eval()
+            for p in value_target.parameters():
+                p.requires_grad_(False)
             self.skills.append(
                 Skill(
                     actor=actor,
                     critic=critic,
                     value=value,
+                    value_target=value_target,
                     actor_opt=torch.optim.Adam(actor.parameters(), lr=config.worker.actor_lr),
                     critic_opt=torch.optim.Adam(critic.parameters(), lr=config.worker.critic_lr),
                     value_opt=torch.optim.Adam(value.parameters(), lr=config.worker.critic_lr),
@@ -241,6 +247,12 @@ class SkillAgent:
         skill.actor_opt.step()
         return float(loss.item())
 
+    @staticmethod
+    def _soft_update(src: nn.Module, dst: nn.Module, tau: float):
+        with torch.no_grad():
+            for p, p_targ in zip(src.parameters(), dst.parameters()):
+                p_targ.data.mul_(1.0 - tau).add_(tau * p.data)
+
     def iql_step(self, task_id: int, batch: Dict[str, np.ndarray]) -> Dict[str, float]:
         skill = self.skills[task_id]
         x = self._input_from_batch(batch)
@@ -263,7 +275,8 @@ class SkillAgent:
         skill.value_opt.step()
 
         with torch.no_grad():
-            target_q = r + self.config.worker.gamma * (1.0 - d) * skill.value(xn)
+            next_v = skill.value_target(xn) if self.config.specialist.iql_use_value_target else skill.value(xn)
+            target_q = r + self.config.worker.gamma * (1.0 - d) * next_v
         q1, q2 = skill.critic(x, a)
         critic_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
         skill.critic_opt.zero_grad()
@@ -274,7 +287,11 @@ class SkillAgent:
         with torch.no_grad():
             q1_pi, q2_pi = skill.critic(x, a)
             adv_pi = torch.min(q1_pi, q2_pi) - skill.value(x)
-            exp_adv = torch.exp(self.config.specialist.iql_adv_beta * adv_pi).clamp(
+            adv_for_weight = adv_pi
+            if self.config.specialist.iql_normalize_advantage:
+                adv_std = adv_pi.std(unbiased=False).clamp(min=1e-6)
+                adv_for_weight = (adv_pi - adv_pi.mean()) / adv_std
+            exp_adv = torch.exp(self.config.specialist.iql_adv_beta * adv_for_weight).clamp(
                 max=self.config.specialist.iql_max_weight
             )
         logp = skill.actor.log_prob_from_action(x, a)
@@ -283,13 +300,19 @@ class SkillAgent:
         actor_loss.backward()
         torch.nn.utils.clip_grad_norm_(skill.actor.parameters(), 1.0)
         skill.actor_opt.step()
+        if self.config.specialist.iql_use_value_target:
+            tau = float(self.config.specialist.iql_value_target_tau)
+            self._soft_update(skill.value, skill.value_target, tau)
 
         return {
             "iql_value_loss": float(value_loss.item()),
             "iql_critic_loss": float(critic_loss.item()),
             "iql_actor_loss": float(actor_loss.item()),
             "iql_adv_mean": float(adv_pi.mean().item()),
+            "iql_adv_std": float(adv_pi.std(unbiased=False).item()),
             "iql_weight_mean": float(exp_adv.mean().item()),
+            "iql_weight_max": float(exp_adv.max().item()),
+            "iql_target_q_mean": float(target_q.mean().item()),
         }
 
     @torch.no_grad()
@@ -427,6 +450,7 @@ class SkillAgent:
                         "actor": s.actor.state_dict(),
                         "critic": s.critic.state_dict(),
                         "value": s.value.state_dict(),
+                        "value_target": s.value_target.state_dict(),
                     }
                     for s in self.skills
                 ],
@@ -487,6 +511,11 @@ def _print_skill_metrics(task_name: str, safe: str, algo: str, metrics: Dict[str
         print(f"    IQL value={metrics[f'iql_value_loss/{safe}_final']:.4f}  "
               f"critic={metrics[f'iql_critic_loss/{safe}_final']:.4f}  "
               f"actor={metrics[f'iql_actor_loss/{safe}_final']:.4f}")
+        if f"iql_adv_std/{safe}_final" in metrics:
+            print(f"    IQL weights: adv_mean={metrics[f'iql_adv_mean/{safe}_final']:.4f}  "
+                  f"adv_std={metrics[f'iql_adv_std/{safe}_final']:.4f}  "
+                  f"weight_mean={metrics[f'iql_weight_mean/{safe}_final']:.4f}  "
+                  f"weight_max={metrics[f'iql_weight_max/{safe}_final']:.4f}")
     elif algo in ("td3bc", "td3_bc") and f"td3bc_critic_loss/{safe}_final" in metrics:
         print(f"    TD3+BC critic={metrics[f'td3bc_critic_loss/{safe}_final']:.4f}  "
               f"actor={metrics[f'td3bc_actor_loss/{safe}_final']:.4f}  "
