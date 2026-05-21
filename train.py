@@ -21,8 +21,9 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 
 from config import Config
-from demo_dataset import sample_oracle_prefix_states
+from demo_dataset import build_or_load_demo_dataset, sample_oracle_prefix_states
 from env_wrapper import FrankaKitchenImageWrapper
+from online_finetune import run_online_finetuning
 from specialist import SkillAgent, train_offline_skills
 from utils import format_time, save_video
 
@@ -401,6 +402,15 @@ def print_banner(config: Config, log_path: str):
           f"prefix_states={config.training.prefix_eval_n_states}")
     print(f"  Video          : record={config.training.record_video}  n={config.training.video_n_episodes}  "
           f"fps={config.training.video_fps}")
+    print(f"  Online AWAC    : enabled={config.online.enabled}  steps={config.online.total_env_steps}  "
+          f"updates_per_env_step={config.online.updates_per_env_step}  batch={config.online.batch_size}")
+    print(f"  Online replay  : demo_fraction={config.online.demo_fraction_start}->{config.online.demo_fraction_end}  "
+          f"bc_anchor={config.online.bc_anchor_weight}  awac_temp={config.online.awac_temperature}  "
+          f"max_weight={config.online.awac_max_weight}")
+    print(f"  Online collect : exploration_noise={config.online.exploration_noise}  "
+          f"failure_priority={config.online.failure_priority}  eval_interval={config.online.eval_interval_steps}")
+    if config.online.load_checkpoint:
+        print(f"  Load checkpoint: {config.online.load_checkpoint}  skip_offline={config.online.skip_offline_training}")
     print(f"  Device         : {config.training.device}")
     print(f"  Log dir        : {config.training.log_dir}")
     print(f"  Train log      : {log_path}")
@@ -434,7 +444,18 @@ def train(config: Config):
         print_banner(config, log_path)
         agent = SkillAgent(config)
         t0 = time.time()
-        stats = train_offline_skills(agent, config, verbose=True, writer=writer)
+        if config.online.skip_offline_training:
+            print("  [Stage A] Skipping offline optimizer steps; preparing demo replay only.")
+            ds, stats = build_or_load_demo_dataset(agent, config, verbose=True)
+            agent.demo_dataset = ds
+            agent.proprio_norm.fit(ds.w_p)
+            if not config.online.load_checkpoint:
+                raise ValueError("--skip_offline_training requires --load_checkpoint.")
+        else:
+            stats = train_offline_skills(agent, config, verbose=True, writer=writer)
+        if config.online.load_checkpoint:
+            print(f"  [Checkpoint] Loading policy state -> {config.online.load_checkpoint}")
+            agent.load(config.online.load_checkpoint)
         print(f"\n  Stage A complete in {format_time(time.time() - t0)}.")
         for k, v in stats.items():
             if isinstance(v, (int, float)):
@@ -502,6 +523,47 @@ def train(config: Config):
                 print(f"    {name:<14} completion={rate:5.1f}%  first_option={first_str}")
             print(f"  Termination mix    : {chain['eval/termination_reasons']}")
 
+            if config.online.enabled:
+                online_stats = run_online_finetuning(
+                    agent,
+                    config,
+                    writer=writer,
+                    evaluate_fn=evaluate_scripted_chain,
+                    verbose=True,
+                )
+                for k, v in online_stats.items():
+                    writer.add_scalar(k, float(v), int(online_stats["online/env_steps"]))
+
+                print(SEP2)
+                print("  FINAL SCRIPTED CHAIN EVAL AFTER ONLINE")
+                print(SEP2)
+                final_chain_dir = (
+                    os.path.join(config.training.log_dir, "videos", "scripted_chain_online_final")
+                    if config.training.record_video else None
+                )
+                final_chain = evaluate_scripted_chain(
+                    agent,
+                    config,
+                    config.eval.n_eval_episodes,
+                    record_dir=final_chain_dir,
+                )
+                for k, v in final_chain.items():
+                    if isinstance(v, (int, float)) and np.isfinite(float(v)):
+                        writer.add_scalar(f"final_after_online/{k}", float(v), int(online_stats["online/env_steps"]))
+                print(f"  Any-task success   : {final_chain['eval/any_task_success_rate']*100:5.1f}%")
+                print(f"  Full-task success  : {final_chain['eval/full_task_success_rate']*100:5.1f}%")
+                print(f"  Mean tasks done    : {final_chain['eval/mean_tasks_completed']:.2f}/{agent.n_tasks}")
+                print(f"  Chosen-task SR     : {final_chain['eval/mean_chosen_task_success']*100:5.1f}%")
+                print(f"  Env-horizon fail   : {final_chain['eval/final_env_done_failure_rate']*100:5.1f}%")
+                print("  Per-task chain completion:")
+                for name in agent.tasks:
+                    safe = name.replace(" ", "_")
+                    rate = final_chain[f"eval/task/{safe}_completion_rate"] * 100.0
+                    first_opt = final_chain[f"eval/task/{safe}_mean_first_option"]
+                    first_str = f"{first_opt:.1f}" if np.isfinite(first_opt) else "n/a"
+                    print(f"    {name:<14} completion={rate:5.1f}%  first_option={first_str}")
+                print(f"  Termination mix    : {final_chain['eval/termination_reasons']}")
+
         ckpt_dir = os.path.join(config.training.log_dir, "checkpoints")
         os.makedirs(ckpt_dir, exist_ok=True)
         agent.save(os.path.join(ckpt_dir, "checkpoint_final.pt"))
@@ -559,6 +621,25 @@ def parse_args() -> Config:
     parser.add_argument("--prefix_condition_tasks", nargs="*", default=None)
     parser.add_argument("--prefix_eval_states", type=int, default=None)
     parser.add_argument("--no_video", action="store_true")
+    parser.add_argument("--online_finetune", action="store_true")
+    parser.add_argument("--online_steps", type=int, default=None)
+    parser.add_argument("--online_eval_interval", type=int, default=None)
+    parser.add_argument("--online_log_interval_episodes", type=int, default=None)
+    parser.add_argument("--online_updates_per_env_step", type=float, default=None)
+    parser.add_argument("--online_batch_size", type=int, default=None)
+    parser.add_argument("--online_buffer_capacity_per_skill", type=int, default=None)
+    parser.add_argument("--online_demo_fraction_start", type=float, default=None)
+    parser.add_argument("--online_demo_fraction_end", type=float, default=None)
+    parser.add_argument("--online_demo_fraction_decay_steps", type=int, default=None)
+    parser.add_argument("--online_awac_temperature", type=float, default=None)
+    parser.add_argument("--online_awac_max_weight", type=float, default=None)
+    parser.add_argument("--online_bc_anchor_weight", type=float, default=None)
+    parser.add_argument("--online_critic_target_tau", type=float, default=None)
+    parser.add_argument("--online_normalize_advantage", action="store_true")
+    parser.add_argument("--online_exploration_noise", type=float, default=None)
+    parser.add_argument("--online_failure_priority", type=float, default=None)
+    parser.add_argument("--load_checkpoint", type=str, default="")
+    parser.add_argument("--skip_offline_training", action="store_true")
     args = parser.parse_args()
 
     cfg = Config()
@@ -636,6 +717,44 @@ def parse_args() -> Config:
         cfg.training.prefix_eval_n_states = args.prefix_eval_states
     if args.no_video:
         cfg.training.record_video = False
+    if args.online_finetune:
+        cfg.online.enabled = True
+    if args.online_steps is not None:
+        cfg.online.total_env_steps = args.online_steps
+    if args.online_eval_interval is not None:
+        cfg.online.eval_interval_steps = args.online_eval_interval
+    if args.online_log_interval_episodes is not None:
+        cfg.online.log_interval_episodes = args.online_log_interval_episodes
+    if args.online_updates_per_env_step is not None:
+        cfg.online.updates_per_env_step = args.online_updates_per_env_step
+    if args.online_batch_size is not None:
+        cfg.online.batch_size = args.online_batch_size
+    if args.online_buffer_capacity_per_skill is not None:
+        cfg.online.online_buffer_capacity_per_skill = args.online_buffer_capacity_per_skill
+    if args.online_demo_fraction_start is not None:
+        cfg.online.demo_fraction_start = args.online_demo_fraction_start
+    if args.online_demo_fraction_end is not None:
+        cfg.online.demo_fraction_end = args.online_demo_fraction_end
+    if args.online_demo_fraction_decay_steps is not None:
+        cfg.online.demo_fraction_decay_steps = args.online_demo_fraction_decay_steps
+    if args.online_awac_temperature is not None:
+        cfg.online.awac_temperature = args.online_awac_temperature
+    if args.online_awac_max_weight is not None:
+        cfg.online.awac_max_weight = args.online_awac_max_weight
+    if args.online_bc_anchor_weight is not None:
+        cfg.online.bc_anchor_weight = args.online_bc_anchor_weight
+    if args.online_critic_target_tau is not None:
+        cfg.online.critic_target_tau = args.online_critic_target_tau
+    if args.online_normalize_advantage:
+        cfg.online.normalize_advantage = True
+    if args.online_exploration_noise is not None:
+        cfg.online.exploration_noise = args.online_exploration_noise
+    if args.online_failure_priority is not None:
+        cfg.online.failure_priority = args.online_failure_priority
+    if args.load_checkpoint:
+        cfg.online.load_checkpoint = args.load_checkpoint
+    if args.skip_offline_training:
+        cfg.online.skip_offline_training = True
     cfg.__post_init__()
     return cfg
 

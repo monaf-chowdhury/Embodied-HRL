@@ -201,14 +201,63 @@ Training:
 
 There is no learned manager in this branch.
 
-## Main Command
+# Main Command
 
 `Cache Rule`
 If you change encoder, action_chunk, tasks, image size, reward weights, then rebuild the cache. Just add `--rebuild_demo_cache` this flag towards the end of the command. 
 
 Algorithm choice alone does not require rebuilding. You do not need --rebuild_demo_cache for every algorithm ablations. Reuse cache if these are unchanged:
 
-### Using shell
+## Using shell
+
+### Online RL Finetuning
+Recommended first run, end-to-end offline `BC+IQL+Value_Target_0.05` + online AWAC:
+```bash
+bash run.sh --offline_algo bc_iql \
+  --seed 2000 \
+  --log_dir logs/online_awac_seed2000 \
+  --iql_use_value_target \
+  --iql_value_target_tau 0.05 \
+  --online_finetune \
+  --online_steps 200000 \
+  --online_eval_interval 25000 \
+  --chain_eval_episodes 50
+```
+If you already have the best offline checkpoint and want to skip offline retraining:
+```bash
+bash run.sh --offline_algo bc_iql \
+  --seed 2000 \
+  --log_dir logs/online_awac_from_ckpt_seed2000 \
+  --iql_use_value_target \
+  --iql_value_target_tau 0.05 \
+  --load_checkpoint logs/YOUR_OFFLINE_RUN/checkpoints/checkpoint_final.pt \
+  --skip_offline_training \
+  --online_finetune \
+  --online_steps 200000 \
+  --online_eval_interval 25000 \
+  --chain_eval_episodes 50
+```
+
+### Running Offline Pretraining
+Baseline offline runs
+```bash
+# 1. Previous best baseline: no target value, no advantage norm
+bash run.sh --offline_algo bc_iql --seed 42 --log_dir logs/bc_iql_baseline_seed42
+
+# 2. Advantage normalization only
+bash run.sh --offline_algo bc_iql --seed 42 --log_dir logs/bc_iql_advnorm_seed42 --iql_normalize_advantage
+
+# 3. (Best offline performance) Target value only, larger tau 
+bash run.sh --offline_algo bc_iql --seed 42 --log_dir logs/bc_iql_vtarget_tau005_seed42 --iql_use_value_target --iql_value_target_tau 0.05
+
+# 4. Target value + advantage normalization
+bash run.sh --offline_algo bc_iql --seed 42 --log_dir logs/bc_iql_vtarget_tau005_advnorm_seed42 --iql_use_value_target --iql_value_target_tau 0.05 --iql_normalize_advantage
+```
+
+Important: `--iql_value_target_tau 0.05` alone does nothing unless you also pass `--iql_use_value_target.`
+
+
+Trying different offline algo
 ```bash
 bash run.sh --offline_algo bc
 bash run.sh --offline_algo bc_iql
@@ -225,7 +274,8 @@ bash run.sh --offline_algo bet --bet_num_bins 128 --bet_steps 100000
 bash run.sh --offline_algo bc_iql --chain_eval_episodes 100 --no_video
 ```
 
-### From the terminal 
+## From the terminal
+### Running offline pretraining 
 
 ```bash
 python train.py \

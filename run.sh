@@ -14,11 +14,14 @@ Examples:
   bash run.sh --offline_algo bet --bet_num_bins 128
   bash run.sh --offline_algo bc_iql --rebuild_demo_cache
   bash run.sh --offline_algo bc_iql --chain_eval_episodes 100 --no_video
+  bash run.sh --offline_algo bc_iql --online_finetune --online_steps 200000
 
 Notes:
   - Common default: DINOv2 + action chunk 4 + all four tasks.
   - Extra args are passed directly to train.py.
   - Rebuild cache only when encoder, action chunk, tasks, image size, or reward weights change.
+  - For the current best offline setup, add:
+      --iql_use_value_target --iql_value_target_tau 0.05
 EOF
 }
 

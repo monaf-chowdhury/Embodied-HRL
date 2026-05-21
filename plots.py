@@ -21,6 +21,7 @@ Output files:
     04_worker_sac.png             — legacy worker panel if tags exist
     05_buffers.png                — buffer fills
     06_warmup.png                 — Stage-A BC/CE losses (if collected)
+    09_online_awac.png            — online AWAC fine-tuning diagnostics
     comparison.png                — multi-run overlay (--compare mode)
 """
 import os
@@ -175,6 +176,9 @@ def _skill_names(data: dict) -> list[str]:
         if len(parts) >= 3 and parts[0] == 'skill':
             names.add(parts[1])
             continue
+        if len(parts) >= 4 and parts[0] == 'online' and parts[1] == 'skill':
+            names.add(parts[2])
+            continue
         if len(parts) >= 2 and parts[0] == 'single_task':
             metric = parts[1]
             for suffix in ('_success_rate', '_mean_options', '_mean_env_reward', '_mean_final_error'):
@@ -222,6 +226,36 @@ def _plot_skill_family_first_available(ax, data: dict, metrics: list[str],
         if any(f'skill/{skill}/{metric}' in data for skill in skills):
             return _plot_skill_family(ax, data, metric, title, ylabel, sw=sw)
     return _plot_skill_family(ax, data, metrics[0], title, ylabel, sw=sw)
+
+
+def _plot_online_skill_family(ax, data: dict, metric: str, title: str, ylabel: str,
+                              sw: int = 15, ymin=None, ymax=None):
+    skills = _skill_names(data)
+    plotted = False
+    palette = list(COLORS.values())
+    for i, skill in enumerate(skills):
+        tag = f'online/skill/{skill}/{metric}'
+        if tag not in data:
+            continue
+        steps, values = data[tag]
+        ys = smooth(values, sw)
+        color = palette[i % len(palette)]
+        ax.plot(steps, values, alpha=STYLE['raw_alpha'], color=color, linewidth=STYLE['raw_lw'])
+        ax.plot(steps, ys, alpha=STYLE['smooth_alpha'], color=color,
+                linewidth=STYLE['smooth_lw'], label=skill.replace('_', ' '))
+        plotted = True
+    if not plotted:
+        ax.text(0.5, 0.5, f'No online data\n({metric})',
+                ha='center', va='center', transform=ax.transAxes,
+                color='gray', fontsize=STYLE['label_fs'])
+    if ymin is not None or ymax is not None:
+        ax.set_ylim(ymin, ymax)
+    ax.set_title(title, fontsize=STYLE['title_fs'], fontweight='bold')
+    ax.set_xlabel('Environment Steps', fontsize=STYLE['label_fs'])
+    ax.set_ylabel(ylabel, fontsize=STYLE['label_fs'])
+    if plotted:
+        ax.legend(fontsize=STYLE['tick_fs'])
+    _style_ax(ax)
 
 
 # =============================================================================
@@ -496,6 +530,39 @@ def plot_skill_eval(data: dict, out_dir: str):
 
 
 # =============================================================================
+# Plot 09 — Online AWAC diagnostics
+# =============================================================================
+
+def plot_online_awac(data: dict, out_dir: str, sw: int = 15):
+    has_online = any(k.startswith('online/') or k.startswith('online_eval/') for k in data)
+    if not has_online:
+        return
+    fig, axes = plt.subplots(2, 3, figsize=(20, 10))
+    axes = axes.flatten()
+    fig.suptitle('Online Chain-Context AWAC Fine-Tuning',
+                 fontsize=STYLE['suptitle_fs'], fontweight='bold')
+
+    _plot(axes[0], data, 'online_eval/eval/full_task_success_rate',
+          title='Online Eval Full-Task Success',
+          ylabel='%', color=COLORS['green'], pct=True, smooth_window=1, ymin=0, ymax=105)
+    _plot(axes[1], data, 'online_eval/eval/mean_tasks_completed',
+          title='Online Eval Mean Tasks Completed',
+          ylabel='Tasks', color=COLORS['gold'], smooth_window=1, ymin=0, ymax=4.1)
+    _plot(axes[2], data, 'online/demo_fraction',
+          title='Demo Replay Fraction',
+          ylabel='fraction', color=COLORS['gray'], smooth_window=sw, ymin=0, ymax=1.05)
+    _plot_online_skill_family(axes[3], data, 'online_critic_loss',
+                              title='Per-Skill Online Critic Loss', ylabel='MSE', sw=sw)
+    _plot_online_skill_family(axes[4], data, 'online_bc_anchor_loss',
+                              title='Per-Skill Demo BC Anchor Loss', ylabel='MSE', sw=sw)
+    _plot_online_skill_family(axes[5], data, 'online_weight_mean',
+                              title='Per-Skill AWAC Weight Mean', ylabel='weight', sw=sw)
+
+    fig.tight_layout()
+    _save(fig, out_dir, '09_online_awac.png')
+
+
+# =============================================================================
 # Multi-run comparison
 # =============================================================================
 
@@ -587,6 +654,7 @@ def main():
     plot_warmup(data, out_dir)
     plot_skill_losses(data, out_dir, sw=sw)
     plot_skill_eval(data, out_dir)
+    plot_online_awac(data, out_dir, sw=sw)
 
     print(f"\n{'-'*60}")
     print(f"  All plots saved to: {out_dir}/")

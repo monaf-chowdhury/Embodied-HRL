@@ -130,6 +130,7 @@ class ValueNet(nn.Module):
 class Skill:
     actor: SkillActor
     critic: TwinQ
+    critic_target: TwinQ
     value: ValueNet
     value_target: ValueNet
     actor_opt: torch.optim.Optimizer
@@ -166,6 +167,9 @@ class SkillAgent:
         for _ in self.tasks:
             actor = SkillActor(self.policy_input_dim, hidden, layers, self.action_dim).to(self.device)
             critic = TwinQ(self.policy_input_dim, hidden, layers, self.action_dim).to(self.device)
+            critic_target = copy.deepcopy(critic).to(self.device).eval()
+            for p in critic_target.parameters():
+                p.requires_grad_(False)
             value = ValueNet(self.policy_input_dim, hidden, layers).to(self.device)
             value_target = copy.deepcopy(value).to(self.device).eval()
             for p in value_target.parameters():
@@ -174,6 +178,7 @@ class SkillAgent:
                 Skill(
                     actor=actor,
                     critic=critic,
+                    critic_target=critic_target,
                     value=value,
                     value_target=value_target,
                     actor_opt=torch.optim.Adam(actor.parameters(), lr=config.worker.actor_lr),
@@ -315,6 +320,75 @@ class SkillAgent:
             "iql_target_q_mean": float(target_q.mean().item()),
         }
 
+    def online_awac_step(self,
+                         task_id: int,
+                         train_batch: Dict[str, np.ndarray],
+                         demo_anchor_batch: Dict[str, np.ndarray]) -> Dict[str, float]:
+        """Conservative online AWAC update on mixed demo/online data.
+
+        Critic: TD backup over mixed replay.
+        Actor: advantage-weighted regression on mixed replay + explicit demo BC anchor.
+        """
+        skill = self.skills[task_id]
+        x = self._input_from_batch(train_batch)
+        xn = self._input_next_from_batch(train_batch)
+        a = torch.from_numpy(train_batch["action"]).to(self.device).clamp(-0.999, 0.999)
+        r = torch.from_numpy(train_batch["reward"]).unsqueeze(1).to(self.device)
+        d = torch.from_numpy(train_batch["done"]).unsqueeze(1).to(self.device)
+
+        with torch.no_grad():
+            next_a = skill.actor.deterministic(xn).clamp(-0.999, 0.999)
+            tq1, tq2 = skill.critic_target(xn, next_a)
+            target_q = r + self.config.worker.gamma * (1.0 - d) * torch.min(tq1, tq2)
+
+        q1, q2 = skill.critic(x, a)
+        critic_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
+        skill.critic_opt.zero_grad()
+        critic_loss.backward()
+        torch.nn.utils.clip_grad_norm_(skill.critic.parameters(), 1.0)
+        skill.critic_opt.step()
+
+        with torch.no_grad():
+            q1_data, q2_data = skill.critic(x, a)
+            q_data = torch.min(q1_data, q2_data)
+            pi = skill.actor.deterministic(x).clamp(-0.999, 0.999)
+            q1_pi, q2_pi = skill.critic(x, pi)
+            q_pi = torch.min(q1_pi, q2_pi)
+            adv = q_data - q_pi
+            adv_for_weight = adv
+            if self.config.online.normalize_advantage:
+                adv_for_weight = (adv - adv.mean()) / adv.std(unbiased=False).clamp(min=1e-6)
+            weights = torch.exp(adv_for_weight / max(float(self.config.online.awac_temperature), 1e-6)).clamp(
+                max=float(self.config.online.awac_max_weight)
+            )
+
+        logp = skill.actor.log_prob_from_action(x, a)
+        awac_loss = -(weights * logp).mean()
+
+        demo_x = self._input_from_batch(demo_anchor_batch)
+        demo_a = torch.from_numpy(demo_anchor_batch["action"]).to(self.device).clamp(-0.999, 0.999)
+        demo_pred = skill.actor.deterministic(demo_x)
+        bc_anchor_loss = F.mse_loss(demo_pred, demo_a)
+        actor_loss = awac_loss + float(self.config.online.bc_anchor_weight) * bc_anchor_loss
+
+        skill.actor_opt.zero_grad()
+        actor_loss.backward()
+        torch.nn.utils.clip_grad_norm_(skill.actor.parameters(), 1.0)
+        skill.actor_opt.step()
+        self._soft_update(skill.critic, skill.critic_target, float(self.config.online.critic_target_tau))
+
+        return {
+            "online_critic_loss": float(critic_loss.item()),
+            "online_actor_loss": float(actor_loss.item()),
+            "online_awac_loss": float(awac_loss.item()),
+            "online_bc_anchor_loss": float(bc_anchor_loss.item()),
+            "online_adv_mean": float(adv.mean().item()),
+            "online_adv_std": float(adv.std(unbiased=False).item()),
+            "online_weight_mean": float(weights.mean().item()),
+            "online_weight_max": float(weights.max().item()),
+            "online_target_q_mean": float(target_q.mean().item()),
+        }
+
     @torch.no_grad()
     def get_worker_chunk(self,
                          z: np.ndarray,
@@ -449,6 +523,7 @@ class SkillAgent:
                     {
                         "actor": s.actor.state_dict(),
                         "critic": s.critic.state_dict(),
+                        "critic_target": s.critic_target.state_dict(),
                         "value": s.value.state_dict(),
                         "value_target": s.value_target.state_dict(),
                     }
@@ -457,6 +532,34 @@ class SkillAgent:
             },
             path,
         )
+
+    def load(self, path: str):
+        ckpt = torch.load(path, map_location=self.device)
+        saved_tasks = list(ckpt.get("tasks", []))
+        if saved_tasks and saved_tasks != self.tasks:
+            raise ValueError(f"Checkpoint tasks {saved_tasks} do not match current tasks {self.tasks}.")
+        self.proprio_norm.mean = np.asarray(ckpt["proprio_mean"], dtype=np.float32)
+        self.proprio_norm.std = np.asarray(ckpt["proprio_std"], dtype=np.float32)
+        self.stage_a_task_success = np.asarray(
+            ckpt.get("stage_a_task_success", np.zeros(self.n_tasks, dtype=np.float32)),
+            dtype=np.float32,
+        )
+        self.curriculum_task_order = list(ckpt.get("curriculum_task_order", list(range(self.n_tasks))))
+        for skill, saved in zip(self.skills, ckpt["skills"]):
+            skill.actor.load_state_dict(saved["actor"])
+            skill.critic.load_state_dict(saved["critic"])
+            if "critic_target" in saved:
+                skill.critic_target.load_state_dict(saved["critic_target"])
+            else:
+                skill.critic_target.load_state_dict(saved["critic"])
+            skill.value.load_state_dict(saved["value"])
+            if "value_target" in saved:
+                skill.value_target.load_state_dict(saved["value_target"])
+            else:
+                skill.value_target.load_state_dict(saved["value"])
+            skill.actor_opt = torch.optim.Adam(skill.actor.parameters(), lr=self.config.worker.actor_lr)
+            skill.critic_opt = torch.optim.Adam(skill.critic.parameters(), lr=self.config.worker.critic_lr)
+            skill.value_opt = torch.optim.Adam(skill.value.parameters(), lr=self.config.worker.critic_lr)
 
 
 def _safe_name(name: str) -> str:
