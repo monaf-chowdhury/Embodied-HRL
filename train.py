@@ -403,12 +403,24 @@ def print_banner(config: Config, log_path: str):
     print(f"  Video          : record={config.training.record_video}  n={config.training.video_n_episodes}  "
           f"fps={config.training.video_fps}")
     print(f"  Online AWAC    : enabled={config.online.enabled}  steps={config.online.total_env_steps}  "
-          f"updates_per_env_step={config.online.updates_per_env_step}  batch={config.online.batch_size}")
+          f"mode={config.online.mode}  updates_per_env_step={config.online.updates_per_env_step}  "
+          f"batch={config.online.batch_size}")
     print(f"  Online replay  : demo_fraction={config.online.demo_fraction_start}->{config.online.demo_fraction_end}  "
-          f"bc_anchor={config.online.bc_anchor_weight}  awac_temp={config.online.awac_temperature}  "
-          f"max_weight={config.online.awac_max_weight}")
+          f"demo_decay={config.online.demo_fraction_decay_steps}  "
+          f"bc_anchor={config.online.bc_anchor_weight}->{config.online.bc_anchor_weight_end}  "
+          f"anchor_decay={config.online.bc_anchor_decay_steps}  "
+          f"awac_temp={config.online.awac_temperature}  max_weight={config.online.awac_max_weight}")
     print(f"  Online collect : exploration_noise={config.online.exploration_noise}  "
           f"failure_priority={config.online.failure_priority}  eval_interval={config.online.eval_interval_steps}")
+    print(f"  Online repair  : freeze_threshold={config.online.freeze_success_threshold}  "
+          f"next_skill_threshold={config.online.next_skill_collection_threshold}  "
+          f"collect_next_on_success={config.online.collect_next_on_success}  "
+          f"actor_success_only={config.online.actor_success_only}  "
+          f"actor_high_return_fallback={config.online.actor_include_high_return_failures}  "
+          f"min_actor_success={config.online.min_actor_success_samples}  "
+          f"critic_huber={config.online.critic_huber_loss}  "
+          f"huber_delta={config.online.critic_huber_delta}  "
+          f"rollback_drop={config.online.rollback_drop_tolerance}")
     if config.online.load_checkpoint:
         print(f"  Load checkpoint: {config.online.load_checkpoint}  skip_offline={config.online.skip_offline_training}")
     print(f"  Device         : {config.training.device}")
@@ -529,6 +541,7 @@ def train(config: Config):
                     config,
                     writer=writer,
                     evaluate_fn=evaluate_scripted_chain,
+                    initial_eval=chain,
                     verbose=True,
                 )
                 for k, v in online_stats.items():
@@ -622,6 +635,7 @@ def parse_args() -> Config:
     parser.add_argument("--prefix_eval_states", type=int, default=None)
     parser.add_argument("--no_video", action="store_true")
     parser.add_argument("--online_finetune", action="store_true")
+    parser.add_argument("--online_mode", type=str, default=None, choices=["skill_repair", "chain"])
     parser.add_argument("--online_steps", type=int, default=None)
     parser.add_argument("--online_eval_interval", type=int, default=None)
     parser.add_argument("--online_log_interval_episodes", type=int, default=None)
@@ -634,8 +648,19 @@ def parse_args() -> Config:
     parser.add_argument("--online_awac_temperature", type=float, default=None)
     parser.add_argument("--online_awac_max_weight", type=float, default=None)
     parser.add_argument("--online_bc_anchor_weight", type=float, default=None)
+    parser.add_argument("--online_bc_anchor_weight_end", type=float, default=None)
+    parser.add_argument("--online_bc_anchor_decay_steps", type=int, default=None)
     parser.add_argument("--online_critic_target_tau", type=float, default=None)
+    parser.add_argument("--online_no_critic_huber", action="store_true")
+    parser.add_argument("--online_critic_huber_delta", type=float, default=None)
     parser.add_argument("--online_normalize_advantage", action="store_true")
+    parser.add_argument("--online_actor_all_attempts", action="store_true")
+    parser.add_argument("--online_actor_high_return_fallback", action="store_true")
+    parser.add_argument("--online_no_collect_next_on_success", action="store_true")
+    parser.add_argument("--online_min_actor_success_samples", type=int, default=None)
+    parser.add_argument("--online_freeze_success_threshold", type=float, default=None)
+    parser.add_argument("--online_next_skill_collection_threshold", type=float, default=None)
+    parser.add_argument("--online_rollback_drop_tolerance", type=float, default=None)
     parser.add_argument("--online_exploration_noise", type=float, default=None)
     parser.add_argument("--online_failure_priority", type=float, default=None)
     parser.add_argument("--load_checkpoint", type=str, default="")
@@ -719,6 +744,8 @@ def parse_args() -> Config:
         cfg.training.record_video = False
     if args.online_finetune:
         cfg.online.enabled = True
+    if args.online_mode is not None:
+        cfg.online.mode = args.online_mode
     if args.online_steps is not None:
         cfg.online.total_env_steps = args.online_steps
     if args.online_eval_interval is not None:
@@ -743,10 +770,32 @@ def parse_args() -> Config:
         cfg.online.awac_max_weight = args.online_awac_max_weight
     if args.online_bc_anchor_weight is not None:
         cfg.online.bc_anchor_weight = args.online_bc_anchor_weight
+    if args.online_bc_anchor_weight_end is not None:
+        cfg.online.bc_anchor_weight_end = args.online_bc_anchor_weight_end
+    if args.online_bc_anchor_decay_steps is not None:
+        cfg.online.bc_anchor_decay_steps = args.online_bc_anchor_decay_steps
     if args.online_critic_target_tau is not None:
         cfg.online.critic_target_tau = args.online_critic_target_tau
+    if args.online_no_critic_huber:
+        cfg.online.critic_huber_loss = False
+    if args.online_critic_huber_delta is not None:
+        cfg.online.critic_huber_delta = args.online_critic_huber_delta
     if args.online_normalize_advantage:
         cfg.online.normalize_advantage = True
+    if args.online_actor_all_attempts:
+        cfg.online.actor_success_only = False
+    if args.online_actor_high_return_fallback:
+        cfg.online.actor_include_high_return_failures = True
+    if args.online_no_collect_next_on_success:
+        cfg.online.collect_next_on_success = False
+    if args.online_min_actor_success_samples is not None:
+        cfg.online.min_actor_success_samples = args.online_min_actor_success_samples
+    if args.online_freeze_success_threshold is not None:
+        cfg.online.freeze_success_threshold = args.online_freeze_success_threshold
+    if args.online_next_skill_collection_threshold is not None:
+        cfg.online.next_skill_collection_threshold = args.online_next_skill_collection_threshold
+    if args.online_rollback_drop_tolerance is not None:
+        cfg.online.rollback_drop_tolerance = args.online_rollback_drop_tolerance
     if args.online_exploration_noise is not None:
         cfg.online.exploration_noise = args.online_exploration_noise
     if args.online_failure_priority is not None:

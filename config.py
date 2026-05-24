@@ -102,6 +102,7 @@ class SpecialistConfig:
 @dataclass
 class OnlineConfig:
     enabled: bool = False
+    mode: str = "skill_repair"  # "skill_repair" | "chain"
     total_env_steps: int = 200_000
     eval_interval_steps: int = 25_000
     log_interval_episodes: int = 20
@@ -109,20 +110,31 @@ class OnlineConfig:
     batch_size: int = 256
     online_buffer_capacity_per_skill: int = 75_000
 
-    # Mixed replay: start demo-heavy and anneal toward online data.
-    demo_fraction_start: float = 0.70
-    demo_fraction_end: float = 0.50
-    demo_fraction_decay_steps: int = 100_000
+    # Mixed replay: keep demo-heavy by default to prevent online drift.
+    demo_fraction_start: float = 0.85
+    demo_fraction_end: float = 0.75
+    demo_fraction_decay_steps: int = 50_000
 
     # Conservative AWAC-style update.
     awac_temperature: float = 1.0
     awac_max_weight: float = 20.0
-    bc_anchor_weight: float = 2.0
+    bc_anchor_weight: float = 10.0
+    bc_anchor_weight_end: float = 5.0
+    bc_anchor_decay_steps: int = 50_000
     critic_target_tau: float = 0.005
+    critic_huber_loss: bool = True
+    critic_huber_delta: float = 10.0
     normalize_advantage: bool = False
+    actor_success_only: bool = True
+    actor_include_high_return_failures: bool = False
+    collect_next_on_success: bool = True
+    min_actor_success_samples: int = 64
+    freeze_success_threshold: float = 0.85
+    next_skill_collection_threshold: float = 0.60
+    rollback_drop_tolerance: float = 0.30
 
     # Chain-context collection.
-    exploration_noise: float = 0.05
+    exploration_noise: float = 0.0
     failure_priority: float = 2.0
 
     load_checkpoint: str = ""

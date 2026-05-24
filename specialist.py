@@ -323,11 +323,13 @@ class SkillAgent:
     def online_awac_step(self,
                          task_id: int,
                          train_batch: Dict[str, np.ndarray],
-                         demo_anchor_batch: Dict[str, np.ndarray]) -> Dict[str, float]:
+                         demo_anchor_batch: Dict[str, np.ndarray],
+                         actor_batch: Optional[Dict[str, np.ndarray]] = None,
+                         bc_anchor_weight: Optional[float] = None) -> Dict[str, float]:
         """Conservative online AWAC update on mixed demo/online data.
 
         Critic: TD backup over mixed replay.
-        Actor: advantage-weighted regression on mixed replay + explicit demo BC anchor.
+        Actor: advantage-weighted regression on high-quality actor replay + explicit demo BC anchor.
         """
         skill = self.skills[task_id]
         x = self._input_from_batch(train_batch)
@@ -342,17 +344,24 @@ class SkillAgent:
             target_q = r + self.config.worker.gamma * (1.0 - d) * torch.min(tq1, tq2)
 
         q1, q2 = skill.critic(x, a)
-        critic_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
+        if bool(self.config.online.critic_huber_loss):
+            beta = max(float(self.config.online.critic_huber_delta), 1e-6)
+            critic_loss = F.smooth_l1_loss(q1, target_q, beta=beta) + F.smooth_l1_loss(q2, target_q, beta=beta)
+        else:
+            critic_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
         skill.critic_opt.zero_grad()
         critic_loss.backward()
         torch.nn.utils.clip_grad_norm_(skill.critic.parameters(), 1.0)
         skill.critic_opt.step()
 
+        actor_batch = actor_batch if actor_batch is not None else train_batch
+        xa = self._input_from_batch(actor_batch)
+        aa = torch.from_numpy(actor_batch["action"]).to(self.device).clamp(-0.999, 0.999)
         with torch.no_grad():
-            q1_data, q2_data = skill.critic(x, a)
+            q1_data, q2_data = skill.critic(xa, aa)
             q_data = torch.min(q1_data, q2_data)
-            pi = skill.actor.deterministic(x).clamp(-0.999, 0.999)
-            q1_pi, q2_pi = skill.critic(x, pi)
+            pi = skill.actor.deterministic(xa).clamp(-0.999, 0.999)
+            q1_pi, q2_pi = skill.critic(xa, pi)
             q_pi = torch.min(q1_pi, q2_pi)
             adv = q_data - q_pi
             adv_for_weight = adv
@@ -362,14 +371,19 @@ class SkillAgent:
                 max=float(self.config.online.awac_max_weight)
             )
 
-        logp = skill.actor.log_prob_from_action(x, a)
+        logp = skill.actor.log_prob_from_action(xa, aa)
         awac_loss = -(weights * logp).mean()
 
         demo_x = self._input_from_batch(demo_anchor_batch)
         demo_a = torch.from_numpy(demo_anchor_batch["action"]).to(self.device).clamp(-0.999, 0.999)
         demo_pred = skill.actor.deterministic(demo_x)
         bc_anchor_loss = F.mse_loss(demo_pred, demo_a)
-        actor_loss = awac_loss + float(self.config.online.bc_anchor_weight) * bc_anchor_loss
+        anchor_weight = (
+            float(self.config.online.bc_anchor_weight)
+            if bc_anchor_weight is None
+            else float(bc_anchor_weight)
+        )
+        actor_loss = awac_loss + anchor_weight * bc_anchor_loss
 
         skill.actor_opt.zero_grad()
         actor_loss.backward()
@@ -382,6 +396,7 @@ class SkillAgent:
             "online_actor_loss": float(actor_loss.item()),
             "online_awac_loss": float(awac_loss.item()),
             "online_bc_anchor_loss": float(bc_anchor_loss.item()),
+            "online_bc_anchor_weight": float(anchor_weight),
             "online_adv_mean": float(adv.mean().item()),
             "online_adv_std": float(adv.std(unbiased=False).item()),
             "online_weight_mean": float(weights.mean().item()),

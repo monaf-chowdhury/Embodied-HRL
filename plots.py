@@ -548,9 +548,27 @@ def plot_online_awac(data: dict, out_dir: str, sw: int = 15):
     _plot(axes[1], data, 'online_eval/eval/mean_tasks_completed',
           title='Online Eval Mean Tasks Completed',
           ylabel='Tasks', color=COLORS['gold'], smooth_window=1, ymin=0, ymax=4.1)
-    _plot(axes[2], data, 'online/demo_fraction',
-          title='Demo Replay Fraction',
-          ylabel='fraction', color=COLORS['gray'], smooth_window=sw, ymin=0, ymax=1.05)
+    if 'online/demo_fraction' in data or 'online/bc_anchor_weight' in data:
+        for tag, label, color in [
+            ('online/demo_fraction', 'demo fraction', COLORS['gray']),
+            ('online/bc_anchor_weight', 'BC anchor', COLORS['red']),
+        ]:
+            if tag not in data:
+                continue
+            steps, values = data[tag]
+            axes[2].plot(steps, values, alpha=STYLE['raw_alpha'], color=color, linewidth=STYLE['raw_lw'])
+            axes[2].plot(steps, smooth(values, sw), alpha=STYLE['smooth_alpha'],
+                         color=color, linewidth=STYLE['smooth_lw'], label=label)
+        axes[2].set_title('Demo Fraction / BC Anchor',
+                          fontsize=STYLE['title_fs'], fontweight='bold')
+        axes[2].set_xlabel('Environment Steps', fontsize=STYLE['label_fs'])
+        axes[2].set_ylabel('value', fontsize=STYLE['label_fs'])
+        axes[2].legend(fontsize=STYLE['tick_fs'])
+        _style_ax(axes[2])
+    else:
+        _plot(axes[2], data, 'online/demo_fraction',
+              title='Demo Replay Fraction',
+              ylabel='fraction', color=COLORS['gray'], smooth_window=sw, ymin=0, ymax=1.05)
     _plot_online_skill_family(axes[3], data, 'online_critic_loss',
                               title='Per-Skill Online Critic Loss', ylabel='MSE', sw=sw)
     _plot_online_skill_family(axes[4], data, 'online_bc_anchor_loss',

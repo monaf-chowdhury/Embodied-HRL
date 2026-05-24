@@ -15,11 +15,23 @@ Examples:
   bash run.sh --offline_algo bc_iql --rebuild_demo_cache
   bash run.sh --offline_algo bc_iql --chain_eval_episodes 100 --no_video
   bash run.sh --offline_algo bc_iql --online_finetune --online_steps 200000
+  bash run.sh --offline_algo bc_iql --online_finetune --online_mode skill_repair \
+    --online_demo_fraction_start 0.85 --online_demo_fraction_end 0.75 \
+    --online_demo_fraction_decay_steps 50000 \
+    --online_bc_anchor_weight 10 --online_bc_anchor_weight_end 5 \
+    --online_bc_anchor_decay_steps 50000 \
+    --online_freeze_success_threshold 0.85 \
+    --online_next_skill_collection_threshold 0.60
 
 Notes:
   - Common default: DINOv2 + action chunk 4 + all four tasks.
   - Extra args are passed directly to train.py.
   - Rebuild cache only when encoder, action chunk, tasks, image size, or reward weights change.
+  - Online fine-tuning defaults to reliability-gated skill repair:
+      freeze solved skills, collect weak-skill attempts from prefix-induced starts,
+      collect the next skill after successful frontier attempts,
+      update actors from demos plus successful online attempts,
+      and use Huber critic loss to avoid rare online-target explosions.
   - For the current best offline setup, add:
       --iql_use_value_target --iql_value_target_tau 0.05
 EOF
@@ -77,7 +89,7 @@ COMMON_ARGS=(
   --offline_rl_steps 100000
   --batch_size 256
   --single_task_eval_episodes 20
-  --chain_eval_episodes 20
+  --chain_eval_episodes 100
   --log_interval 500
   --log_dir "$LOG_DIR"
   --demo_datasets franka-complete franka-mixed franka-partial
@@ -100,4 +112,3 @@ esac
 echo "Running offline algorithm: $OFFLINE_ALGO"
 echo "Log dir: $LOG_DIR"
 python train.py "${COMMON_ARGS[@]}" "${ALGO_ARGS[@]}" "${EXTRA_ARGS[@]}"
-
