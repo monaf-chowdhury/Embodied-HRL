@@ -91,7 +91,7 @@ def evaluate_single_task(agent: SkillAgent,
         best_rollout = None
         try:
             for ep in range(n_episodes):
-                img, state = env.reset(seed=config.training.seed + 10_000 + 1000 * task_id + ep)
+                img, state = env.reset(seed=10_000 + 1000 * task_id + ep)
                 z = agent.encoder.encode_numpy(img).squeeze()
                 completion = np.zeros(agent.n_tasks, dtype=np.float32)
                 done = False
@@ -192,7 +192,7 @@ def evaluate_scripted_chain(agent: SkillAgent,
     )
     try:
         for ep in range(n_episodes):
-            img, state = env.reset(seed=config.training.seed + 20_000 + ep)
+            img, state = env.reset(seed=99_999 + ep)
             z = agent.encoder.encode_numpy(img).squeeze()
             completion = np.zeros(agent.n_tasks, dtype=np.float32)
             done = False
@@ -300,7 +300,7 @@ def evaluate_prefix(agent: SkillAgent,
         os.makedirs(record_dir, exist_ok=True)
     try:
         for i, sample in enumerate(samples):
-            env.reset(seed=config.training.seed + 30_000 + i)
+            env.reset(seed=30_000 + i)
             qpos, qvel = env.observation_to_qpos_qvel(sample["state"])
             env.set_mujoco_state(qpos, qvel)
             env._current_obs = {"observation": np.asarray(sample["state"], dtype=np.float64).copy()}
@@ -394,10 +394,12 @@ def print_banner(config: Config, log_path: str):
     print(f"  BeT params     : steps={config.specialist.bet_steps}  bins={config.specialist.bet_num_bins}  "
           f"offset_weight={config.specialist.bet_offset_weight}")
     print(f"  Dense reward   : progress={config.worker.progress_weight}  "
-          f"completion={config.worker.completion_bonus}  action_cost={config.worker.action_cost}")
-    print(f"  Reward eqn     : r = {config.worker.progress_weight} * delta_error "
-          f"+ {config.worker.completion_bonus} * completion "
-          f"- {config.worker.action_cost} * ||a||^2")
+          f"completion={config.worker.completion_bonus}  action_cost={config.worker.action_cost}  "
+          f"sigma={config.worker.sigma}")
+    print(f"  Reward eqn     : r = {config.worker.progress_weight}*(gamma*phi(s')-phi(s)) "
+          f"+ {config.worker.completion_bonus}*done "
+          f"- {config.worker.action_cost}*||a||^2   "
+          f"phi(s)=exp(-(e/eps)/sigma)")
     print(f"  Eval episodes  : single={config.eval.n_single_task_episodes}  chain={config.eval.n_eval_episodes}  "
           f"prefix_states={config.training.prefix_eval_n_states}")
     print(f"  Video          : record={config.training.record_video}  n={config.training.video_n_episodes}  "

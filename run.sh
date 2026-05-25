@@ -26,14 +26,16 @@ Examples:
 Notes:
   - Common default: DINOv2 + action chunk 4 + all four tasks.
   - Extra args are passed directly to train.py.
-  - Rebuild cache only when encoder, action chunk, tasks, image size, or reward weights change.
+  - Rebuild cache when encoder, action chunk, tasks, image size, or reward function changes.
+    The reward uses potential-based shaping (phi = exp(-(e/eps)/sigma)); changing sigma
+    requires --rebuild_demo_cache.
   - Online fine-tuning defaults to reliability-gated skill repair:
       freeze solved skills, collect weak-skill attempts from prefix-induced starts,
       collect the next skill after successful frontier attempts,
       update actors from demos plus successful online attempts,
       and use Huber critic loss to avoid rare online-target explosions.
-  - For the current best offline setup, add:
-      --iql_use_value_target --iql_value_target_tau 0.05
+  - IQL value target and advantage normalisation are ON by default.
+    Override with --iql_use_value_target=false if needed.
 EOF
 }
 
@@ -88,7 +90,7 @@ COMMON_ARGS=(
   --bc_steps 30000
   --offline_rl_steps 100000
   --batch_size 256
-  --single_task_eval_episodes 20
+  --single_task_eval_episodes 100
   --chain_eval_episodes 100
   --log_interval 500
   --log_dir "$LOG_DIR"

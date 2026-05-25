@@ -34,7 +34,7 @@ _DATASET_ALIASES: Dict[str, List[str]] = {
     "d4rl/kitchen/partial-v2": ["D4RL/kitchen/partial-v2", "kitchen-partial-v0"],
 }
 
-_CACHE_VERSION = "v4_replaylabels_balancedbc_iql_focus"
+_CACHE_VERSION = "v5_potential_phi_reward"
 
 
 @dataclass
@@ -946,6 +946,7 @@ def _chunk_reward(agent,
             err_after,
             action_t,
             completion_bit_flipped=completed,
+            task_id=task_id,
         )
     return float(reward)
 

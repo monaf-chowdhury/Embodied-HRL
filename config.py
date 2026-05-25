@@ -31,6 +31,9 @@ class WorkerConfig:
     completion_bonus: float = 10.0
     action_cost: float = 0.001
     failure_penalty: float = 0.1
+    # Potential-based shaping: phi(s) = exp(-(e/eps) / sigma), bounded in (0, 1].
+    # sigma=1.0 concentrates gradient near the success boundary (e_norm < 2)
+    sigma: float = 1.0
 
 
 @dataclass
@@ -58,8 +61,8 @@ class WarmupConfig:
 
 @dataclass
 class EvalConfig:
-    n_eval_episodes: int = 20
-    n_single_task_episodes: int = 20
+    n_eval_episodes: int = 100
+    n_single_task_episodes: int = 100
 
 
 @dataclass
@@ -76,9 +79,9 @@ class SpecialistConfig:
     iql_expectile: float = 0.7
     iql_adv_beta: float = 3.0
     iql_max_weight: float = 20.0
-    iql_use_value_target: bool = False
-    iql_value_target_tau: float = 0.05
-    iql_normalize_advantage: bool = False
+    iql_use_value_target: bool = True
+    iql_value_target_tau: float = 0.005
+    iql_normalize_advantage: bool = True
 
     # TD3+BC.
     td3bc_alpha: float = 2.5
@@ -131,7 +134,7 @@ class OnlineConfig:
     min_actor_success_samples: int = 64
     freeze_success_threshold: float = 0.85
     next_skill_collection_threshold: float = 0.60
-    rollback_drop_tolerance: float = 0.30
+    rollback_drop_tolerance: float = 0.12
 
     # Chain-context collection.
     exploration_noise: float = 0.0

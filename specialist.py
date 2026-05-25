@@ -421,9 +421,18 @@ class SkillAgent:
                             spec_err_before: float,
                             spec_err_after: float,
                             action_step: np.ndarray,
-                            completion_bit_flipped: bool) -> float:
+                            completion_bit_flipped: bool,
+                            task_id: int) -> float:
         cfg = self.config.worker
-        reward = cfg.progress_weight * (spec_err_before - spec_err_after)
+        eps = float(self.spec.epsilon(task_id))
+        sigma = float(cfg.sigma)
+        # Potential-based shaping: phi(s) = exp(-(e/eps)/sigma) in (0, 1].
+        # Normalising by per-task eps makes sigma dimensionless and uniform
+        # across tasks. The shaping term is gamma*phi(s') - phi(s), which
+        # preserves the optimal policy (Ng et al. 1999).
+        phi_before = float(np.exp(-(spec_err_before / eps) / sigma))
+        phi_after  = float(np.exp(-(spec_err_after  / eps) / sigma))
+        reward = cfg.progress_weight * (cfg.gamma * phi_after - phi_before)
         reward += cfg.completion_bonus * float(completion_bit_flipped)
         reward -= cfg.action_cost * float(np.sum(action_step ** 2))
         return float(reward)
@@ -482,7 +491,8 @@ class SkillAgent:
                 err_before = self.spec.task_error(state, task_id)
                 err_after = self.spec.task_error(next_state, task_id)
                 option_return += self._worker_step_reward(
-                    err_before, err_after, action_step, chosen_name in just_completed
+                    err_before, err_after, action_step,
+                    chosen_name in just_completed, task_id,
                 )
                 option_env_reward += float(env_reward)
                 state = next_state

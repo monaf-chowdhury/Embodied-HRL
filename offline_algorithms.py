@@ -150,12 +150,23 @@ class IQLAlgorithm(OfflineAlgorithm):
         n_steps = int(self.config.specialist.n_offline_rl_steps)
         if n_steps <= 0:
             return AlgorithmResult(metrics={})
+        skill = self.agent.skills[task_id]
+        best_actor_loss = float("inf")
+        best_actor_state = clone_state_dict_cpu(skill.actor)
         metrics_list = []
         iterator = trange(n_steps, desc=f"IQL/{task_name}", leave=False, disable=not self.verbose)
         for i in iterator:
             step = i + 1
             metrics = self.agent.iql_step(task_id, self.sample(ds, task_id))
             metrics_list.append(metrics)
+            # Track the actor state with minimum actor loss. IQL actor loss is
+            # -E[exp(beta*adv)*log_pi], which decreases as the actor learns to
+            # concentrate probability on high-advantage actions. Tracking the
+            # minimum avoids taking the final state if late-stage training
+            # causes regression (especially for tasks with noisy critic estimates).
+            if float(metrics["iql_actor_loss"]) < best_actor_loss:
+                best_actor_loss = float(metrics["iql_actor_loss"])
+                best_actor_state = clone_state_dict_cpu(skill.actor)
             if self.should_log(step, n_steps):
                 tb_step = self.config.specialist.n_teacher_bc_steps + step
                 for key, value in metrics.items():
@@ -166,17 +177,24 @@ class IQLAlgorithm(OfflineAlgorithm):
                     v=f"{metrics['iql_value_loss']:.3f}",
                     q=f"{metrics['iql_critic_loss']:.3f}",
                 )
+        restore_state_dict(skill.actor, best_actor_state, self.agent.device)
+        skill.actor_opt = torch.optim.Adam(skill.actor.parameters(), lr=self.config.worker.actor_lr)
         out = {}
         for key in metrics_list[-1].keys():
             out[f"{key}/{safe}_final"] = float(np.mean([m[key] for m in metrics_list[-100:]]))
-        return AlgorithmResult(metrics=out)
+        out[f"iql_actor_loss/{safe}_best"] = float(best_actor_loss)
+        return AlgorithmResult(metrics=out, best_actor_state=best_actor_state)
 
 
 class BCIQLAlgorithm(OfflineAlgorithm):
     def train_task(self, ds, task_id: int, task_name: str) -> AlgorithmResult:
         bc = BCAlgorithm(self.agent, self.config, self.writer, self.verbose).train_task(ds, task_id, task_name)
         iql = IQLAlgorithm(self.agent, self.config, self.writer, self.verbose).train_task(ds, task_id, task_name)
-        return AlgorithmResult(metrics={**bc.metrics, **iql.metrics}, best_actor_state=bc.best_actor_state)
+        # BCAlgorithm restores best-BC actor before returning.
+        # IQLAlgorithm now restores best-IQL actor before returning.
+        # The in-place state is already correct; propagate iql.best_actor_state
+        # so callers know which state is loaded.
+        return AlgorithmResult(metrics={**bc.metrics, **iql.metrics}, best_actor_state=iql.best_actor_state)
 
 
 class TD3BCAlgorithm(OfflineAlgorithm):

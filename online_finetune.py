@@ -387,6 +387,7 @@ def _execute_option_for_collection(agent: SkillAgent,
                 err_after,
                 action_step,
                 completion_bit_flipped=task_completed,
+                task_id=task_id,
             )
             chunk_reward += float(step_reward)
             option_return += float(step_reward)
@@ -930,6 +931,15 @@ def run_online_finetuning(agent: SkillAgent,
 
     final_path = os.path.join(ckpt_dir, "checkpoint_online_final.pt")
     agent.save(final_path)
+
+    # Restore the best checkpoint so the caller evaluates the best model,
+    # not the final (potentially degraded) model after 200k steps.
+    if os.path.isfile(best_path):
+        agent.load(best_path)
+        if verbose:
+            print(f"  [Stage B] Restoring best checkpoint "
+                  f"(best_full={best_full*100:.1f}%) for final evaluation.")
+
     return {
         "online/env_steps": float(total_steps),
         "online/episodes": float(episode),
