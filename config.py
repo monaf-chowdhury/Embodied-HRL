@@ -5,10 +5,14 @@ from typing import List
 
 @dataclass
 class EncoderConfig:
-    name: str = "dinov2"         # "r3m" or "dinov2"
+    name: str = "dinov2"         # "r3m", "dinov2", or "dinov3"
     freeze: bool = True
     raw_dim: int = 2048
     img_size: int = 224
+    dinov3_model: str = "dinov3_vits16plus"
+    dinov3_weights: str = "/dinov3/dinov3_weights/dinov3_vits16plus_pretrain_lvd1689m.pth"     # Path/URL, or set DINOV3_WEIGHTS.
+    dinov3_repo_or_dir: str = "/dinov3"
+    dinov3_source: str = "local"  # "github" or "local"
 
 
 @dataclass
@@ -63,6 +67,9 @@ class WarmupConfig:
 class EvalConfig:
     n_eval_episodes: int = 100
     n_single_task_episodes: int = 100
+    prefix_sample_seed: int = 30_000
+    chain_context_eval: bool = True
+    chain_context_eval_states: int = 100
 
 
 @dataclass
@@ -77,11 +84,13 @@ class SpecialistConfig:
     n_offline_rl_steps: int = 100_000
     n_teacher_iql_steps: int = 100_000  # Backward-compatible alias.
     iql_expectile: float = 0.7
-    iql_adv_beta: float = 3.0
+    iql_adv_beta: float = 2.0
     iql_max_weight: float = 20.0
     iql_use_value_target: bool = True
     iql_value_target_tau: float = 0.005
-    iql_normalize_advantage: bool = True
+    iql_normalize_advantage: bool = False
+    iql_eval_interval: int = 10_000
+    iql_eval_prefix_states: int = 100
 
     # TD3+BC.
     td3bc_alpha: float = 2.5
@@ -109,7 +118,7 @@ class OnlineConfig:
     total_env_steps: int = 200_000
     eval_interval_steps: int = 25_000
     log_interval_episodes: int = 20
-    updates_per_env_step: float = 0.25
+    updates_per_env_step: float = 0.75
     batch_size: int = 256
     online_buffer_capacity_per_skill: int = 75_000
 
@@ -137,7 +146,7 @@ class OnlineConfig:
     rollback_drop_tolerance: float = 0.12
 
     # Chain-context collection.
-    exploration_noise: float = 0.0
+    exploration_noise: float = 0.05
     failure_priority: float = 2.0
 
     load_checkpoint: str = ""
@@ -179,10 +188,36 @@ class Config:
     training: TrainingConfig = field(default_factory=TrainingConfig)
 
     def __post_init__(self):
+        self.refresh_encoder_dim()
+        self.specialist.n_teacher_iql_steps = self.specialist.n_offline_rl_steps
+
+    def refresh_encoder_dim(self):
         if self.encoder.name == "r3m":
             self.encoder.raw_dim = 2048
         elif self.encoder.name == "dinov2":
             self.encoder.raw_dim = 384
+        elif self.encoder.name == "dinov3":
+            self.encoder.raw_dim = _dinov3_output_dim(self.encoder.dinov3_model)
         else:
             raise ValueError(f"Unknown encoder '{self.encoder.name}'")
-        self.specialist.n_teacher_iql_steps = self.specialist.n_offline_rl_steps
+
+
+def _dinov3_output_dim(model_name: str) -> int:
+    model = model_name.lower()
+    if "vitb" in model:
+        return 768
+    if "vitl" in model:
+        return 1024
+    if "vith" in model:
+        return 1280
+    if "vit7b" in model:
+        return 4096
+    if "convnext_tiny" in model:
+        return 768
+    if "convnext_small" in model:
+        return 768
+    if "convnext_base" in model:
+        return 1024
+    if "convnext_large" in model:
+        return 1536
+    return 384

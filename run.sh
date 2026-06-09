@@ -34,8 +34,6 @@ Notes:
       collect the next skill after successful frontier attempts,
       update actors from demos plus successful online attempts,
       and use Huber critic loss to avoid rare online-target explosions.
-  - IQL value target and advantage normalisation are ON by default.
-    Override with --iql_use_value_target=false if needed.
 EOF
 }
 

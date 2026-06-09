@@ -716,6 +716,9 @@ def run_online_finetuning(agent: SkillAgent,
     episode = 0
     update_credit = 0.0
     n_updates = 0
+    actor_demo_fallback_updates = np.zeros(agent.n_tasks, dtype=np.int64)
+    actor_success_online_updates = np.zeros(agent.n_tasks, dtype=np.int64)
+    actor_all_attempt_updates = np.zeros(agent.n_tasks, dtype=np.int64)
     baseline_full = float(initial_eval.get("eval/full_task_success_rate", 0.0)) if initial_eval else 0.0
     best_full = baseline_full
     recent: List[Dict[str, object]] = []
@@ -832,10 +835,13 @@ def run_online_finetuning(agent: SkillAgent,
                         success_only=True,
                         include_high_return_failures=bool(config.online.actor_include_high_return_failures),
                     )
+                    actor_success_online_updates[task_id] += 1
                 else:
                     actor_batch = _demo_batch(agent, task_id, int(config.online.batch_size))
+                    actor_demo_fallback_updates[task_id] += 1
             else:
                 actor_batch = critic_batch
+                actor_all_attempt_updates[task_id] += 1
             demo_anchor = _demo_batch(agent, task_id, int(config.online.batch_size))
             metrics = agent.online_awac_step(
                 task_id,
@@ -854,6 +860,36 @@ def run_online_finetuning(agent: SkillAgent,
                 writer.add_scalar("online/bc_anchor_weight", float(bc_anchor), total_steps)
                 writer.add_scalar("online/replay_total", float(len(replay)), total_steps)
                 writer.add_scalar(
+                    "online/actor_source/demo_only_fallback_total",
+                    float(actor_demo_fallback_updates.sum()),
+                    total_steps,
+                )
+                writer.add_scalar(
+                    "online/actor_source/success_online_total",
+                    float(actor_success_online_updates.sum()),
+                    total_steps,
+                )
+                writer.add_scalar(
+                    "online/actor_source/all_attempt_total",
+                    float(actor_all_attempt_updates.sum()),
+                    total_steps,
+                )
+                writer.add_scalar(
+                    f"online/actor_source/{safe}_demo_only_fallback",
+                    float(actor_demo_fallback_updates[task_id]),
+                    total_steps,
+                )
+                writer.add_scalar(
+                    f"online/actor_source/{safe}_success_online",
+                    float(actor_success_online_updates[task_id]),
+                    total_steps,
+                )
+                writer.add_scalar(
+                    f"online/actor_source/{safe}_all_attempt",
+                    float(actor_all_attempt_updates[task_id]),
+                    total_steps,
+                )
+                writer.add_scalar(
                     f"online/replay/{safe}_quality_size",
                     replay.task_size(task_id, success_only=True),
                     total_steps,
@@ -868,8 +904,19 @@ def run_online_finetuning(agent: SkillAgent,
                     total_steps,
                 )
                 for k, name in enumerate(agent.tasks):
-                    writer.add_scalar(f"online/replay/{name.replace(' ', '_')}_size", replay.task_size(k), total_steps)
-                    writer.add_scalar(f"online/failure_ema/{name.replace(' ', '_')}", failure_ema[k], total_steps)
+                    safe_name = name.replace(" ", "_")
+                    writer.add_scalar(f"online/replay/{safe_name}_size", replay.task_size(k), total_steps)
+                    writer.add_scalar(f"online/failure_ema/{safe_name}", failure_ema[k], total_steps)
+                    writer.add_scalar(
+                        f"online/actor_source/{safe_name}_demo_only_fallback_total",
+                        float(actor_demo_fallback_updates[k]),
+                        total_steps,
+                    )
+                    writer.add_scalar(
+                        f"online/actor_source/{safe_name}_success_online_total",
+                        float(actor_success_online_updates[k]),
+                        total_steps,
+                    )
 
         if verbose and episode % max(1, int(config.online.log_interval_episodes)) == 0:
             mean_tasks = np.mean([float(s["tasks_done"]) for s in recent])
@@ -889,6 +936,9 @@ def run_online_finetuning(agent: SkillAgent,
             print(f"  Collect frontier={[agent.tasks[k] for k in collect_task_ids]}  "
                   f"Active updates={[agent.tasks[k] for k in active_task_ids]}")
             print(f"  Replay quality sizes={[replay.task_size(k, success_only=True) for k in range(agent.n_tasks)]}")
+            print(f"  Actor update sources: demo_fallback={actor_demo_fallback_updates.tolist()}  "
+                  f"success_online={actor_success_online_updates.tolist()}  "
+                  f"all_attempt={actor_all_attempt_updates.tolist()}")
 
         should_eval = (
             evaluate_fn is not None
@@ -907,7 +957,8 @@ def run_online_finetuning(agent: SkillAgent,
                 print("=" * 76)
                 print(f"  ONLINE EVAL step={total_steps:,}: full={full*100:5.1f}%  "
                       f"any={eval_stats['eval/any_task_success_rate']*100:5.1f}%  "
-                      f"tasks={eval_stats['eval/mean_tasks_completed']:.2f}/{agent.n_tasks}")
+                      f"tasks={eval_stats['eval/mean_tasks_completed']:.2f}/{agent.n_tasks}  "
+                      f"chosen={eval_stats['eval/mean_chosen_task_success']*100:5.1f}%")
                 print("=" * 76)
             if full > best_full:
                 best_full = full
@@ -949,4 +1000,7 @@ def run_online_finetuning(agent: SkillAgent,
         "online/rollback_count": float(rollback_count),
         "online/n_frozen_skills": float(len(frozen_task_ids)),
         "online/n_trainable_skills": float(len(trainable_task_ids)),
+        "online/actor_demo_fallback_updates": float(actor_demo_fallback_updates.sum()),
+        "online/actor_success_online_updates": float(actor_success_online_updates.sum()),
+        "online/actor_all_attempt_updates": float(actor_all_attempt_updates.sum()),
     }

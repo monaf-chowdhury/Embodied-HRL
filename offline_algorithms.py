@@ -7,12 +7,15 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from demo_dataset import sample_oracle_prefix_states
+from env_wrapper import FrankaKitchenImageWrapper
 
 try:
     from tqdm.auto import trange
@@ -39,6 +42,91 @@ def soft_update(src: nn.Module, dst: nn.Module, tau: float):
 def set_postfix(iterator, **kwargs):
     if hasattr(iterator, "set_postfix"):
         iterator.set_postfix(**kwargs)
+
+
+def _prefix_tasks_for(agent, task_id: int) -> List[str]:
+    """Use the scripted chain prefix for task-conditioned validation."""
+    task_id = int(task_id)
+    return [agent.tasks[k] for k in range(task_id)]
+
+
+def _prefix_actor_eval(agent,
+                       config,
+                       samples: Sequence[Dict[str, np.ndarray]],
+                       target_id: int) -> Dict[str, float]:
+    """Evaluate a skill from fixed oracle prefix states.
+
+    Success is measured with the environment completion bit, not the auxiliary
+    close-enough condition, so this validation matches the chain metric.
+    """
+    if not samples:
+        return {
+            "success_rate": 0.0,
+            "mean_final_error": float("inf"),
+            "mean_options": 0.0,
+        }
+
+    env = FrankaKitchenImageWrapper(
+        tasks_to_complete=config.training.tasks_to_complete,
+        img_size=config.encoder.img_size,
+        terminate_on_tasks_completed=False,
+    )
+    prev_env_steps = int(getattr(agent, "total_env_steps", 0))
+    prev_options = int(getattr(agent, "total_options", 0))
+    successes: List[float] = []
+    final_errors: List[float] = []
+    options: List[float] = []
+    try:
+        for i, sample in enumerate(samples):
+            env.reset(seed=int(config.eval.prefix_sample_seed) + 1_000 + i)
+            qpos, qvel = env.observation_to_qpos_qvel(sample["state"])
+            env.set_mujoco_state(qpos, qvel)
+            env._current_obs = {"observation": np.asarray(sample["state"], dtype=np.float64).copy()}
+            env._step_count = 0
+
+            state = np.asarray(sample["state"], dtype=np.float64).copy()
+            img = env.render_image()
+            z = agent.encoder.encode_numpy(img).squeeze()
+            completion = np.asarray(sample["completion"], dtype=np.float32).copy()
+            done = False
+            n_opts = 0
+
+            while (
+                not done
+                and completion[int(target_id)] < 0.5
+                and n_opts < config.manager.max_high_level_steps
+            ):
+                result = agent.execute_option(
+                    env=env,
+                    task_id=int(target_id),
+                    start_img=img,
+                    start_state=state,
+                    start_z=z,
+                    completion=completion,
+                    deterministic_worker=True,
+                    collect_frames=False,
+                )
+                state = result.proprio_end
+                z = result.z_end
+                completion = result.completion_end
+                done = result.env_done
+                n_opts += 1
+                if not done:
+                    img = env.render_image()
+
+            successes.append(float(completion[int(target_id)] > 0.5))
+            final_errors.append(float(agent.spec.task_error(state, int(target_id))))
+            options.append(float(n_opts))
+    finally:
+        env.close()
+        agent.total_env_steps = prev_env_steps
+        agent.total_options = prev_options
+
+    return {
+        "success_rate": float(np.mean(successes)),
+        "mean_final_error": float(np.mean(final_errors)),
+        "mean_options": float(np.mean(options)),
+    }
 
 
 class BeTActor(nn.Module):
@@ -152,21 +240,59 @@ class IQLAlgorithm(OfflineAlgorithm):
             return AlgorithmResult(metrics={})
         skill = self.agent.skills[task_id]
         best_actor_loss = float("inf")
-        best_actor_state = clone_state_dict_cpu(skill.actor)
+        loss_best_actor_state = clone_state_dict_cpu(skill.actor)
+        best_actor_state: Optional[Dict[str, torch.Tensor]] = None
+        best_prefix_success = -1.0
+        best_prefix_error = float("inf")
+        best_prefix_step = 0
+        prefix_samples: List[Dict[str, np.ndarray]] = []
+        eval_interval = int(getattr(self.config.specialist, "iql_eval_interval", 0))
+        n_prefix_states = int(getattr(self.config.specialist, "iql_eval_prefix_states", 0))
+        if eval_interval > 0 and n_prefix_states > 0:
+            try:
+                prefix_samples, prefix_stats = sample_oracle_prefix_states(
+                    agent=self.agent,
+                    config=self.config,
+                    prefix_tasks=_prefix_tasks_for(self.agent, task_id),
+                    target_task=task_name,
+                    max_states=n_prefix_states,
+                    verbose=False,
+                )
+                if self.verbose:
+                    print(
+                        f"    IQL prefix-val states={len(prefix_samples)} "
+                        f"matches={int(prefix_stats.get('matching_segments', 0.0))}"
+                    )
+            except Exception as exc:
+                prefix_samples = []
+                if self.verbose:
+                    print(f"    IQL prefix-val disabled for {task_name}: {exc}")
         metrics_list = []
         iterator = trange(n_steps, desc=f"IQL/{task_name}", leave=False, disable=not self.verbose)
         for i in iterator:
             step = i + 1
             metrics = self.agent.iql_step(task_id, self.sample(ds, task_id))
             metrics_list.append(metrics)
-            # Track the actor state with minimum actor loss. IQL actor loss is
-            # -E[exp(beta*adv)*log_pi], which decreases as the actor learns to
-            # concentrate probability on high-advantage actions. Tracking the
-            # minimum avoids taking the final state if late-stage training
-            # causes regression (especially for tasks with noisy critic estimates).
             if float(metrics["iql_actor_loss"]) < best_actor_loss:
                 best_actor_loss = float(metrics["iql_actor_loss"])
-                best_actor_state = clone_state_dict_cpu(skill.actor)
+                loss_best_actor_state = clone_state_dict_cpu(skill.actor)
+            if prefix_samples and (step % eval_interval == 0 or step == n_steps):
+                eval_stats = _prefix_actor_eval(self.agent, self.config, prefix_samples, task_id)
+                success = float(eval_stats["success_rate"])
+                error = float(eval_stats["mean_final_error"])
+                if self.writer is not None:
+                    tb_step = self.config.specialist.n_teacher_bc_steps + step
+                    self.scalar(f"skill/{safe}/iql_prefix_success_rate", success, tb_step)
+                    self.scalar(f"skill/{safe}/iql_prefix_mean_final_error", error, tb_step)
+                    self.scalar(f"skill/{safe}/iql_prefix_mean_options", eval_stats["mean_options"], tb_step)
+                if (
+                    success > best_prefix_success
+                    or (success == best_prefix_success and error < best_prefix_error)
+                ):
+                    best_prefix_success = success
+                    best_prefix_error = error
+                    best_prefix_step = step
+                    best_actor_state = clone_state_dict_cpu(skill.actor)
             if self.should_log(step, n_steps):
                 tb_step = self.config.specialist.n_teacher_bc_steps + step
                 for key, value in metrics.items():
@@ -177,12 +303,20 @@ class IQLAlgorithm(OfflineAlgorithm):
                     v=f"{metrics['iql_value_loss']:.3f}",
                     q=f"{metrics['iql_critic_loss']:.3f}",
                 )
+        if best_actor_state is None:
+            # Fallback only when prefix validation is unavailable. This keeps
+            # runs from crashing on unusual task orders or missing prefix data.
+            best_actor_state = loss_best_actor_state
         restore_state_dict(skill.actor, best_actor_state, self.agent.device)
         skill.actor_opt = torch.optim.Adam(skill.actor.parameters(), lr=self.config.worker.actor_lr)
         out = {}
         for key in metrics_list[-1].keys():
             out[f"{key}/{safe}_final"] = float(np.mean([m[key] for m in metrics_list[-100:]]))
         out[f"iql_actor_loss/{safe}_best"] = float(best_actor_loss)
+        if best_prefix_step > 0:
+            out[f"iql_prefix_success/{safe}_best"] = float(best_prefix_success)
+            out[f"iql_prefix_error/{safe}_best"] = float(best_prefix_error)
+            out[f"iql_prefix_best_step/{safe}"] = float(best_prefix_step)
         return AlgorithmResult(metrics=out, best_actor_state=best_actor_state)
 
 

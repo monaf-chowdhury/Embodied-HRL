@@ -2,3 +2,6 @@ __pycache__
 logs*
 test.py
 plots_claude.py
+cache/
+dinov3/
+dinov3_weights/

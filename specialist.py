@@ -559,7 +559,7 @@ class SkillAgent:
         )
 
     def load(self, path: str):
-        ckpt = torch.load(path, map_location=self.device)
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
         saved_tasks = list(ckpt.get("tasks", []))
         if saved_tasks and saved_tasks != self.tasks:
             raise ValueError(f"Checkpoint tasks {saved_tasks} do not match current tasks {self.tasks}.")
@@ -644,6 +644,10 @@ def _print_skill_metrics(task_name: str, safe: str, algo: str, metrics: Dict[str
                   f"adv_std={metrics[f'iql_adv_std/{safe}_final']:.4f}  "
                   f"weight_mean={metrics[f'iql_weight_mean/{safe}_final']:.4f}  "
                   f"weight_max={metrics[f'iql_weight_max/{safe}_final']:.4f}")
+        if f"iql_prefix_success/{safe}_best" in metrics:
+            print(f"    IQL prefix-val: success={metrics[f'iql_prefix_success/{safe}_best']*100:.1f}%  "
+                  f"err={metrics[f'iql_prefix_error/{safe}_best']:.4f}  "
+                  f"best_step={int(metrics[f'iql_prefix_best_step/{safe}'])}")
     elif algo in ("td3bc", "td3_bc") and f"td3bc_critic_loss/{safe}_final" in metrics:
         print(f"    TD3+BC critic={metrics[f'td3bc_critic_loss/{safe}_final']:.4f}  "
               f"actor={metrics[f'td3bc_actor_loss/{safe}_final']:.4f}  "

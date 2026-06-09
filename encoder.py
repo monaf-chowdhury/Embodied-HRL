@@ -7,6 +7,7 @@ measure option success. That job belongs to task_spec.task_error().
 
 Supports R3M (ResNet-50, 2048-d) and DINOv2 (ViT-S/14, 384-d).
 """
+import os
 import torch
 import torch.nn as nn
 import torchvision.transforms as T
@@ -32,6 +33,9 @@ class VisualEncoder(nn.Module):
         elif config.name == "dinov2":
             self.backbone = self._load_dinov2()
             self.output_dim = 384
+        elif config.name == "dinov3":
+            self.backbone = self._load_dinov3()
+            self.output_dim = self._infer_dinov3_dim(self.backbone)
         else:
             raise ValueError(f"Unknown encoder: {config.name}")
         self.config.raw_dim = self.output_dim
@@ -64,6 +68,33 @@ class VisualEncoder(nn.Module):
         model.eval()
         return model
 
+    def _load_dinov3(self) -> nn.Module:
+        weights = self.config.dinov3_weights or os.environ.get("DINOV3_WEIGHTS", "")
+        if not weights:
+            raise ValueError(
+                "DINOv3 requires a checkpoint path or URL. Set "
+                "config.encoder.dinov3_weights, pass --dinov3_weights, or set "
+                "DINOV3_WEIGHTS."
+            )
+        model = torch.hub.load(
+            self.config.dinov3_repo_or_dir,
+            self.config.dinov3_model,
+            source=self.config.dinov3_source,
+            weights=weights,
+        )
+        model.eval()
+        return model
+
+    @staticmethod
+    def _infer_dinov3_dim(model: nn.Module) -> int:
+        for attr in ("embed_dim", "num_features", "hidden_dim"):
+            value = getattr(model, attr, None)
+            if isinstance(value, int) and value > 0:
+                return int(value)
+        if hasattr(model, "head") and hasattr(model.head, "in_features"):
+            return int(model.head.in_features)
+        return 384
+
     # -----------------------------------------------------------------
 
     def encode_raw(self, images: torch.Tensor) -> torch.Tensor:
@@ -78,8 +109,21 @@ class VisualEncoder(nn.Module):
                     feats = feats['embedding']
                 if isinstance(feats, tuple):
                     feats = feats[0]
-            else:
+            elif self.config.name in ("dinov2", "dinov3"):
                 feats = self.backbone(self.preprocess(images))
+            else:
+                raise ValueError(f"Unknown encoder: {self.config.name}")
+            if isinstance(feats, dict):
+                for key in ("x_norm_clstoken", "cls_token", "embedding"):
+                    if key in feats:
+                        feats = feats[key]
+                        break
+                else:
+                    feats = next(iter(feats.values()))
+            if isinstance(feats, tuple):
+                feats = feats[0]
+            if feats.ndim > 2:
+                feats = feats.flatten(1)
         return feats.detach()
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:

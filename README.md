@@ -144,7 +144,7 @@ minari list local
 
 ---
 
-## Step 8: Install R3M encoder
+## Step 8.1: Install R3M encoder
 
 ```bash
 pip install git+https://github.com/facebookresearch/r3m.git
@@ -154,6 +154,18 @@ Pre-download weights (~100MB, saved to `~/.r3m/`):
 ```bash
 python -c "from r3m import load_r3m; load_r3m('resnet50'); print('R3M weights ready.')"
 ```
+
+## Step 8.2: Download DinoV3 Weights
+
+Request access from **[Meta](https://ai.meta.com/resources/models-and-libraries/dinov3-downloads/)** . Download links will be provided to the email 
+
+```bash
+# Download dinov3 repo whereever you want...
+git clone https://github.com/facebookresearch/dinov3.git
+
+wget -c -O dinov3_vits16plus_pretrain_lvd1689m.pth 'PASTE_THE_LINK_INSIDE'
+```
+
 
 ---
 
@@ -165,7 +177,7 @@ python -c "from r3m import load_r3m; load_r3m('resnet50'); print('R3M weights re
 ```text
 config.py        Dataclass config
 demo_dataset.py  D4RL/Minari loading, replay labels, render/encode cache
-encoder.py       Frozen R3M or DINOv2 image encoder
+encoder.py       Frozen R3M, DINOv2, or DINOv3 image encoder
 env_wrapper.py   FrankaKitchen image/state wrapper
 networks.py      Minimal MLP helper
 specialist.py    One visual BC/IQL policy per task
@@ -207,6 +219,16 @@ There is no learned manager in this branch.
 If you change encoder, action_chunk, tasks, image size, reward weights, then rebuild the cache. Just add `--rebuild_demo_cache` this flag towards the end of the command. 
 
 Algorithm choice alone does not require rebuilding. You do not need --rebuild_demo_cache for every algorithm ablations. Reuse cache if these are unchanged:
+
+Encoder choices:
+
+```bash
+--encoder r3m
+--encoder dinov2
+--encoder dinov3 --dinov3_weights /path/to/dinov3_checkpoint.pth
+```
+
+DINOv3 can also read the checkpoint from `DINOV3_WEIGHTS`. Rebuild demo caches when switching between encoders or DINOv3 model variants.
 
 ## Using shell
 

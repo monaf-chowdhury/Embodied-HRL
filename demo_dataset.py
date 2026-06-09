@@ -581,7 +581,7 @@ def sample_oracle_prefix_states(agent,
             f"prefix={list(prefix_tasks)}."
         )
 
-    rng = np.random.default_rng(config.training.seed)
+    rng = np.random.default_rng(config.eval.prefix_sample_seed)
     if max_states > 0 and len(candidates) > max_states:
         keep = rng.choice(len(candidates), size=max_states, replace=False)
         keep = np.sort(keep)
@@ -977,8 +977,11 @@ def _extract_observation_array(obs) -> np.ndarray:
 
 def _cache_path_for(config: Config, requested_name: str, chunk_len: int) -> str:
     task_sig = "-".join(_safe_name(t) for t in config.training.tasks_to_complete)
+    encoder_sig = config.encoder.name
+    if config.encoder.name == "dinov3":
+        encoder_sig = f"{encoder_sig}-{_safe_name(config.encoder.dinov3_model)}"
     file_name = (
-        f"{_safe_name(requested_name)}__{_CACHE_VERSION}_{config.encoder.name}"
+        f"{_safe_name(requested_name)}__{_CACHE_VERSION}_{encoder_sig}"
         f"_img{config.encoder.img_size}_chunk{chunk_len}_{task_sig}.npz"
     )
     return os.path.join(config.warmup.cache_dir, file_name)

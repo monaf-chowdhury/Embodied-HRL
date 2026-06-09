@@ -76,21 +76,23 @@ def evaluate_single_task(agent: SkillAgent,
                          config: Config,
                          n_episodes: int,
                          record_dir: Optional[str] = None) -> Dict[str, float]:
+    np.random.seed(12345)
+    torch.manual_seed(12345)
     results: Dict[str, float] = {}
     if record_dir:
         os.makedirs(record_dir, exist_ok=True)
     report = ["Single-task deterministic evaluation", f"episodes_per_task={n_episodes}", ""]
 
     for task_id, task_name in enumerate(agent.tasks):
-        env = FrankaKitchenImageWrapper(
-            tasks_to_complete=[task_name],
-            img_size=config.encoder.img_size,
-            terminate_on_tasks_completed=True,
-        )
         success, options, rewards, final_errors = [], [], [], []
         best_rollout = None
-        try:
-            for ep in range(n_episodes):
+        for ep in range(n_episodes):
+            env = FrankaKitchenImageWrapper(
+                tasks_to_complete=[task_name],
+                img_size=config.encoder.img_size,
+                terminate_on_tasks_completed=True,
+            )
+            try:
                 img, state = env.reset(seed=10_000 + 1000 * task_id + ep)
                 z = agent.encoder.encode_numpy(img).squeeze()
                 completion = np.zeros(agent.n_tasks, dtype=np.float32)
@@ -139,8 +141,8 @@ def evaluate_single_task(agent: SkillAgent,
                         "options": n_opts,
                         "episode": ep,
                     }
-        finally:
-            env.close()
+            finally:
+                env.close()
 
         safe = task_name.replace(" ", "_")
         results[f"single_task/{safe}_success_rate"] = float(np.mean(success))
@@ -174,6 +176,8 @@ def evaluate_scripted_chain(agent: SkillAgent,
                             config: Config,
                             n_episodes: int,
                             record_dir: Optional[str] = None) -> Dict[str, float]:
+    np.random.seed(12345)
+    torch.manual_seed(12345)
     if record_dir:
         os.makedirs(record_dir, exist_ok=True)
     order = task_order(agent, config.training.controller_order_mode)
@@ -185,13 +189,13 @@ def evaluate_scripted_chain(agent: SkillAgent,
     final_budget_episodes = 0
     final_env_done_episodes = 0
 
-    env = FrankaKitchenImageWrapper(
-        tasks_to_complete=config.training.tasks_to_complete,
-        img_size=config.encoder.img_size,
-        terminate_on_tasks_completed=True,
-    )
-    try:
-        for ep in range(n_episodes):
+    for ep in range(n_episodes):
+        env = FrankaKitchenImageWrapper(
+            tasks_to_complete=config.training.tasks_to_complete,
+            img_size=config.encoder.img_size,
+            terminate_on_tasks_completed=True,
+        )
+        try:
             img, state = env.reset(seed=99_999 + ep)
             z = agent.encoder.encode_numpy(img).squeeze()
             completion = np.zeros(agent.n_tasks, dtype=np.float32)
@@ -248,8 +252,8 @@ def evaluate_scripted_chain(agent: SkillAgent,
             task_first_option_count[seen] += 1.0
             if frames:
                 save_video(frames, os.path.join(record_dir, f"ep_{ep:03d}.mp4"), fps=config.training.video_fps)
-    finally:
-        env.close()
+        finally:
+            env.close()
 
     out = {
         "eval/any_task_success_rate": float(np.mean(any_success)),
@@ -281,6 +285,8 @@ def evaluate_prefix(agent: SkillAgent,
                     target_task: str,
                     n_states: int,
                     record_dir: Optional[str] = None) -> Dict[str, float]:
+    np.random.seed(12345)
+    torch.manual_seed(12345)
     samples, sampler_stats = sample_oracle_prefix_states(
         agent=agent,
         config=config,
@@ -355,6 +361,98 @@ def evaluate_prefix(agent: SkillAgent,
     return out
 
 
+def evaluate_chain_context_skills(agent: SkillAgent,
+                                  config: Config,
+                                  n_states: int) -> Dict[str, float]:
+    """Evaluate each skill from oracle states after its scripted prefix."""
+    np.random.seed(12345)
+    torch.manual_seed(12345)
+    out: Dict[str, float] = {}
+    prev_env_steps = int(getattr(agent, "total_env_steps", 0))
+    prev_options = int(getattr(agent, "total_options", 0))
+
+    for target_id, target_name in enumerate(agent.tasks):
+        safe = target_name.replace(" ", "_")
+        try:
+            samples, sampler_stats = sample_oracle_prefix_states(
+                agent=agent,
+                config=config,
+                prefix_tasks=agent.tasks[:target_id],
+                target_task=target_name,
+                max_states=n_states,
+                verbose=False,
+            )
+        except Exception as exc:
+            print(f"  [Chain-context] {target_name}: skipped ({exc})")
+            out[f"chain_context/{safe}_success_rate"] = 0.0
+            out[f"chain_context/{safe}_mean_final_error"] = float("inf")
+            out[f"chain_context/{safe}_mean_options"] = 0.0
+            out[f"chain_context/{safe}_n_states"] = 0.0
+            continue
+
+        env = FrankaKitchenImageWrapper(
+            tasks_to_complete=config.training.tasks_to_complete,
+            img_size=config.encoder.img_size,
+            terminate_on_tasks_completed=False,
+        )
+        successes: List[float] = []
+        final_errors: List[float] = []
+        options: List[float] = []
+        try:
+            for i, sample in enumerate(samples):
+                env.reset(seed=int(config.eval.prefix_sample_seed) + 10_000 + target_id * 1_000 + i)
+                qpos, qvel = env.observation_to_qpos_qvel(sample["state"])
+                env.set_mujoco_state(qpos, qvel)
+                env._current_obs = {"observation": np.asarray(sample["state"], dtype=np.float64).copy()}
+                env._step_count = 0
+
+                state = np.asarray(sample["state"], dtype=np.float64).copy()
+                img = env.render_image()
+                z = agent.encoder.encode_numpy(img).squeeze()
+                completion = np.asarray(sample["completion"], dtype=np.float32).copy()
+                done = False
+                n_opts = 0
+
+                while (
+                    not done
+                    and completion[target_id] < 0.5
+                    and n_opts < config.manager.max_high_level_steps
+                ):
+                    result = agent.execute_option(
+                        env=env,
+                        task_id=target_id,
+                        start_img=img,
+                        start_state=state,
+                        start_z=z,
+                        completion=completion,
+                        deterministic_worker=True,
+                        collect_frames=False,
+                    )
+                    state = result.proprio_end
+                    z = result.z_end
+                    completion = result.completion_end
+                    done = result.env_done
+                    n_opts += 1
+                    if not done:
+                        img = env.render_image()
+
+                successes.append(float(completion[target_id] > 0.5))
+                final_errors.append(float(agent.spec.task_error(state, target_id)))
+                options.append(float(n_opts))
+        finally:
+            env.close()
+
+        out[f"chain_context/{safe}_success_rate"] = float(np.mean(successes)) if successes else 0.0
+        out[f"chain_context/{safe}_mean_final_error"] = float(np.mean(final_errors)) if final_errors else 0.0
+        out[f"chain_context/{safe}_mean_options"] = float(np.mean(options)) if options else 0.0
+        out[f"chain_context/{safe}_n_states"] = float(len(samples))
+        out[f"chain_context/{safe}_matching_segments"] = float(sampler_stats.get("matching_segments", 0.0))
+
+    agent.total_env_steps = prev_env_steps
+    agent.total_options = prev_options
+    return out
+
+
 def print_banner(config: Config, log_path: str):
     print(f"\n{SEP}")
     print("  Lean Skill Learning — FrankaKitchen-v1")
@@ -385,7 +483,9 @@ def print_banner(config: Config, log_path: str):
           f"adv_beta={config.specialist.iql_adv_beta}  max_weight={config.specialist.iql_max_weight}  "
           f"adv_norm={config.specialist.iql_normalize_advantage}  "
           f"value_target={config.specialist.iql_use_value_target}  "
-          f"value_target_tau={config.specialist.iql_value_target_tau}")
+          f"value_target_tau={config.specialist.iql_value_target_tau}  "
+          f"prefix_eval_interval={config.specialist.iql_eval_interval}  "
+          f"prefix_eval_states={config.specialist.iql_eval_prefix_states}")
     print(f"  TD3+BC params  : alpha={config.specialist.td3bc_alpha}  tau={config.specialist.td3bc_tau}  "
           f"policy_noise={config.specialist.td3bc_policy_noise}  noise_clip={config.specialist.td3bc_noise_clip}  "
           f"policy_freq={config.specialist.td3bc_policy_freq}")
@@ -402,6 +502,8 @@ def print_banner(config: Config, log_path: str):
           f"phi(s)=exp(-(e/eps)/sigma)")
     print(f"  Eval episodes  : single={config.eval.n_single_task_episodes}  chain={config.eval.n_eval_episodes}  "
           f"prefix_states={config.training.prefix_eval_n_states}")
+    print(f"  Chain-context  : enabled={config.eval.chain_context_eval}  "
+          f"states={config.eval.chain_context_eval_states}")
     print(f"  Video          : record={config.training.record_video}  n={config.training.video_n_episodes}  "
           f"fps={config.training.video_fps}")
     print(f"  Online AWAC    : enabled={config.online.enabled}  steps={config.online.total_env_steps}  "
@@ -474,6 +576,28 @@ def train(config: Config):
         for k, v in stats.items():
             if isinstance(v, (int, float)):
                 writer.add_scalar(f"warmup/{k}", float(v), 0)
+
+        if config.eval.chain_context_eval:
+            print(SEP2)
+            print("  CHAIN-CONTEXT SKILL EVAL")
+            print(SEP2)
+            chain_context = evaluate_chain_context_skills(
+                agent,
+                config,
+                config.eval.chain_context_eval_states,
+            )
+            for k, v in chain_context.items():
+                if isinstance(v, (int, float)) and np.isfinite(float(v)):
+                    writer.add_scalar(k, float(v), 0)
+            print(f"  Oracle prefix states per task: {config.eval.chain_context_eval_states}")
+            for name in agent.tasks:
+                safe = name.replace(" ", "_")
+                print(
+                    f"  {name:<14} prefix_success="
+                    f"{chain_context[f'chain_context/{safe}_success_rate']*100:5.1f}%  "
+                    f"options={chain_context[f'chain_context/{safe}_mean_options']:.1f}  "
+                    f"err={chain_context[f'chain_context/{safe}_mean_final_error']:.4f}"
+                )
 
         print(SEP2)
         print("  SINGLE-TASK EVAL")
@@ -598,7 +722,11 @@ def parse_args() -> Config:
     parser = argparse.ArgumentParser(description="Lean per-skill BC/IQL for FrankaKitchen")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--encoder", type=str, default="r3m", choices=["r3m", "dinov2"])
+    parser.add_argument("--encoder", type=str, default="r3m", choices=["r3m", "dinov2", "dinov3"])
+    parser.add_argument("--dinov3_model", type=str, default=None)
+    parser.add_argument("--dinov3_weights", type=str, default=None)
+    parser.add_argument("--dinov3_repo_or_dir", type=str, default=None)
+    parser.add_argument("--dinov3_source", type=str, default=None, choices=["github", "local"])
     parser.add_argument("--log_dir", type=str, default="logs/lean_skills")
     parser.add_argument("--tasks", nargs="+", default=None)
     parser.add_argument("--demo_datasets", nargs="+", default=None)
@@ -621,6 +749,8 @@ def parse_args() -> Config:
     parser.add_argument("--iql_use_value_target", action="store_true")
     parser.add_argument("--iql_value_target_tau", type=float, default=None)
     parser.add_argument("--iql_normalize_advantage", "--iql_adv_normalize", action="store_true")
+    parser.add_argument("--iql_eval_interval", type=int, default=None)
+    parser.add_argument("--iql_eval_prefix_states", type=int, default=None)
     parser.add_argument("--td3bc_alpha", type=float, default=None)
     parser.add_argument("--awr_temperature", type=float, default=None)
     parser.add_argument("--awr_max_weight", type=float, default=None)
@@ -635,6 +765,8 @@ def parse_args() -> Config:
     parser.add_argument("--prefix_target_task", type=str, default="")
     parser.add_argument("--prefix_condition_tasks", nargs="*", default=None)
     parser.add_argument("--prefix_eval_states", type=int, default=None)
+    parser.add_argument("--chain_context_eval_states", type=int, default=None)
+    parser.add_argument("--no_chain_context_eval", action="store_true")
     parser.add_argument("--no_video", action="store_true")
     parser.add_argument("--online_finetune", action="store_true")
     parser.add_argument("--online_mode", type=str, default=None, choices=["skill_repair", "chain"])
@@ -675,6 +807,15 @@ def parse_args() -> Config:
     cfg.training.device = args.device
     cfg.training.log_dir = args.log_dir
     cfg.encoder.name = args.encoder
+    if args.dinov3_model is not None:
+        cfg.encoder.dinov3_model = args.dinov3_model
+    if args.dinov3_weights is not None:
+        cfg.encoder.dinov3_weights = args.dinov3_weights
+    if args.dinov3_repo_or_dir is not None:
+        cfg.encoder.dinov3_repo_or_dir = args.dinov3_repo_or_dir
+    if args.dinov3_source is not None:
+        cfg.encoder.dinov3_source = args.dinov3_source
+    cfg.refresh_encoder_dim()
     if args.tasks is not None:
         cfg.training.tasks_to_complete = args.tasks
     if args.demo_datasets is not None:
@@ -716,6 +857,10 @@ def parse_args() -> Config:
         cfg.specialist.iql_value_target_tau = args.iql_value_target_tau
     if args.iql_normalize_advantage:
         cfg.specialist.iql_normalize_advantage = True
+    if args.iql_eval_interval is not None:
+        cfg.specialist.iql_eval_interval = args.iql_eval_interval
+    if args.iql_eval_prefix_states is not None:
+        cfg.specialist.iql_eval_prefix_states = args.iql_eval_prefix_states
     if args.td3bc_alpha is not None:
         cfg.specialist.td3bc_alpha = args.td3bc_alpha
     if args.awr_temperature is not None:
@@ -742,6 +887,10 @@ def parse_args() -> Config:
         cfg.training.prefix_condition_tasks = args.prefix_condition_tasks or []
     if args.prefix_eval_states is not None:
         cfg.training.prefix_eval_n_states = args.prefix_eval_states
+    if args.chain_context_eval_states is not None:
+        cfg.eval.chain_context_eval_states = args.chain_context_eval_states
+    if args.no_chain_context_eval:
+        cfg.eval.chain_context_eval = False
     if args.no_video:
         cfg.training.record_video = False
     if args.online_finetune:
