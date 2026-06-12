@@ -20,6 +20,18 @@ import numpy as np
 from config import Config
 from env_wrapper import FrankaKitchenImageWrapper
 from specialist import SkillAgent
+from utils import preserve_rng_state
+
+
+def _average_eval_stats(evals: Sequence[Dict[str, float]]) -> Dict[str, float]:
+    """Element-wise mean of numeric eval metrics (non-numeric: first wins)."""
+    out: Dict[str, float] = {}
+    for key, value in evals[0].items():
+        if isinstance(value, (int, float)):
+            out[key] = float(np.mean([float(e[key]) for e in evals]))
+        else:
+            out[key] = value
+    return out
 
 
 class OnlineSkillReplay:
@@ -708,6 +720,9 @@ def run_online_finetuning(agent: SkillAgent,
     )
     frozen_task_ids, trainable_task_ids, chain_rates = _repair_task_sets(agent, config, initial_eval)
     failure_ema = np.clip(1.0 - chain_rates.astype(np.float32), 0.0, 1.0)
+    # Smoothed per-task chain rates for freeze/frontier gating: one
+    # 100-episode eval has ~4-5pp per-task noise, enough to flap the gates.
+    chain_rate_ema = chain_rates.astype(np.float32).copy()
     collect_task_ids = _frontier_task_ids(agent, config, frozen_task_ids, trainable_task_ids)
     active_task_ids = _active_repair_task_ids(
         agent, config, frozen_task_ids, trainable_task_ids, failure_ema, replay
@@ -947,8 +962,24 @@ def run_online_finetuning(agent: SkillAgent,
         )
         if should_eval:
             last_eval_step = total_steps
-            eval_stats = evaluate_fn(agent, config, config.eval.n_eval_episodes, record_dir=None)
-            full = float(eval_stats["eval/full_task_success_rate"])
+            tol = float(config.online.rollback_drop_tolerance)
+            # Isolate the eval's global RNG reseeding from the training
+            # stream (exploration noise / task choice / replay sampling).
+            with preserve_rng_state():
+                eval_stats = evaluate_fn(agent, config, config.eval.n_eval_episodes, record_dir=None)
+                full = float(eval_stats["eval/full_task_success_rate"])
+                if full > best_full or full < best_full - tol:
+                    # Same-policy chain evals vary by ~4-5pp, so a single
+                    # draw can fake a new best or a regression. Confirm
+                    # decision-relevant outcomes with a second eval; act on
+                    # the mean.
+                    confirm_stats = evaluate_fn(
+                        agent, config, config.eval.n_eval_episodes, record_dir=None)
+                    if verbose:
+                        print(f"  [Eval confirm] first={full*100:.1f}%  second="
+                              f"{float(confirm_stats['eval/full_task_success_rate'])*100:.1f}%")
+                    eval_stats = _average_eval_stats([eval_stats, confirm_stats])
+                    full = float(eval_stats["eval/full_task_success_rate"])
             if writer is not None:
                 for key, value in eval_stats.items():
                     if isinstance(value, (int, float)) and np.isfinite(float(value)):
@@ -963,13 +994,21 @@ def run_online_finetuning(agent: SkillAgent,
             if full > best_full:
                 best_full = full
                 agent.save(best_path)
-            elif full < best_full - float(config.online.rollback_drop_tolerance):
+            elif full < best_full - tol:
                 rollback_count += 1
                 if verbose:
-                    print(f"  [Rollback] eval full SR dropped to {full*100:.1f}% "
-                          f"from best {best_full*100:.1f}%; restoring best checkpoint.")
+                    print(f"  [Rollback] confirmed eval full SR {full*100:.1f}% "
+                          f"vs best {best_full*100:.1f}%; restoring best checkpoint.")
                 agent.load(best_path)
-            frozen_task_ids, trainable_task_ids, chain_rates = _repair_task_sets(agent, config, eval_stats)
+                # Checkpoints carry no Adam moments; fresh optimizers keep
+                # post-rollback updates from using stale momenta.
+                agent.reset_optimizers(trainable_task_ids)
+            # Gate freeze/frontier decisions on smoothed per-task rates.
+            chain_rate_ema = 0.5 * chain_rate_ema + 0.5 * _chain_completion_rates(agent, eval_stats)
+            gating_stats = dict(eval_stats)
+            for k, name in enumerate(agent.tasks):
+                gating_stats[f"eval/task/{name.replace(' ', '_')}_completion_rate"] = float(chain_rate_ema[k])
+            frozen_task_ids, trainable_task_ids, chain_rates = _repair_task_sets(agent, config, gating_stats)
             failure_ema = np.maximum(failure_ema, np.clip(1.0 - chain_rates.astype(np.float32), 0.0, 1.0))
             collect_task_ids = _frontier_task_ids(agent, config, frozen_task_ids, trainable_task_ids)
             active_task_ids = _active_repair_task_ids(

@@ -1,12 +1,9 @@
 """
 plots.py — Diagnostic plots for lean FrankaKitchen skill-learning runs.
 
-Reads TensorBoard event files and generates PNG plots covering:
-  * eval full-task vs any-task success rates (the headline chart)
-  * task-completion dynamics during training
-  * optional legacy manager/worker panels when those tags exist
-  * buffer fills + option length
-  * stage-A warmup sanity (BC / CE losses)
+Reads TensorBoard event files (with train_log text fallback) and generates
+PNG plots covering offline BC/IQL+LQL training health, prefix-state model
+selection, and online AWAC fine-tuning.
 
 Usage:
     python plots.py --log_dir logs/lean_skills/
@@ -15,12 +12,12 @@ Usage:
 
 Output files:
     00_overview_dashboard.png     — 6-panel summary; look here first
-    01_eval_success.png           — eval success rates over time
-    02_training_episode.png       — per-episode env reward + options + tasks completed
-    03_manager_dqn.png            — manager/controller diagnostics
-    04_worker_sac.png             — legacy worker panel if tags exist
-    05_buffers.png                — buffer fills
-    06_warmup.png                 — Stage-A BC/CE losses (if collected)
+    01_eval_success.png           — chain eval success rates over time
+    02_training_episode.png       — online per-episode reward / options / tasks
+    03_lql_diagnostics.png        — LQL lower-bound penalty health per skill
+    04_prefix_validation.png      — IQL prefix-state validation per skill
+    07_skill_losses.png           — per-skill offline optimisation losses
+    08_skill_eval.png             — final per-skill eval bar charts
     09_online_awac.png            — online AWAC fine-tuning diagnostics
     comparison.png                — multi-run overlay (--compare mode)
 """
@@ -434,18 +431,16 @@ def plot_overview(data: dict, out_dir: str, sw: int = 15):
         ylabel='Tasks', color=COLORS['gold'],
         smooth_window=1, ymin=0, ymax=4.1)
 
-    _plot(axes[3], data, 'train/ep_tasks_completed',
-          title='[4]  Train Tasks Completed / episode',
-          ylabel='Tasks', color=COLORS['orange'], smooth_window=sw)
+    _plot_skill_family(axes[3], data, 'iql_prefix_success_rate',
+                       title='[4]  IQL Prefix-Val Success (model selection)',
+                       ylabel='%', sw=1, pct=True, ymin=0, ymax=105)
 
-    _plot(axes[4], data, 'worker/worker_critic_loss',
-          title='[5]  Worker Critic Loss',
-          ylabel='MSE', color=COLORS['red'], smooth_window=sw)
+    _plot_skill_family(axes[4], data, 'iql_critic_loss',
+                       title='[5]  IQL Critic TD Loss', ylabel='MSE', sw=sw)
 
-    _plot_first_available(axes[5], data,
-          ['manager/manager_loss', 'train/controller_fraction'],
-          title='[6]  High-Level Controller',
-          ylabel='MSE / fraction', color=COLORS['purple'], smooth_window=sw)
+    _plot_skill_family(axes[5], data, 'iql_lb_active_frac',
+                       title='[6]  LQL Active Pair Fraction',
+                       ylabel='fraction', sw=sw, ymin=0, ymax=1.05)
 
     fig.tight_layout()
     _save(fig, out_dir, '00_overview_dashboard.png')
@@ -513,93 +508,74 @@ def plot_training_episode(data: dict, out_dir: str, sw: int = 15):
 
 
 # =============================================================================
-# Plot 03 — Optional legacy controller panel
+# Plot 03 — LQL lower-bound penalty diagnostics
 # =============================================================================
 
-def plot_manager(data: dict, out_dir: str, sw: int = 15):
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    fig.suptitle('High-Level Controller',
-                 fontsize=STYLE['suptitle_fs'], fontweight='bold')
+def plot_lql_diagnostics(data: dict, out_dir: str, sw: int = 15):
+    """Health of the LQL lower-bound critic penalty.
 
-    _plot_first_available(axes[0], data,
-          ['manager/manager_loss', 'train/controller_fraction'],
-          title='Manager Loss / Controller Fraction', ylabel='MSE / fraction',
-          color=COLORS['red'], smooth_window=sw)
-    _plot_first_available(axes[1], data,
-          ['manager/manager_q_mean', 'train/unlocked_task_count'],
-          title='Mean Q(s,*) / Unlocked Tasks', ylabel='Q-value / count',
-          color=COLORS['purple'], smooth_window=sw)
-    _plot_first_available(axes[2], data,
-          ['train/epsilon', 'train/scripted_manager_fraction', 'train/controller_fraction'],
-          title='Exploration / Scripted Fraction', ylabel='eps / fraction',
-          color=COLORS['gray'], smooth_window=sw, ymin=0, ymax=1.05)
-
-    fig.tight_layout()
-    _save(fig, out_dir, '03_manager_dqn.png')
-
-
-# =============================================================================
-# Plot 04 — Optional legacy worker panel
-# =============================================================================
-
-def plot_worker(data: dict, out_dir: str, sw: int = 15):
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    fig.suptitle('Worker / Skill Optimisation',
-                 fontsize=STYLE['suptitle_fs'], fontweight='bold')
-
-    _plot(axes[0], data, 'worker/worker_critic_loss',
-          title='Critic Loss', ylabel='MSE',
-          color=COLORS['red'], smooth_window=sw)
-    _plot(axes[1], data, 'worker/worker_actor_loss',
-          title='Actor Loss', ylabel='Loss',
-          color=COLORS['blue'], smooth_window=sw)
-    _plot(axes[2], data, 'worker/worker_alpha',
-          title='Entropy Temperature (alpha)',
-          ylabel='alpha', color=COLORS['teal'], smooth_window=sw)
-
-    fig.tight_layout()
-    _save(fig, out_dir, '04_worker_sac.png')
-
-
-# =============================================================================
-# Plot 05 — Buffers
-# =============================================================================
-
-def plot_buffers(data: dict, out_dir: str, sw: int = 5):
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    fig.suptitle('Replay Buffers', fontsize=STYLE['suptitle_fs'], fontweight='bold')
-
-    _plot(axes[0], data, 'train/worker_buffer_size',
-          title='Worker Buffer (chunk transitions)',
-          ylabel='Transitions', color=COLORS['blue'], smooth_window=sw)
-    _plot(axes[1], data, 'train/manager_buffer_size',
-          title='Manager Buffer (option transitions)',
-          ylabel='Transitions', color=COLORS['orange'], smooth_window=sw)
-
-    fig.tight_layout()
-    _save(fig, out_dir, '05_buffers.png')
-
-
-# =============================================================================
-# Plot 06 — Warmup losses (if present)
-# =============================================================================
-
-def plot_warmup(data: dict, out_dir: str):
-    keys = [k for k in data if k.startswith('warmup/')]
-    if not keys:
+    What to look for:
+      * active_frac should settle in a moderate band (~5-40%). Pinned at 0%
+        means chains never fire (sampler/data bug); pinned near 100% means the
+        critic is persistently below the demo returns (slow propagation or
+        lambda too small).
+      * lb_loss should decay as Q absorbs the bounds.
+      * target_q_mean / q_mean climbing without bound => Q inflation; lower
+        lambda_lb.
+    """
+    has_lql = any('/iql_lb_' in k for k in data)
+    if not has_lql:
         return
-    fig, ax = plt.subplots(1, 1, figsize=(10, 5))
-    fig.suptitle('Stage-A Warmup Metrics',
+    fig, axes = plt.subplots(2, 3, figsize=(20, 10))
+    axes = axes.flatten()
+    fig.suptitle('LQL Lower-Bound Penalty Diagnostics',
                  fontsize=STYLE['suptitle_fs'], fontweight='bold')
-    for i, tag in enumerate(sorted(keys)):
-        steps, values = data[tag]
-        ax.plot(steps, values, marker='o', label=tag.replace('warmup/', ''))
-    ax.legend(fontsize=STYLE['tick_fs'])
-    _style_ax(ax)
-    ax.set_xlabel('Step', fontsize=STYLE['label_fs'])
-    ax.set_ylabel('Value', fontsize=STYLE['label_fs'])
+
+    _plot_skill_family(axes[0], data, 'iql_lb_loss',
+                       title='LB Penalty (mean hinge^2)', ylabel='Loss', sw=sw)
+    _plot_skill_family(axes[1], data, 'iql_lb_active_frac',
+                       title='Active Pair Fraction (hinge > 0)',
+                       ylabel='fraction', sw=sw, ymin=0, ymax=1.05)
+    _plot_skill_family(axes[2], data, 'iql_lb_hinge_mean',
+                       title='Mean Hinge Magnitude (active pairs)',
+                       ylabel='Q underestimate', sw=sw)
+    _plot_skill_family(axes[3], data, 'iql_lb_chain_len_mean',
+                       title='Mean Sampled Chain Length',
+                       ylabel='chunk transitions', sw=sw)
+    _plot_skill_family(axes[4], data, 'iql_target_q_mean',
+                       title='TD Target Q Mean (inflation watch)',
+                       ylabel='Q', sw=sw)
+    _plot_skill_family(axes[5], data, 'iql_q_mean',
+                       title='Q(s,a) Mean on Demo Batch',
+                       ylabel='Q', sw=sw)
+
     fig.tight_layout()
-    _save(fig, out_dir, '06_warmup.png')
+    _save(fig, out_dir, '03_lql_diagnostics.png')
+
+
+# =============================================================================
+# Plot 04 — IQL prefix-state validation (model selection signal)
+# =============================================================================
+
+def plot_prefix_validation(data: dict, out_dir: str):
+    skills = _skill_names(data)
+    has_prefix = any(f'skill/{s}/iql_prefix_success_rate' in data for s in skills)
+    if not has_prefix:
+        return
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig.suptitle('IQL Prefix-State Validation (checkpoint selection)',
+                 fontsize=STYLE['suptitle_fs'], fontweight='bold')
+
+    _plot_skill_family(axes[0], data, 'iql_prefix_success_rate',
+                       title='Prefix-Val Success Rate', ylabel='%',
+                       sw=1, pct=True, ymin=0, ymax=105)
+    _plot_skill_family(axes[1], data, 'iql_prefix_mean_final_error',
+                       title='Prefix-Val Final Task Error', ylabel='error', sw=1)
+    _plot_skill_family(axes[2], data, 'iql_prefix_mean_options',
+                       title='Prefix-Val Options Used', ylabel='options', sw=1)
+
+    fig.tight_layout()
+    _save(fig, out_dir, '04_prefix_validation.png')
 
 
 # =============================================================================
@@ -776,12 +752,12 @@ def plot_online_awac(data: dict, out_dir: str, sw: int = 15):
 
 def plot_comparison(run_dirs, run_labels, out_dir: str, sw: int = 15):
     COMPARE_TAGS = [
-        ('eval/full_task_success_rate',  'Eval Full-Task Success (%)',  True),
-        ('eval/any_task_success_rate',   'Eval Any-Task Success (%)',   True),
-        ('eval/mean_tasks_completed',    'Eval Mean Tasks Completed',   False),
-        ('train/ep_env_reward',          'Train Episode Env Reward',    False),
-        ('worker/worker_critic_loss',    'Worker Critic Loss',          False),
-        ('manager/manager_q_mean',       'Manager Q-Mean',              False),
+        ('eval/full_task_success_rate',             'Eval Full-Task Success (%)',   True),
+        ('eval/any_task_success_rate',              'Eval Any-Task Success (%)',    True),
+        ('eval/mean_tasks_completed',               'Eval Mean Tasks Completed',    False),
+        ('online_eval/eval/full_task_success_rate', 'Online Full-Task Success (%)', True),
+        ('skill/light_switch/iql_prefix_success_rate', 'Light-Switch Prefix-Val (%)', True),
+        ('train/ep_env_reward',                     'Train Episode Env Reward',     False),
     ]
 
     palette = list(COLORS.values())
@@ -856,10 +832,8 @@ def main():
     plot_overview(data, out_dir, sw=sw)
     plot_eval_success(data, out_dir, sw=1)
     plot_training_episode(data, out_dir, sw=sw)
-    plot_manager(data, out_dir, sw=sw)
-    plot_worker(data, out_dir, sw=sw)
-    plot_buffers(data, out_dir, sw=5)
-    plot_warmup(data, out_dir)
+    plot_lql_diagnostics(data, out_dir, sw=sw)
+    plot_prefix_validation(data, out_dir)
     plot_skill_losses(data, out_dir, sw=sw)
     plot_skill_eval(data, out_dir)
     plot_online_awac(data, out_dir, sw=sw)

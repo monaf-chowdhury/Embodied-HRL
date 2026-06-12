@@ -69,15 +69,26 @@ class VisualEncoder(nn.Module):
         return model
 
     def _load_dinov3(self) -> nn.Module:
-        weights = self.config.dinov3_weights or os.environ.get("DINOV3_WEIGHTS", "")
+        _project_root = os.path.dirname(os.path.abspath(__file__))
+
+        def _resolve(p: str) -> str:
+            if not p:
+                return p
+            expanded = os.path.expandvars(os.path.expanduser(p))
+            if os.path.isabs(expanded):
+                return expanded
+            return os.path.join(_project_root, expanded)
+
+        weights = _resolve(self.config.dinov3_weights) or os.environ.get("DINOV3_WEIGHTS", "")
         if not weights:
             raise ValueError(
                 "DINOv3 requires a checkpoint path or URL. Set "
                 "config.encoder.dinov3_weights, pass --dinov3_weights, or set "
                 "DINOV3_WEIGHTS."
             )
+        repo_or_dir = _resolve(self.config.dinov3_repo_or_dir)
         model = torch.hub.load(
-            self.config.dinov3_repo_or_dir,
+            repo_or_dir,
             self.config.dinov3_model,
             source=self.config.dinov3_source,
             weights=weights,

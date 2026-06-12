@@ -10,8 +10,8 @@ class EncoderConfig:
     raw_dim: int = 2048
     img_size: int = 224
     dinov3_model: str = "dinov3_vits16plus"
-    dinov3_weights: str = "/dinov3/dinov3_weights/dinov3_vits16plus_pretrain_lvd1689m.pth"     # Path/URL, or set DINOV3_WEIGHTS.
-    dinov3_repo_or_dir: str = "/dinov3"
+    dinov3_weights: str = "dinov3/dinov3_weights/dinov3_vits16plus_pretrain_lvd1689m.pth"     # Relative to project root, absolute, or set DINOV3_WEIGHTS env var.
+    dinov3_repo_or_dir: str = "dinov3"
     dinov3_source: str = "local"  # "github" or "local"
 
 
@@ -70,6 +70,13 @@ class EvalConfig:
     prefix_sample_seed: int = 30_000
     chain_context_eval: bool = True
     chain_context_eval_states: int = 100
+    # Final reported eval: repeated runs on episode seeds DISJOINT from the
+    # online model-selection stream (99_999+ep), reported as mean +/- std.
+    # Chain evals of an identical policy vary by ~4-5pp (renderer/GPU
+    # nondeterminism compounds chaotically over long rollouts), so a single
+    # eval is a noisy draw and max-over-evals is upward-biased.
+    final_eval_repeats: int = 3
+    final_eval_seed_base: int = 200_000
 
 
 @dataclass
@@ -91,6 +98,16 @@ class SpecialistConfig:
     iql_normalize_advantage: bool = False
     iql_eval_interval: int = 10_000
     iql_eval_prefix_states: int = 100
+
+    # LQL lower-bound critic penalty (arXiv 2605.05812, adapted to IQL).
+    # Q(s_k,a_k) >= G_{k:l} + gamma^(l-k) * V_target(s_l) over same-task
+    # chunk-aligned demo chains; violations are penalised with hinge^2.
+    # One chain step == one action chunk (H env steps), matching the 1-step
+    # TD semantics where gamma is applied per chunk, not per env step.
+    lql_enabled: bool = True
+    lql_lambda_lb: float = 0.33  # Codex set it to 0.5; For safety, I set it 1/3 i.e. 0.33 
+    lql_n_transitions: int = 8   # max chunk transitions per sampled chain
+    lql_min_gap: int = 2         # only pairs spanning >= this many chunks (1-step is TD's job)
 
     # TD3+BC.
     td3bc_alpha: float = 2.5

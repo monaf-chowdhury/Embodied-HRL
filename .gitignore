@@ -5,3 +5,4 @@ plots_claude.py
 cache/
 dinov3/
 dinov3_weights/
+.codex_tmp/

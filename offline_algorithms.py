@@ -50,6 +50,19 @@ def _prefix_tasks_for(agent, task_id: int) -> List[str]:
     return [agent.tasks[k] for k in range(task_id)]
 
 
+_LQL_ANCHOR_KEYS = (
+    "z", "proprio", "task_target", "task_cur", "task_mask",
+    "action", "reward", "done", "z_next", "proprio_next", "task_cur_next",
+)
+
+
+def lql_anchor_batch(segments: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    """Column 0 of a chain batch == a uniformly-sampled flat transition batch."""
+    batch = {key: segments[key][:, 0] for key in _LQL_ANCHOR_KEYS}
+    batch["task_id"] = segments["task_id"]
+    return batch
+
+
 def _prefix_actor_eval(agent,
                        config,
                        samples: Sequence[Dict[str, np.ndarray]],
@@ -267,11 +280,38 @@ class IQLAlgorithm(OfflineAlgorithm):
                 prefix_samples = []
                 if self.verbose:
                     print(f"    IQL prefix-val disabled for {task_name}: {exc}")
+        use_lql = (
+            bool(self.config.specialist.lql_enabled)
+            and float(self.config.specialist.lql_lambda_lb) > 0.0
+        )
+        if use_lql:
+            chain_stats = ds.lql_chain_stats(task_id, self.config.specialist.lql_min_gap)
+            if self.verbose:
+                print(
+                    f"    LQL chains[{task_name}]: rows={int(chain_stats['rows']):,}  "
+                    f"linked={chain_stats['linked_frac']*100:.1f}%  "
+                    f"pairable={chain_stats['pairable_frac']*100:.1f}%  "
+                    f"len_mean={chain_stats['chain_len_mean']:.1f}  "
+                    f"len_max={int(chain_stats['chain_len_max'])}"
+                )
+            if chain_stats["pairable_frac"] <= 0.0:
+                use_lql = False
+                if self.verbose:
+                    print(f"    LQL disabled for {task_name}: no pairable chains in demo data.")
         metrics_list = []
         iterator = trange(n_steps, desc=f"IQL/{task_name}", leave=False, disable=not self.verbose)
         for i in iterator:
             step = i + 1
-            metrics = self.agent.iql_step(task_id, self.sample(ds, task_id))
+            if use_lql:
+                segments = ds.sample_lql_segments(
+                    task_id,
+                    self.config.specialist.batch_size,
+                    self.config.specialist.lql_n_transitions,
+                    proprio_normalizer=self.agent.normalize_proprio,
+                )
+                metrics = self.agent.iql_step(task_id, lql_anchor_batch(segments), segments=segments)
+            else:
+                metrics = self.agent.iql_step(task_id, self.sample(ds, task_id))
             metrics_list.append(metrics)
             if float(metrics["iql_actor_loss"]) < best_actor_loss:
                 best_actor_loss = float(metrics["iql_actor_loss"])
@@ -298,11 +338,14 @@ class IQLAlgorithm(OfflineAlgorithm):
                 for key, value in metrics.items():
                     self.scalar(f"skill/{safe}/{key}", value, tb_step)
             if self.verbose:
-                set_postfix(
-                    iterator,
-                    v=f"{metrics['iql_value_loss']:.3f}",
-                    q=f"{metrics['iql_critic_loss']:.3f}",
-                )
+                postfix = {
+                    "v": f"{metrics['iql_value_loss']:.3f}",
+                    "q": f"{metrics['iql_critic_loss']:.3f}",
+                }
+                if "iql_lb_loss" in metrics:
+                    postfix["lb"] = f"{metrics['iql_lb_loss']:.3f}"
+                    postfix["lb_act"] = f"{metrics['iql_lb_active_frac']*100:.0f}%"
+                set_postfix(iterator, **postfix)
         if best_actor_state is None:
             # Fallback only when prefix validation is unavailable. This keeps
             # runs from crashing on unusual task orders or missing prefix data.

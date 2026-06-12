@@ -33,6 +33,75 @@ LOG_STD_MIN = -5.0
 LOG_STD_MAX = 2.0
 
 
+def lql_lower_bound_penalty(q_chain: torch.Tensor,
+                            v_next_chain: torch.Tensor,
+                            rewards: torch.Tensor,
+                            dones: torch.Tensor,
+                            valid: torch.Tensor,
+                            gamma: float,
+                            min_gap: int) -> Dict[str, torch.Tensor]:
+    """LQL lower-bound hinge penalty over chunk-aligned demo chains.
+
+    For a chain of N valid transitions (states s_0..s_N), every pair (k, l)
+    with l - k >= min_gap enforces the optimality lower bound
+
+        Q(s_k, a_k) >= G_{k:l} + gamma^(l-k) * (1 - done_{l-1}) * V_target(s_l)
+
+    where G_{k:l} = sum_{j=k}^{l-1} gamma^(j-k) r_j is the realized discounted
+    partial return. Violations are penalised with hinge^2 (paper: arXiv
+    2605.05812; continuation via V_target instead of Q(s, pi(s)) to stay
+    in-distribution for IQL).
+
+    Args (all shaped (B, L); only q_chain may carry gradient):
+      q_chain      Q(s_k, a_k) for each chain row.
+      v_next_chain V_target at each row's NEXT state, i.e. chain state s_{k+1}.
+      rewards      per-chunk rewards (already zeroed where invalid).
+      dones        per-row env-termination flags.
+      valid        bool prefix mask of real rows.
+
+    Returns dict: "penalty" (scalar, mean hinge^2 over valid pairs) plus
+    detached diagnostics ("active_frac", "hinge_mean", "n_pairs").
+    """
+    B, L = rewards.shape
+    device = rewards.device
+    min_gap = max(1, int(min_gap))
+    zero = torch.zeros((), device=device)
+    if L < min_gap:
+        return {"penalty": zero, "active_frac": zero,
+                "hinge_mean": zero, "n_pairs": zero}
+
+    valid_f = valid.float()
+    r = rewards * valid_f
+    disc = torch.pow(torch.full((L,), float(gamma), device=device),
+                     torch.arange(L, device=device, dtype=torch.float32))
+    # c[:, m] = sum_{j < m} gamma^j r_j  -> G_{k:l} = (c[:, l] - c[:, k]) / gamma^k
+    c = torch.cat([torch.zeros(B, 1, device=device),
+                   torch.cumsum(r * disc.unsqueeze(0), dim=1)], dim=1)
+
+    k_idx = torch.arange(L, device=device)            # k = 0..L-1
+    l_idx = torch.arange(1, L + 1, device=device)     # l = 1..L (state s_l)
+    G = (c[:, l_idx].unsqueeze(1) - c[:, k_idx].unsqueeze(2)) / disc[k_idx].view(1, L, 1)
+
+    span = l_idx.view(1, 1, L) - k_idx.view(1, L, 1)  # l - k
+    gamma_span = torch.pow(torch.full_like(G, float(gamma)), span.float())
+    # Continuation at s_l == next state of row l-1; drop it past termination.
+    boot = gamma_span * (1.0 - dones[:, l_idx - 1].unsqueeze(1)) * v_next_chain[:, l_idx - 1].unsqueeze(1)
+
+    hinge = F.relu(G + boot - q_chain.unsqueeze(2))
+    # Prefix-contiguous validity: rows k..l-1 valid <=> row l-1 valid (k < l).
+    pair_valid = (span >= min_gap) & valid[:, l_idx - 1].unsqueeze(1)
+    pair_valid_f = pair_valid.float()
+    n_pairs = pair_valid_f.sum().clamp(min=1.0)
+
+    penalty = (hinge.pow(2) * pair_valid_f).sum() / n_pairs
+    with torch.no_grad():
+        active = ((hinge > 0) & pair_valid).float().sum()
+        active_frac = active / n_pairs
+        hinge_mean = (hinge * pair_valid_f).sum() / active.clamp(min=1.0)
+    return {"penalty": penalty, "active_frac": active_frac,
+            "hinge_mean": hinge_mean, "n_pairs": pair_valid_f.sum()}
+
+
 @dataclass
 class OptionResult:
     z_start: np.ndarray
@@ -197,6 +266,25 @@ class SkillAgent:
     def normalize_proprio(self, p: np.ndarray) -> np.ndarray:
         return self.proprio_norm(p)
 
+    def reset_optimizers(self, task_ids: Optional[List[int]] = None):
+        """Re-create per-skill optimizers (fresh Adam moments).
+
+        Checkpoints store network weights only, so after agent.load() the
+        optimizers still hold first/second-moment estimates accumulated for
+        the *discarded* weights. Call this after any load that is followed by
+        further training (e.g. online rollback) so the first post-restore
+        updates are not driven by stale momenta.
+        """
+        ids = list(range(self.n_tasks)) if task_ids is None else [int(k) for k in task_ids]
+        for k in ids:
+            skill = self.skills[k]
+            skill.actor_opt = torch.optim.Adam(
+                skill.actor.parameters(), lr=self.config.worker.actor_lr)
+            skill.critic_opt = torch.optim.Adam(
+                skill.critic.parameters(), lr=self.config.worker.critic_lr)
+            skill.value_opt = torch.optim.Adam(
+                skill.value.parameters(), lr=self.config.worker.critic_lr)
+
     def _input_arrays(self,
                       z: np.ndarray,
                       proprio: np.ndarray,
@@ -258,7 +346,10 @@ class SkillAgent:
             for p, p_targ in zip(src.parameters(), dst.parameters()):
                 p_targ.data.mul_(1.0 - tau).add_(tau * p.data)
 
-    def iql_step(self, task_id: int, batch: Dict[str, np.ndarray]) -> Dict[str, float]:
+    def iql_step(self,
+                 task_id: int,
+                 batch: Dict[str, np.ndarray],
+                 segments: Optional[Dict[str, np.ndarray]] = None) -> Dict[str, float]:
         skill = self.skills[task_id]
         x = self._input_from_batch(batch)
         xn = self._input_next_from_batch(batch)
@@ -283,7 +374,25 @@ class SkillAgent:
             next_v = skill.value_target(xn) if self.config.specialist.iql_use_value_target else skill.value(xn)
             target_q = r + self.config.worker.gamma * (1.0 - d) * next_v
         q1, q2 = skill.critic(x, a)
-        critic_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
+        critic_td_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
+
+        lql_metrics: Dict[str, float] = {}
+        lambda_lb = float(self.config.specialist.lql_lambda_lb)
+        if (segments is not None
+                and bool(self.config.specialist.lql_enabled)
+                and lambda_lb > 0.0):
+            lb = self._lql_lb_loss(skill, segments)
+            critic_loss = critic_td_loss + lambda_lb * lb["penalty"]
+            lql_metrics = {
+                "iql_lb_loss": float(lb["penalty"].item()),
+                "iql_lb_active_frac": float(lb["active_frac"].item()),
+                "iql_lb_hinge_mean": float(lb["hinge_mean"].item()),
+                "iql_lb_pairs": float(lb["n_pairs"].item()),
+                "iql_lb_chain_len_mean": float(lb["chain_len_mean"]),
+            }
+        else:
+            critic_loss = critic_td_loss
+
         skill.critic_opt.zero_grad()
         critic_loss.backward()
         torch.nn.utils.clip_grad_norm_(skill.critic.parameters(), 1.0)
@@ -309,15 +418,55 @@ class SkillAgent:
             tau = float(self.config.specialist.iql_value_target_tau)
             self._soft_update(skill.value, skill.value_target, tau)
 
-        return {
+        out = {
             "iql_value_loss": float(value_loss.item()),
-            "iql_critic_loss": float(critic_loss.item()),
+            # iql_critic_loss stays the pure TD term for comparability with
+            # pre-LQL baselines; the optimized total is logged separately.
+            "iql_critic_loss": float(critic_td_loss.item()),
+            "iql_critic_total_loss": float(critic_loss.item()),
             "iql_actor_loss": float(actor_loss.item()),
             "iql_adv_mean": float(adv_pi.mean().item()),
             "iql_adv_std": float(adv_pi.std(unbiased=False).item()),
             "iql_weight_mean": float(exp_adv.mean().item()),
             "iql_weight_max": float(exp_adv.max().item()),
             "iql_target_q_mean": float(target_q.mean().item()),
+            "iql_q_mean": float(q_det.mean().item()),
+            "iql_v_mean": float(v.mean().item()),
+        }
+        out.update(lql_metrics)
+        return out
+
+    def _lql_lb_loss(self, skill: Skill, segments: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
+        """Evaluate the LQL lower-bound penalty on a sampled chain batch.
+
+        Network passes mirror the TD step: Q with gradient at every chain row,
+        V_target (detached) at every row's next state (== chain state s_{l}).
+        The hinge is applied to each twin head separately, matching how the TD
+        loss treats q1/q2, then averaged.
+        """
+        x_seg = self._input_from_batch(segments)        # (B, L, in_dim)
+        xn_seg = self._input_next_from_batch(segments)  # (B, L, in_dim)
+        a_seg = torch.from_numpy(segments["action"]).to(self.device).clamp(-0.999, 0.999)
+        r_seg = torch.from_numpy(segments["reward"]).to(self.device)
+        d_seg = torch.from_numpy(segments["done"]).to(self.device)
+        valid = torch.from_numpy(segments["valid"]).to(self.device)
+
+        q1_seg, q2_seg = skill.critic(x_seg, a_seg)
+        with torch.no_grad():
+            v_next = skill.value_target(xn_seg).squeeze(-1)
+
+        gamma = float(self.config.worker.gamma)
+        min_gap = int(self.config.specialist.lql_min_gap)
+        out1 = lql_lower_bound_penalty(
+            q1_seg.squeeze(-1), v_next, r_seg, d_seg, valid, gamma, min_gap)
+        out2 = lql_lower_bound_penalty(
+            q2_seg.squeeze(-1), v_next, r_seg, d_seg, valid, gamma, min_gap)
+        return {
+            "penalty": 0.5 * (out1["penalty"] + out2["penalty"]),
+            "active_frac": 0.5 * (out1["active_frac"] + out2["active_frac"]),
+            "hinge_mean": 0.5 * (out1["hinge_mean"] + out2["hinge_mean"]),
+            "n_pairs": out1["n_pairs"],
+            "chain_len_mean": float(valid.float().sum(dim=1).mean().item()),
         }
 
     def online_awac_step(self,

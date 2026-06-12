@@ -163,6 +163,10 @@ Request access from **[Meta](https://ai.meta.com/resources/models-and-libraries/
 # Download dinov3 repo whereever you want...
 git clone https://github.com/facebookresearch/dinov3.git
 
+cd dinov3
+mkdir dinov3_weights
+cd dinov3_weights
+
 wget -c -O dinov3_vits16plus_pretrain_lvd1689m.pth 'PASTE_THE_LINK_INSIDE'
 ```
 

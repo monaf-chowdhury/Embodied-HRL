@@ -34,7 +34,7 @@ _DATASET_ALIASES: Dict[str, List[str]] = {
     "d4rl/kitchen/partial-v2": ["D4RL/kitchen/partial-v2", "kitchen-partial-v0"],
 }
 
-_CACHE_VERSION = "v5_potential_phi_reward"
+_CACHE_VERSION = "v7_skill_done_chunk_znext"
 
 
 @dataclass
@@ -86,6 +86,9 @@ class DemoPretrainDataset:
         self.worker_indices_by_task: List[np.ndarray] = [
             np.zeros(0, dtype=np.int64) for _ in range(n_tasks)
         ]
+        # Lazily built map: row i -> row index of its chunk-aligned successor
+        # within the same demo trajectory/segment, or -1 (see ensure_chain_links).
+        self._chain_next: Optional[np.ndarray] = None
 
     def add_worker(self, z, p, tt, tc, tm, tid, a_flat, reward,
                    z_next, p_next, tc_next, done, seg_prog: float = 0.0):
@@ -135,6 +138,7 @@ class DemoPretrainDataset:
 
         self.worker_task_counts += other.worker_task_counts
         self.manager_task_counts += other.manager_task_counts
+        self._chain_next = None
 
     def n_worker(self) -> int:
         return len(self.w_z)
@@ -180,6 +184,135 @@ class DemoPretrainDataset:
             np.where(self.w_id == k)[0].astype(np.int64)
             for k in range(self.n_tasks)
         ]
+        self._chain_next = None
+
+    # ------------------------------------------------------------------
+    # LQL chunk-aligned trajectory chains
+    # ------------------------------------------------------------------
+
+    def ensure_chain_links(self) -> np.ndarray:
+        """Build (or return) the chunk-aligned successor map for LQL chains.
+
+        Row j is the chain successor of row i iff stepping the stored H-step
+        action chunk from row i's state lands exactly on row j's state. The
+        build loop emits one row per demo timestep in trajectory order, so the
+        only candidate is j = i + H; it is accepted only when
+
+          * both rows belong to the same task (Q functions are per-task), and
+          * row i does not terminate the episode, and
+          * row i's stored next proprio state is bitwise-identical to row j's
+            current proprio state (both come from the same float32 demo
+            observation array, so true successors match exactly).
+
+        The bitwise state-continuity check is the precise invariant the
+        discounted-return chaining needs (s'_i == s_j); it is stronger than
+        bookkeeping (episode, t) indices and works for previously built caches.
+        Rows with truncated tail chunks or at segment/episode boundaries fail
+        the check and simply terminate their chain (successor -1).
+        """
+        if self._chain_next is not None:
+            return self._chain_next
+        if not isinstance(self.w_p, np.ndarray):
+            raise RuntimeError("ensure_chain_links() requires a finalized dataset.")
+        n = self.n_worker()
+        H = int(self.H)
+        nxt = np.full(n, -1, dtype=np.int64)
+        if n > H:
+            i = np.arange(n - H, dtype=np.int64)
+            j = i + H
+            same_task = self.w_id[i] == self.w_id[j]
+            alive = self.w_done[i] < 0.5
+            contiguous = np.all(self.w_p_next[i] == self.w_p[j], axis=1)
+            ok = same_task & alive & contiguous
+            nxt[i[ok]] = j[ok]
+        self._chain_next = nxt
+        return nxt
+
+    def lql_chain_stats(self, task_id: int, min_gap: int = 2) -> Dict[str, float]:
+        """Chain-length statistics for one task (diagnostics/logging)."""
+        nxt = self.ensure_chain_links()
+        n = self.n_worker()
+        chain_len = np.ones(n, dtype=np.int64)
+        for i in range(n - 1, -1, -1):
+            if nxt[i] >= 0:
+                chain_len[i] = 1 + chain_len[nxt[i]]
+        indices = self.worker_indices_by_task[int(task_id)]
+        if len(indices) == 0:
+            return {"rows": 0.0, "linked_frac": 0.0,
+                    "pairable_frac": 0.0, "chain_len_mean": 0.0,
+                    "chain_len_max": 0.0}
+        lens = chain_len[indices]
+        return {
+            "rows": float(len(indices)),
+            "linked_frac": float(np.mean(nxt[indices] >= 0)),
+            # Fraction of anchors that admit at least one LB pair (l-k >= min_gap).
+            "pairable_frac": float(np.mean(lens >= max(1, int(min_gap)))),
+            "chain_len_mean": float(np.mean(lens)),
+            "chain_len_max": float(np.max(lens)),
+        }
+
+    def sample_lql_segments(self,
+                            task_id: int,
+                            batch_size: int,
+                            n_transitions: int,
+                            proprio_normalizer=None) -> Dict[str, np.ndarray]:
+        """Sample chunk-aligned same-task demo chains for the LQL penalty.
+
+        Anchors are drawn uniformly from the task's rows (same distribution as
+        sample_worker_task_batch), then extended forward through the chain
+        successor map for up to ``n_transitions`` chunk transitions. Chains are
+        variable-length: ``valid`` marks the prefix of real rows; shorter
+        chains are zero-padded. Column 0 (the anchor) is always valid, so it
+        doubles as a standard uniformly-sampled transition batch.
+
+        Returns arrays shaped (B, L, ...) plus ``valid`` (B, L) bool.
+        ``z_next``/``proprio_next``/``task_cur_next`` of chain row j describe
+        chain state s_{j+1} (bitwise-equal to row j+1's current state when
+        row j+1 is valid), so V(s_l) can be read uniformly from row l-1.
+        """
+        nxt = self.ensure_chain_links()
+        indices = self.worker_indices_by_task[int(task_id)]
+        if len(indices) == 0:
+            raise RuntimeError(f"No worker samples found for task id={task_id}.")
+        B = int(batch_size)
+        L = max(1, int(n_transitions))
+
+        rows = np.full((B, L), -1, dtype=np.int64)
+        rows[:, 0] = np.random.choice(indices, size=B, replace=True).astype(np.int64)
+        cur = rows[:, 0]
+        for col in range(1, L):
+            cur = np.where(cur >= 0, nxt[np.maximum(cur, 0)], -1)
+            rows[:, col] = cur
+
+        valid = rows >= 0
+        safe = np.maximum(rows, 0).reshape(-1)
+        vmask = valid.astype(np.float32)
+
+        def gather(arr: np.ndarray, dtype=np.float32) -> np.ndarray:
+            out = arr[safe].astype(dtype).reshape(B, L, -1)
+            return out * vmask[:, :, None]
+
+        p = gather(self.w_p)
+        p_next = gather(self.w_p_next)
+        if proprio_normalizer is not None:
+            p = proprio_normalizer(p) * vmask[:, :, None]
+            p_next = proprio_normalizer(p_next) * vmask[:, :, None]
+
+        return {
+            "z": gather(self.w_z),
+            "proprio": p.astype(np.float32),
+            "task_target": gather(self.w_tt),
+            "task_cur": gather(self.w_tc),
+            "task_mask": gather(self.w_tm),
+            "action": gather(self.w_a),
+            "reward": (self.w_r[safe].astype(np.float32).reshape(B, L) * vmask),
+            "done": (self.w_done[safe].astype(np.float32).reshape(B, L) * vmask),
+            "z_next": gather(self.w_z_next),
+            "proprio_next": p_next.astype(np.float32),
+            "task_cur_next": gather(self.w_tc_next),
+            "task_id": self.w_id[rows[:, 0]].copy(),
+            "valid": valid,
+        }
 
     def sample_worker_batch(self, batch_size: int,
                             proprio_normalizer=None,
@@ -766,10 +899,19 @@ def _build_dataset_from_episodes(agent,
             states=cur_states[valid],
             batch_size=config.warmup.render_batch_size,
         )
+        # A worker transition spans the full action chunk: its next state is
+        # next_states[chunk_end] (s_{t+H}), so the next VISUAL feature must be
+        # encoded from that same chunk-end state. Encoding next_states[valid]
+        # (s_{t+1}) here would pair a 1-step-ahead image with an H-step-ahead
+        # proprio in every TD/LQL bootstrap input.
+        chunk_next_states = np.stack([
+            next_states[min(t + agent.H_chunk - 1, seg_end[t])]
+            for t in valid
+        ], axis=0)
         z_next_valid = _encode_states(
             agent=agent,
             render_env=render_env,
-            states=next_states[valid],
+            states=chunk_next_states,
             batch_size=config.warmup.render_batch_size,
         )
 
@@ -790,6 +932,22 @@ def _build_dataset_from_episodes(agent,
                 end=chunk_end,
             )
 
+            # Skill-MDP termination: each per-task critic models "run task k
+            # until it completes", so completing the task is terminal for the
+            # skill even though the env episode continues into the next task.
+            # skill_done pairs the completion bonus and the terminal flag on
+            # exactly the same chunks (_chunk_reward awards the bonus iff the
+            # chunk covers this task's completion event). Without it, TD/LQL
+            # bootstrap into V(post-completion states) the value net never
+            # trains on, whose extrapolated value self-reinforces toward
+            # bonus/(1-gamma). Online replay already uses these semantics
+            # (done or chunk_success).
+            env_done = bool(
+                episode.terminations[min(chunk_end, len(episode.terminations) - 1)]
+                or episode.truncations[min(chunk_end, len(episode.truncations) - 1)]
+            )
+            skill_done = bool(np.any(completion_event_task[t:chunk_end + 1] == task_id))
+
             ds.add_worker(
                 z=z_valid[local_idx],
                 p=state_t,
@@ -802,8 +960,7 @@ def _build_dataset_from_episodes(agent,
                 z_next=z_next_valid[local_idx],
                 p_next=next_state,
                 tc_next=agent.spec.padded_state_slice_for(next_state, task_id),
-                done=float(bool(episode.terminations[min(chunk_end, len(episode.terminations) - 1)]
-                                or episode.truncations[min(chunk_end, len(episode.truncations) - 1)])),
+                done=float(env_done or skill_done),
                 seg_prog=float(
                     (t - seg_start[t]) / max(1, (seg_end[t] - seg_start[t]))
                 ),

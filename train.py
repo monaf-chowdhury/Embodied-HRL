@@ -175,7 +175,8 @@ def evaluate_single_task(agent: SkillAgent,
 def evaluate_scripted_chain(agent: SkillAgent,
                             config: Config,
                             n_episodes: int,
-                            record_dir: Optional[str] = None) -> Dict[str, float]:
+                            record_dir: Optional[str] = None,
+                            seed_base: int = 99_999) -> Dict[str, float]:
     np.random.seed(12345)
     torch.manual_seed(12345)
     if record_dir:
@@ -196,7 +197,7 @@ def evaluate_scripted_chain(agent: SkillAgent,
             terminate_on_tasks_completed=True,
         )
         try:
-            img, state = env.reset(seed=99_999 + ep)
+            img, state = env.reset(seed=int(seed_base) + ep)
             z = agent.encoder.encode_numpy(img).squeeze()
             completion = np.zeros(agent.n_tasks, dtype=np.float32)
             done = False
@@ -486,6 +487,10 @@ def print_banner(config: Config, log_path: str):
           f"value_target_tau={config.specialist.iql_value_target_tau}  "
           f"prefix_eval_interval={config.specialist.iql_eval_interval}  "
           f"prefix_eval_states={config.specialist.iql_eval_prefix_states}")
+    print(f"  LQL params     : enabled={config.specialist.lql_enabled}  "
+          f"lambda_lb={config.specialist.lql_lambda_lb}  "
+          f"n_transitions={config.specialist.lql_n_transitions}  "
+          f"min_gap={config.specialist.lql_min_gap}")
     print(f"  TD3+BC params  : alpha={config.specialist.td3bc_alpha}  tau={config.specialist.td3bc_tau}  "
           f"policy_noise={config.specialist.td3bc_policy_noise}  noise_clip={config.specialist.td3bc_noise_clip}  "
           f"policy_freq={config.specialist.td3bc_policy_freq}")
@@ -680,21 +685,42 @@ def train(config: Config):
                     os.path.join(config.training.log_dir, "videos", "scripted_chain_online_final")
                     if config.training.record_video else None
                 )
-                final_chain = evaluate_scripted_chain(
-                    agent,
-                    config,
-                    config.eval.n_eval_episodes,
-                    record_dir=final_chain_dir,
-                )
+                # Report on episode seeds DISJOINT from the model-selection
+                # stream, repeated to average out eval nondeterminism.
+                repeats = max(1, int(config.eval.final_eval_repeats))
+                repeat_evals: List[Dict[str, float]] = []
+                for rep in range(repeats):
+                    rep_eval = evaluate_scripted_chain(
+                        agent,
+                        config,
+                        config.eval.n_eval_episodes,
+                        record_dir=final_chain_dir if rep == 0 else None,
+                        seed_base=int(config.eval.final_eval_seed_base) + 1_000 * rep,
+                    )
+                    repeat_evals.append(rep_eval)
+                    print(f"  [Final eval repeat {rep + 1}/{repeats}] "
+                          f"full={rep_eval['eval/full_task_success_rate']*100:5.1f}%  "
+                          f"tasks={rep_eval['eval/mean_tasks_completed']:.2f}/{agent.n_tasks}")
+                final_chain = {
+                    key: float(np.mean([e[key] for e in repeat_evals]))
+                    for key, value in repeat_evals[0].items()
+                    if isinstance(value, (int, float))
+                }
+                final_chain["eval/termination_reasons"] = repeat_evals[0]["eval/termination_reasons"]
+                full_std = float(np.std([e["eval/full_task_success_rate"] for e in repeat_evals]))
                 for k, v in final_chain.items():
                     if isinstance(v, (int, float)) and np.isfinite(float(v)):
                         writer.add_scalar(f"final_after_online/{k}", float(v), int(online_stats["online/env_steps"]))
+                writer.add_scalar("final_after_online/eval/full_task_success_std", full_std,
+                                  int(online_stats["online/env_steps"]))
                 print(f"  Any-task success   : {final_chain['eval/any_task_success_rate']*100:5.1f}%")
-                print(f"  Full-task success  : {final_chain['eval/full_task_success_rate']*100:5.1f}%")
+                print(f"  Full-task success  : {final_chain['eval/full_task_success_rate']*100:5.1f}%"
+                      f"  (+/- {full_std*100:.1f}pp over {repeats} repeats, report seeds "
+                      f"{config.eval.final_eval_seed_base}+)")
                 print(f"  Mean tasks done    : {final_chain['eval/mean_tasks_completed']:.2f}/{agent.n_tasks}")
                 print(f"  Chosen-task SR     : {final_chain['eval/mean_chosen_task_success']*100:5.1f}%")
                 print(f"  Env-horizon fail   : {final_chain['eval/final_env_done_failure_rate']*100:5.1f}%")
-                print("  Per-task chain completion:")
+                print("  Per-task chain completion (mean over repeats):")
                 for name in agent.tasks:
                     safe = name.replace(" ", "_")
                     rate = final_chain[f"eval/task/{safe}_completion_rate"] * 100.0
@@ -751,6 +777,11 @@ def parse_args() -> Config:
     parser.add_argument("--iql_normalize_advantage", "--iql_adv_normalize", action="store_true")
     parser.add_argument("--iql_eval_interval", type=int, default=None)
     parser.add_argument("--iql_eval_prefix_states", type=int, default=None)
+    parser.add_argument("--no_lql", action="store_true",
+                        help="Disable the LQL lower-bound critic penalty (A/B baseline).")
+    parser.add_argument("--lql_lambda_lb", type=float, default=None)
+    parser.add_argument("--lql_n_transitions", type=int, default=None)
+    parser.add_argument("--lql_min_gap", type=int, default=None)
     parser.add_argument("--td3bc_alpha", type=float, default=None)
     parser.add_argument("--awr_temperature", type=float, default=None)
     parser.add_argument("--awr_max_weight", type=float, default=None)
@@ -760,6 +791,7 @@ def parse_args() -> Config:
     parser.add_argument("--log_interval", type=int, default=None)
     parser.add_argument("--single_task_eval_episodes", type=int, default=None)
     parser.add_argument("--chain_eval_episodes", type=int, default=None)
+    parser.add_argument("--final_eval_repeats", type=int, default=None)
     parser.add_argument("--controller_order_mode", type=str, default=None, choices=["given_order", "stage_a_rank"])
     parser.add_argument("--prefix_eval_only", action="store_true")
     parser.add_argument("--prefix_target_task", type=str, default="")
@@ -861,6 +893,14 @@ def parse_args() -> Config:
         cfg.specialist.iql_eval_interval = args.iql_eval_interval
     if args.iql_eval_prefix_states is not None:
         cfg.specialist.iql_eval_prefix_states = args.iql_eval_prefix_states
+    if args.no_lql:
+        cfg.specialist.lql_enabled = False
+    if args.lql_lambda_lb is not None:
+        cfg.specialist.lql_lambda_lb = args.lql_lambda_lb
+    if args.lql_n_transitions is not None:
+        cfg.specialist.lql_n_transitions = args.lql_n_transitions
+    if args.lql_min_gap is not None:
+        cfg.specialist.lql_min_gap = args.lql_min_gap
     if args.td3bc_alpha is not None:
         cfg.specialist.td3bc_alpha = args.td3bc_alpha
     if args.awr_temperature is not None:
@@ -879,6 +919,8 @@ def parse_args() -> Config:
         cfg.eval.n_single_task_episodes = args.single_task_eval_episodes
     if args.chain_eval_episodes is not None:
         cfg.eval.n_eval_episodes = args.chain_eval_episodes
+    if args.final_eval_repeats is not None:
+        cfg.eval.final_eval_repeats = args.final_eval_repeats
     if args.controller_order_mode is not None:
         cfg.training.controller_order_mode = args.controller_order_mode
     if args.prefix_eval_only:

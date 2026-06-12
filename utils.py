@@ -20,12 +20,36 @@ All code elsewhere in the repo should use `task_error(...)`,
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import numpy as np
 import cv2
 import torch
 from typing import Dict, List, Tuple, Optional
 from transformers import CLIPTokenizer, CLIPTextModel
+
+
+@contextlib.contextmanager
+def preserve_rng_state():
+    """Snapshot and restore global numpy/torch RNG state.
+
+    Evaluation functions reseed the GLOBAL RNGs (np.random.seed(12345) /
+    torch.manual_seed(12345)) for reproducible rollouts. When such an eval
+    runs mid-training, that reset would otherwise leak into the training
+    stream: exploration noise, task selection, and replay sampling would
+    restart from an identical sequence after every eval. Wrap eval calls in
+    this context to keep training stochasticity independent of evaluation.
+    """
+    np_state = np.random.get_state()
+    torch_state = torch.get_rng_state()
+    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    try:
+        yield
+    finally:
+        np.random.set_state(np_state)
+        torch.set_rng_state(torch_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
 
 # =============================================================================
 # Raw benchmark indices and goals — copied from Franka Kitchen relay-policy
