@@ -21,6 +21,7 @@ All code elsewhere in the repo should use `task_error(...)`,
 from __future__ import annotations
 
 import contextlib
+import functools
 import os
 import numpy as np
 import cv2
@@ -50,6 +51,23 @@ def preserve_rng_state():
         torch.set_rng_state(torch_state)
         if cuda_states is not None:
             torch.cuda.set_rng_state_all(cuda_states)
+
+
+def rng_isolated(fn):
+    """Decorator: run `fn` with the global RNG snapshotted and restored.
+
+    Every evaluation function seeds the global RNGs internally (for a
+    reproducible, comparable rollout — including the flow policy's latent
+    samples). Without isolation that seed leaks into the surrounding training /
+    online stream, so e.g. online exploration after an eval would restart from
+    the eval seed (12345) regardless of --seed. Decorating each evaluator keeps
+    eval reproducible *and* leak-proof, independent of the caller.
+    """
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with preserve_rng_state():
+            return fn(*args, **kwargs)
+    return wrapper
 
 # =============================================================================
 # Raw benchmark indices and goals — copied from Franka Kitchen relay-policy
@@ -259,14 +277,6 @@ class TaskSpec:
     @property
     def text_source(self) -> str:
         return self._text_source
-
-
-def build_task_state_flat(spec: TaskSpec, full_state: np.ndarray) -> np.ndarray:
-    """Flatten all padded task-state slices for logging/legacy cached fields."""
-    return np.concatenate(
-        [spec.padded_state_slice_for(full_state, k) for k in range(spec.n_tasks)],
-        axis=0,
-    ).astype(np.float32)
 
 
 # =============================================================================

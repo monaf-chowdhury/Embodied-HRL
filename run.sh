@@ -4,36 +4,30 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  bash run.sh --offline_algo {bc|bc_iql|td3bc|awr|bet} [extra train.py args]
+  bash run.sh --offline_algo {flow_bc|qc_fql} [extra train.py args]
+
+Algorithms:
+  flow_bc  Flow-matching behavior cloning only (no critic). Staged experiment 1:
+           "does an expressive policy class alone beat the old Gaussian BC?"
+  qc_fql   Q-chunking + Flow Q-Learning: chunked twin critic + flow BC +
+           one-step Q-maximizing actor. Staged experiment 2.
 
 Examples:
-  bash run.sh --offline_algo bc
-  bash run.sh --offline_algo bc_iql
-  bash run.sh --offline_algo td3bc --td3bc_alpha 2.0
-  bash run.sh --offline_algo awr --awr_temperature 0.5
-  bash run.sh --offline_algo bet --bet_num_bins 128
-  bash run.sh --offline_algo bc_iql --rebuild_demo_cache
-  bash run.sh --offline_algo bc_iql --chain_eval_episodes 100 --no_video
-  bash run.sh --offline_algo bc_iql --online_finetune --online_steps 200000
-  bash run.sh --offline_algo bc_iql --online_finetune --online_mode skill_repair \
-    --online_demo_fraction_start 0.85 --online_demo_fraction_end 0.75 \
-    --online_demo_fraction_decay_steps 50000 \
-    --online_bc_anchor_weight 10 --online_bc_anchor_weight_end 5 \
-    --online_bc_anchor_decay_steps 50000 \
-    --online_freeze_success_threshold 0.85 \
-    --online_next_skill_collection_threshold 0.60
+  bash run.sh --offline_algo flow_bc --demo_datasets franka-partial
+  bash run.sh --offline_algo qc_fql  --demo_datasets franka-partial
+  bash run.sh --offline_algo qc_fql  --fql_alpha 3.0 --best_of_n 4
+  bash run.sh --offline_algo qc_fql  --online_finetune --online_steps 200000
+  bash run.sh --offline_algo qc_fql  --rebuild_demo_cache
+  bash run.sh --offline_algo qc_fql  --chain_eval_episodes 100 --no_video
 
 Notes:
-  - Common default: DINOv2 + action chunk 4 + all four tasks.
-  - Extra args are passed directly to train.py.
-  - Rebuild cache when encoder, action chunk, tasks, image size, or reward function changes.
-    The reward uses potential-based shaping (phi = exp(-(e/eps)/sigma)); changing sigma
-    requires --rebuild_demo_cache.
-  - Online fine-tuning defaults to reliability-gated skill repair:
-      freeze solved skills, collect weak-skill attempts from prefix-induced starts,
-      collect the next skill after successful frontier attempts,
-      update actors from demos plus successful online attempts,
-      and use Huber critic loss to avoid rare online-target explosions.
+  - Defaults: DINOv3 + action chunk 4 + all four tasks.
+  - Extra args are passed straight through to train.py.
+  - Rebuild the cache (--rebuild_demo_cache) only when the encoder, action chunk,
+    tasks, image size, or reward weights (progress/completion/action_cost/sigma)
+    change. The offline algorithm choice alone never requires a rebuild.
+  - Validate on partial/mixed data: on near-expert "complete" data QC-FQL ~ flow
+    BC ~ BC, so the headroom only shows up where the data is suboptimal.
 EOF
 }
 
@@ -64,28 +58,26 @@ if [[ -z "$OFFLINE_ALGO" ]]; then
 fi
 
 case "$OFFLINE_ALGO" in
-  bc|bc_iql|iql|td3bc|td3_bc|awr|bet|behavior_transformer|sequence_bc)
+  flow_bc|qc_fql)
     ;;
   *)
-    echo "ERROR: unknown --offline_algo '$OFFLINE_ALGO'"
+    echo "ERROR: unknown --offline_algo '$OFFLINE_ALGO' (use flow_bc or qc_fql)"
     usage
     exit 1
     ;;
 esac
 
-SAFE_ALGO="${OFFLINE_ALGO//-/_}"
-SAFE_ALGO="${SAFE_ALGO// /_}"
-LOG_DIR="logs/ablations/${SAFE_ALGO}_dinov2_chunk4"
+LOG_DIR="logs/${OFFLINE_ALGO}_dinov3_chunk4"
 
 COMMON_ARGS=(
   --offline_algo "$OFFLINE_ALGO"
   --seed 42
   --device cuda
-  --encoder dinov2
+  --encoder dinov3
   --action_chunk 4
   --hidden_dim 256
   --n_layers 3
-  --bc_steps 30000
+  --flow_bc_steps 30000
   --offline_rl_steps 100000
   --batch_size 256
   --single_task_eval_episodes 100
@@ -96,19 +88,6 @@ COMMON_ARGS=(
   --tasks microwave kettle "light switch" "slide cabinet"
 )
 
-ALGO_ARGS=()
-case "$OFFLINE_ALGO" in
-  td3bc|td3_bc)
-    ALGO_ARGS+=(--td3bc_alpha 2.5)
-    ;;
-  awr)
-    ALGO_ARGS+=(--awr_temperature 1.0 --awr_max_weight 20)
-    ;;
-  bet|behavior_transformer|sequence_bc)
-    ALGO_ARGS+=(--bet_steps 80000 --bet_num_bins 64 --bet_offset_weight 5.0)
-    ;;
-esac
-
 echo "Running offline algorithm: $OFFLINE_ALGO"
 echo "Log dir: $LOG_DIR"
-python train.py "${COMMON_ARGS[@]}" "${ALGO_ARGS[@]}" "${EXTRA_ARGS[@]}"
+python train.py "${COMMON_ARGS[@]}" "${EXTRA_ARGS[@]}"

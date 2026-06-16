@@ -13,13 +13,12 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 
 from config import Config
 from env_wrapper import FrankaKitchenImageWrapper
-from utils import build_task_state_flat
 
 
 _DATASET_ALIASES: Dict[str, List[str]] = {
@@ -34,7 +33,7 @@ _DATASET_ALIASES: Dict[str, List[str]] = {
     "d4rl/kitchen/partial-v2": ["D4RL/kitchen/partial-v2", "kitchen-partial-v0"],
 }
 
-_CACHE_VERSION = "v7_skill_done_chunk_znext"
+_CACHE_VERSION = "v9_qcfql_discounted_chunk_return"
 
 
 @dataclass
@@ -70,28 +69,18 @@ class DemoPretrainDataset:
         self.w_a: List[np.ndarray] = []
         self.w_r: List[float] = []
         self.w_done: List[float] = []
+        self.w_nstep: List[int] = []
         self.w_z_next: List[np.ndarray] = []
         self.w_p_next: List[np.ndarray] = []
         self.w_tc_next: List[np.ndarray] = []
-        self.w_seg_prog: List[float] = []
-
-        self.m_z: List[np.ndarray] = []
-        self.m_p: List[np.ndarray] = []
-        self.m_ts: List[np.ndarray] = []
-        self.m_c: List[np.ndarray] = []
-        self.m_label: List[int] = []
 
         self.worker_task_counts = np.zeros(n_tasks, dtype=np.int64)
-        self.manager_task_counts = np.zeros(n_tasks, dtype=np.int64)
         self.worker_indices_by_task: List[np.ndarray] = [
             np.zeros(0, dtype=np.int64) for _ in range(n_tasks)
         ]
-        # Lazily built map: row i -> row index of its chunk-aligned successor
-        # within the same demo trajectory/segment, or -1 (see ensure_chain_links).
-        self._chain_next: Optional[np.ndarray] = None
 
     def add_worker(self, z, p, tt, tc, tm, tid, a_flat, reward,
-                   z_next, p_next, tc_next, done, seg_prog: float = 0.0):
+                   z_next, p_next, tc_next, done, nstep: int = 1):
         self.w_z.append(np.asarray(z, dtype=np.float16))
         self.w_p.append(np.asarray(p, dtype=np.float32))
         self.w_tt.append(np.asarray(tt, dtype=np.float32))
@@ -104,16 +93,8 @@ class DemoPretrainDataset:
         self.w_p_next.append(np.asarray(p_next, dtype=np.float32))
         self.w_tc_next.append(np.asarray(tc_next, dtype=np.float32))
         self.w_done.append(float(done))
-        self.w_seg_prog.append(float(seg_prog))
+        self.w_nstep.append(int(nstep))   # env steps in this chunk (for gamma^nstep backup)
         self.worker_task_counts[int(tid)] += 1
-
-    def add_manager(self, z, p, ts, c, label):
-        self.m_z.append(np.asarray(z, dtype=np.float16))
-        self.m_p.append(np.asarray(p, dtype=np.float32))
-        self.m_ts.append(np.asarray(ts, dtype=np.float32))
-        self.m_c.append(np.asarray(c, dtype=np.float32))
-        self.m_label.append(int(label))
-        self.manager_task_counts[int(label)] += 1
 
     def extend(self, other: "DemoPretrainDataset"):
         self.w_z.extend(other.w_z)
@@ -125,26 +106,15 @@ class DemoPretrainDataset:
         self.w_a.extend(other.w_a)
         self.w_r.extend(other.w_r)
         self.w_done.extend(other.w_done)
+        self.w_nstep.extend(other.w_nstep)
         self.w_z_next.extend(other.w_z_next)
         self.w_p_next.extend(other.w_p_next)
         self.w_tc_next.extend(other.w_tc_next)
-        self.w_seg_prog.extend(other.w_seg_prog)
-
-        self.m_z.extend(other.m_z)
-        self.m_p.extend(other.m_p)
-        self.m_ts.extend(other.m_ts)
-        self.m_c.extend(other.m_c)
-        self.m_label.extend(other.m_label)
 
         self.worker_task_counts += other.worker_task_counts
-        self.manager_task_counts += other.manager_task_counts
-        self._chain_next = None
 
     def n_worker(self) -> int:
         return len(self.w_z)
-
-    def n_manager(self) -> int:
-        return len(self.m_z)
 
     def finalize(self):
         self.w_z = (np.stack(self.w_z).astype(np.float16)
@@ -162,192 +132,19 @@ class DemoPretrainDataset:
                     if self.w_a else np.zeros((0, self.action_dim * self.H), dtype=np.float32))
         self.w_r = np.asarray(self.w_r, dtype=np.float32)
         self.w_done = np.asarray(self.w_done, dtype=np.float32)
+        self.w_nstep = np.asarray(self.w_nstep, dtype=np.float32)
         self.w_z_next = (np.stack(self.w_z_next).astype(np.float16)
                          if self.w_z_next else np.zeros((0, self.z_dim), dtype=np.float16))
         self.w_p_next = (np.stack(self.w_p_next).astype(np.float32)
                          if self.w_p_next else np.zeros((0, self.proprio_dim), dtype=np.float32))
         self.w_tc_next = (np.stack(self.w_tc_next).astype(np.float32)
                           if self.w_tc_next else np.zeros((0, self.max_goal_dim), dtype=np.float32))
-        self.w_seg_prog = np.asarray(self.w_seg_prog, dtype=np.float32)
 
-        task_state_dim = self.n_tasks * self.max_goal_dim
-        self.m_z = (np.stack(self.m_z).astype(np.float16)
-                    if self.m_z else np.zeros((0, self.z_dim), dtype=np.float16))
-        self.m_p = (np.stack(self.m_p).astype(np.float32)
-                    if self.m_p else np.zeros((0, self.proprio_dim), dtype=np.float32))
-        self.m_ts = (np.stack(self.m_ts).astype(np.float32)
-                     if self.m_ts else np.zeros((0, task_state_dim), dtype=np.float32))
-        self.m_c = (np.stack(self.m_c).astype(np.float32)
-                    if self.m_c else np.zeros((0, self.n_tasks), dtype=np.float32))
-        self.m_label = np.asarray(self.m_label, dtype=np.int64)
         self.worker_indices_by_task = [
             np.where(self.w_id == k)[0].astype(np.int64)
             for k in range(self.n_tasks)
         ]
-        self._chain_next = None
 
-    # ------------------------------------------------------------------
-    # LQL chunk-aligned trajectory chains
-    # ------------------------------------------------------------------
-
-    def ensure_chain_links(self) -> np.ndarray:
-        """Build (or return) the chunk-aligned successor map for LQL chains.
-
-        Row j is the chain successor of row i iff stepping the stored H-step
-        action chunk from row i's state lands exactly on row j's state. The
-        build loop emits one row per demo timestep in trajectory order, so the
-        only candidate is j = i + H; it is accepted only when
-
-          * both rows belong to the same task (Q functions are per-task), and
-          * row i does not terminate the episode, and
-          * row i's stored next proprio state is bitwise-identical to row j's
-            current proprio state (both come from the same float32 demo
-            observation array, so true successors match exactly).
-
-        The bitwise state-continuity check is the precise invariant the
-        discounted-return chaining needs (s'_i == s_j); it is stronger than
-        bookkeeping (episode, t) indices and works for previously built caches.
-        Rows with truncated tail chunks or at segment/episode boundaries fail
-        the check and simply terminate their chain (successor -1).
-        """
-        if self._chain_next is not None:
-            return self._chain_next
-        if not isinstance(self.w_p, np.ndarray):
-            raise RuntimeError("ensure_chain_links() requires a finalized dataset.")
-        n = self.n_worker()
-        H = int(self.H)
-        nxt = np.full(n, -1, dtype=np.int64)
-        if n > H:
-            i = np.arange(n - H, dtype=np.int64)
-            j = i + H
-            same_task = self.w_id[i] == self.w_id[j]
-            alive = self.w_done[i] < 0.5
-            contiguous = np.all(self.w_p_next[i] == self.w_p[j], axis=1)
-            ok = same_task & alive & contiguous
-            nxt[i[ok]] = j[ok]
-        self._chain_next = nxt
-        return nxt
-
-    def lql_chain_stats(self, task_id: int, min_gap: int = 2) -> Dict[str, float]:
-        """Chain-length statistics for one task (diagnostics/logging)."""
-        nxt = self.ensure_chain_links()
-        n = self.n_worker()
-        chain_len = np.ones(n, dtype=np.int64)
-        for i in range(n - 1, -1, -1):
-            if nxt[i] >= 0:
-                chain_len[i] = 1 + chain_len[nxt[i]]
-        indices = self.worker_indices_by_task[int(task_id)]
-        if len(indices) == 0:
-            return {"rows": 0.0, "linked_frac": 0.0,
-                    "pairable_frac": 0.0, "chain_len_mean": 0.0,
-                    "chain_len_max": 0.0}
-        lens = chain_len[indices]
-        return {
-            "rows": float(len(indices)),
-            "linked_frac": float(np.mean(nxt[indices] >= 0)),
-            # Fraction of anchors that admit at least one LB pair (l-k >= min_gap).
-            "pairable_frac": float(np.mean(lens >= max(1, int(min_gap)))),
-            "chain_len_mean": float(np.mean(lens)),
-            "chain_len_max": float(np.max(lens)),
-        }
-
-    def sample_lql_segments(self,
-                            task_id: int,
-                            batch_size: int,
-                            n_transitions: int,
-                            proprio_normalizer=None) -> Dict[str, np.ndarray]:
-        """Sample chunk-aligned same-task demo chains for the LQL penalty.
-
-        Anchors are drawn uniformly from the task's rows (same distribution as
-        sample_worker_task_batch), then extended forward through the chain
-        successor map for up to ``n_transitions`` chunk transitions. Chains are
-        variable-length: ``valid`` marks the prefix of real rows; shorter
-        chains are zero-padded. Column 0 (the anchor) is always valid, so it
-        doubles as a standard uniformly-sampled transition batch.
-
-        Returns arrays shaped (B, L, ...) plus ``valid`` (B, L) bool.
-        ``z_next``/``proprio_next``/``task_cur_next`` of chain row j describe
-        chain state s_{j+1} (bitwise-equal to row j+1's current state when
-        row j+1 is valid), so V(s_l) can be read uniformly from row l-1.
-        """
-        nxt = self.ensure_chain_links()
-        indices = self.worker_indices_by_task[int(task_id)]
-        if len(indices) == 0:
-            raise RuntimeError(f"No worker samples found for task id={task_id}.")
-        B = int(batch_size)
-        L = max(1, int(n_transitions))
-
-        rows = np.full((B, L), -1, dtype=np.int64)
-        rows[:, 0] = np.random.choice(indices, size=B, replace=True).astype(np.int64)
-        cur = rows[:, 0]
-        for col in range(1, L):
-            cur = np.where(cur >= 0, nxt[np.maximum(cur, 0)], -1)
-            rows[:, col] = cur
-
-        valid = rows >= 0
-        safe = np.maximum(rows, 0).reshape(-1)
-        vmask = valid.astype(np.float32)
-
-        def gather(arr: np.ndarray, dtype=np.float32) -> np.ndarray:
-            out = arr[safe].astype(dtype).reshape(B, L, -1)
-            return out * vmask[:, :, None]
-
-        p = gather(self.w_p)
-        p_next = gather(self.w_p_next)
-        if proprio_normalizer is not None:
-            p = proprio_normalizer(p) * vmask[:, :, None]
-            p_next = proprio_normalizer(p_next) * vmask[:, :, None]
-
-        return {
-            "z": gather(self.w_z),
-            "proprio": p.astype(np.float32),
-            "task_target": gather(self.w_tt),
-            "task_cur": gather(self.w_tc),
-            "task_mask": gather(self.w_tm),
-            "action": gather(self.w_a),
-            "reward": (self.w_r[safe].astype(np.float32).reshape(B, L) * vmask),
-            "done": (self.w_done[safe].astype(np.float32).reshape(B, L) * vmask),
-            "z_next": gather(self.w_z_next),
-            "proprio_next": p_next.astype(np.float32),
-            "task_cur_next": gather(self.w_tc_next),
-            "task_id": self.w_id[rows[:, 0]].copy(),
-            "valid": valid,
-        }
-
-    def sample_worker_batch(self, batch_size: int,
-                            proprio_normalizer=None,
-                            balance_by_task: bool = True,
-                            focus_task_id: Optional[int] = None,
-                            focus_task_weight: float = 1.0,
-                            focus_task_tail_start: float = 0.5,
-                            focus_task_tail_weight: float = 1.0) -> Dict[str, np.ndarray]:
-        idx = self._sample_worker_indices(
-            batch_size,
-            balance_by_task=balance_by_task,
-            focus_task_id=focus_task_id,
-            focus_task_weight=focus_task_weight,
-            focus_task_tail_start=focus_task_tail_start,
-            focus_task_tail_weight=focus_task_tail_weight,
-        )
-        p = self.w_p[idx]
-        p_next = self.w_p_next[idx]
-        if proprio_normalizer is not None:
-            p = np.stack([proprio_normalizer(row) for row in p], axis=0)
-            p_next = np.stack([proprio_normalizer(row) for row in p_next], axis=0)
-        return {
-            "z": self.w_z[idx].astype(np.float32),
-            "proprio": p.astype(np.float32),
-            "task_target": self.w_tt[idx],
-            "task_cur": self.w_tc[idx],
-            "task_mask": self.w_tm[idx],
-            "task_id": self.w_id[idx],
-            "action": self.w_a[idx],
-            "reward": self.w_r[idx],
-            "z_next": self.w_z_next[idx].astype(np.float32),
-            "proprio_next": p_next.astype(np.float32),
-            "task_cur_next": self.w_tc_next[idx].astype(np.float32),
-            "done": self.w_done[idx],
-        }
 
     def sample_worker_task_batch(self,
                                  task_id: int,
@@ -358,103 +155,6 @@ class DemoPretrainDataset:
             raise RuntimeError(f"No worker samples found for task id={task_id}.")
         idx = np.random.choice(indices, size=batch_size, replace=True).astype(np.int64)
         return self._worker_batch_from_indices(idx, proprio_normalizer=proprio_normalizer)
-
-    def _sample_worker_indices(self,
-                               batch_size: int,
-                               balance_by_task: bool,
-                               focus_task_id: Optional[int] = None,
-                               focus_task_weight: float = 1.0,
-                               focus_task_tail_start: float = 0.5,
-                               focus_task_tail_weight: float = 1.0) -> np.ndarray:
-        if (not balance_by_task) or self.n_worker() == 0:
-            if self.n_worker() == 0:
-                return np.zeros((0,), dtype=np.int64)
-            all_idx = np.arange(self.n_worker(), dtype=np.int64)
-            return self._weighted_choice(
-                all_idx,
-                size=batch_size,
-                focus_task_id=focus_task_id,
-                focus_task_weight=focus_task_weight,
-                focus_task_tail_start=focus_task_tail_start,
-                focus_task_tail_weight=focus_task_tail_weight,
-            )
-
-        available = [idx for idx in self.worker_indices_by_task if len(idx) > 0]
-        if not available:
-            return np.random.randint(0, self.n_worker(), size=batch_size)
-
-        available_task_ids = [int(self.w_id[int(indices[0])]) for indices in available]
-        task_weights = np.ones(len(available), dtype=np.float64)
-        if focus_task_id is not None and focus_task_weight > 1.0:
-            for slot, task_id in enumerate(available_task_ids):
-                if task_id == int(focus_task_id):
-                    task_weights[slot] = float(focus_task_weight)
-        task_weights = task_weights / np.sum(task_weights)
-        expected = task_weights * batch_size
-        counts = np.floor(expected).astype(np.int64)
-        remainder = int(batch_size - counts.sum())
-        if remainder > 0:
-            frac = expected - counts.astype(np.float64)
-            order = np.argsort(-frac)
-            for slot in order[:remainder]:
-                counts[slot] += 1
-
-        sampled = []
-        for task_slot, indices in enumerate(available):
-            n_take = int(counts[task_slot])
-            if n_take <= 0:
-                continue
-            chosen = self._weighted_choice(
-                indices,
-                size=n_take,
-                focus_task_id=focus_task_id,
-                focus_task_weight=focus_task_weight,
-                focus_task_tail_start=focus_task_tail_start,
-                focus_task_tail_weight=focus_task_tail_weight,
-            )
-            sampled.append(chosen.astype(np.int64))
-
-        if not sampled:
-            return np.random.randint(0, self.n_worker(), size=batch_size)
-
-        idx = np.concatenate(sampled, axis=0)
-        np.random.shuffle(idx)
-        return idx
-
-    def _weighted_choice(self,
-                         indices: np.ndarray,
-                         size: int,
-                         focus_task_id: Optional[int],
-                         focus_task_weight: float,
-                         focus_task_tail_start: float,
-                         focus_task_tail_weight: float) -> np.ndarray:
-        if len(indices) == 0:
-            return np.zeros((0,), dtype=np.int64)
-        weights = np.ones(len(indices), dtype=np.float64)
-        if focus_task_id is not None and (focus_task_weight > 1.0 or focus_task_tail_weight > 1.0):
-            idx_task_ids = self.w_id[indices]
-            mask = (idx_task_ids == int(focus_task_id))
-            if np.any(mask):
-                sub_weights = np.ones(np.sum(mask), dtype=np.float64)
-                if focus_task_weight > 1.0:
-                    sub_weights *= float(focus_task_weight)
-                if focus_task_tail_weight > 1.0:
-                    prog = self.w_seg_prog[indices[mask]]
-                    tail_mask = prog >= float(focus_task_tail_start)
-                    sub_weights[tail_mask] *= float(focus_task_tail_weight)
-                weights[mask] = sub_weights
-        weights = weights / np.sum(weights)
-        return np.random.choice(indices, size=size, replace=True, p=weights)
-
-    def sample_manager_batch(self, batch_size: int) -> Dict[str, np.ndarray]:
-        idx = np.random.randint(0, self.n_manager(), size=batch_size)
-        return {
-            "z": self.m_z[idx].astype(np.float32),
-            "proprio": self.m_p[idx],
-            "task_state": self.m_ts[idx],
-            "completion": self.m_c[idx],
-            "label": self.m_label[idx],
-        }
 
     def _worker_batch_from_indices(self,
                                    idx: np.ndarray,
@@ -477,37 +177,7 @@ class DemoPretrainDataset:
             "proprio_next": p_next.astype(np.float32),
             "task_cur_next": self.w_tc_next[idx].astype(np.float32),
             "done": self.w_done[idx],
-        }
-
-    def sample_worker_focus_batch(self,
-                                  task_id: int,
-                                  batch_size: int,
-                                  proprio_normalizer=None,
-                                  min_seg_prog: float = 0.75) -> Dict[str, np.ndarray]:
-        task_indices = self.worker_indices_by_task[int(task_id)]
-        if len(task_indices) == 0:
-            raise RuntimeError(f"No worker samples found for focus task id={task_id}.")
-        tail_indices = task_indices[self.w_seg_prog[task_indices] >= float(min_seg_prog)]
-        use_indices = tail_indices if len(tail_indices) > 0 else task_indices
-        idx = np.random.choice(use_indices, size=batch_size, replace=True).astype(np.int64)
-        p = self.w_p[idx]
-        p_next = self.w_p_next[idx]
-        if proprio_normalizer is not None:
-            p = np.stack([proprio_normalizer(row) for row in p], axis=0)
-            p_next = np.stack([proprio_normalizer(row) for row in p_next], axis=0)
-        return {
-            "z": self.w_z[idx].astype(np.float32),
-            "proprio": p.astype(np.float32),
-            "task_target": self.w_tt[idx],
-            "task_cur": self.w_tc[idx],
-            "task_mask": self.w_tm[idx],
-            "task_id": self.w_id[idx],
-            "action": self.w_a[idx],
-            "reward": self.w_r[idx],
-            "z_next": self.w_z_next[idx].astype(np.float32),
-            "proprio_next": p_next.astype(np.float32),
-            "task_cur_next": self.w_tc_next[idx].astype(np.float32),
-            "done": self.w_done[idx],
+            "nstep": self.w_nstep[idx],
         }
 
 
@@ -556,7 +226,6 @@ def build_or_load_demo_dataset(agent,
                 part = _load_cached_dataset(cache_path, merged)
                 part_stats = {
                     "worker_samples": float(part.n_worker()),
-                    "manager_samples": float(part.n_manager()),
                     "cache_hit": 1.0,
                 }
                 if verbose:
@@ -598,14 +267,12 @@ def build_or_load_demo_dataset(agent,
 
     merged.finalize()
     stats["demo_worker_samples"] = float(merged.n_worker())
-    stats["demo_manager_samples"] = float(merged.n_manager())
     if total_replay_weight > 0:
         stats["replay_mean_state_l2"] = float(replay_mean_accum / total_replay_weight)
         stats["replay_max_state_l2"] = float(replay_max)
     for k, task_name in enumerate(agent.tasks):
         safe_task = _safe_name(task_name)
         stats[f"worker_labels/{safe_task}"] = float(merged.worker_task_counts[k])
-        stats[f"manager_labels/{safe_task}"] = float(merged.manager_task_counts[k])
     return merged, stats
 
 
@@ -892,7 +559,7 @@ def _build_dataset_from_episodes(agent,
         if replay_errors.size > 0:
             replay_state_errors.append(replay_errors)
 
-        seg_start, seg_end = _segment_bounds(labels)
+        _, seg_end = _segment_bounds(labels)
         z_valid = _encode_states(
             agent=agent,
             render_env=render_env,
@@ -903,7 +570,7 @@ def _build_dataset_from_episodes(agent,
         # next_states[chunk_end] (s_{t+H}), so the next VISUAL feature must be
         # encoded from that same chunk-end state. Encoding next_states[valid]
         # (s_{t+1}) here would pair a 1-step-ahead image with an H-step-ahead
-        # proprio in every TD/LQL bootstrap input.
+        # proprio in every chunked TD bootstrap input.
         chunk_next_states = np.stack([
             next_states[min(t + agent.H_chunk - 1, seg_end[t])]
             for t in valid
@@ -921,7 +588,7 @@ def _build_dataset_from_episodes(agent,
             action_flat = _chunk_actions(episode.actions, t, chunk_end, agent.H_chunk)
             state_t = cur_states[t]
             next_state = next_states[chunk_end]
-            reward = _chunk_reward(
+            reward, nstep = _chunk_reward(
                 agent=agent,
                 states=cur_states,
                 next_states=next_states,
@@ -937,11 +604,11 @@ def _build_dataset_from_episodes(agent,
             # skill even though the env episode continues into the next task.
             # skill_done pairs the completion bonus and the terminal flag on
             # exactly the same chunks (_chunk_reward awards the bonus iff the
-            # chunk covers this task's completion event). Without it, TD/LQL
-            # bootstrap into V(post-completion states) the value net never
-            # trains on, whose extrapolated value self-reinforces toward
-            # bonus/(1-gamma). Online replay already uses these semantics
-            # (done or chunk_success).
+            # chunk covers this task's completion event). Without it the chunked
+            # critic would bootstrap min_i Q_target(post-completion states) that
+            # the policy never visits under skill k, whose extrapolated value
+            # self-reinforces toward bonus/(1-gamma). Online replay already uses
+            # these semantics (done or chunk_success).
             env_done = bool(
                 episode.terminations[min(chunk_end, len(episode.terminations) - 1)]
                 or episode.truncations[min(chunk_end, len(episode.truncations) - 1)]
@@ -961,27 +628,15 @@ def _build_dataset_from_episodes(agent,
                 p_next=next_state,
                 tc_next=agent.spec.padded_state_slice_for(next_state, task_id),
                 done=float(env_done or skill_done),
-                seg_prog=float(
-                    (t - seg_start[t]) / max(1, (seg_end[t] - seg_start[t]))
-                ),
+                nstep=nstep,
             )
-
-            if ((t - seg_start[t]) % max(config.warmup.manager_label_stride, 1)) == 0:
-                ds.add_manager(
-                    z=z_valid[local_idx],
-                    p=state_t,
-                    ts=build_task_state_flat(agent.spec, state_t),
-                    c=completion_masks[t],
-                    label=task_id,
-                )
 
         if verbose and (ep_i + 1) % 50 == 0:
             print(f"  [Demo] Processed {ep_i + 1}/{len(episodes)} episodes  "
-                  f"worker={ds.n_worker():,}  manager={ds.n_manager():,}")
+                  f"worker={ds.n_worker():,}")
 
     ds.finalize()
     stats["worker_samples"] = float(ds.n_worker())
-    stats["manager_samples"] = float(ds.n_manager())
     if replay_state_errors:
         all_errors = np.concatenate(replay_state_errors, axis=0)
         stats["replay_mean_state_l2"] = float(np.mean(all_errors))
@@ -1091,21 +746,29 @@ def _chunk_reward(agent,
                   completion_events: np.ndarray,
                   task_id: int,
                   start: int,
-                  end: int) -> float:
+                  end: int):
+    """Discounted h-step chunk return R = sum_i gamma^i r_{start+i}, and nstep.
+
+    Q-chunking (arXiv:2507.07969) treats the chunk as an h-step transition:
+    the critic backup pairs this discounted return with a gamma^nstep bootstrap.
+    `nstep` is the actual number of env steps (<= H when truncated at a segment
+    boundary, which is always a skill-completion / terminal chunk).
+    """
+    gamma = float(agent.config.worker.gamma)
     reward = 0.0
-    for t in range(start, end + 1):
+    for i, t in enumerate(range(start, end + 1)):
         err_before = agent.spec.task_error(states[t], task_id)
         err_after = agent.spec.task_error(next_states[t], task_id)
         action_t = np.asarray(actions[t], dtype=np.float32)
         completed = bool(completion_events[t] == task_id)
-        reward += agent._worker_step_reward(
+        reward += (gamma ** i) * agent._worker_step_reward(
             err_before,
             err_after,
             action_t,
             completion_bit_flipped=completed,
             task_id=task_id,
         )
-    return float(reward)
+    return float(reward), int(end - start + 1)
 
 
 def _encode_states(agent,
@@ -1156,17 +819,11 @@ def _save_cached_dataset(path: str, ds: DemoPretrainDataset):
         w_a=ds.w_a,
         w_r=ds.w_r,
         w_done=ds.w_done,
+        w_nstep=ds.w_nstep,
         w_z_next=ds.w_z_next,
         w_p_next=ds.w_p_next,
         w_tc_next=ds.w_tc_next,
-        w_seg_prog=ds.w_seg_prog,
-        m_z=ds.m_z,
-        m_p=ds.m_p,
-        m_ts=ds.m_ts,
-        m_c=ds.m_c,
-        m_label=ds.m_label,
         worker_task_counts=ds.worker_task_counts,
-        manager_task_counts=ds.manager_task_counts,
     )
 
 
@@ -1189,17 +846,11 @@ def _load_cached_dataset(path: str, like: DemoPretrainDataset) -> DemoPretrainDa
     ds.w_a = cache["w_a"]
     ds.w_r = cache["w_r"]
     ds.w_done = cache["w_done"]
+    ds.w_nstep = cache["w_nstep"]
     ds.w_z_next = cache["w_z_next"]
     ds.w_p_next = cache["w_p_next"]
     ds.w_tc_next = cache["w_tc_next"]
-    ds.w_seg_prog = cache["w_seg_prog"]
-    ds.m_z = cache["m_z"]
-    ds.m_p = cache["m_p"]
-    ds.m_ts = cache["m_ts"]
-    ds.m_c = cache["m_c"]
-    ds.m_label = cache["m_label"]
     ds.worker_task_counts = cache["worker_task_counts"]
-    ds.manager_task_counts = cache["manager_task_counts"]
     ds.worker_indices_by_task = [
         np.where(ds.w_id == k)[0].astype(np.int64)
         for k in range(ds.n_tasks)

@@ -2,7 +2,7 @@
 Lean offline skill training for FrankaKitchen.
 
 Pipeline:
-  demos -> replay labels/rendered images -> per-task BC/IQL -> evaluation.
+  demos -> replay labels/rendered images -> per-task QC-FQL -> evaluation.
 
 This branch intentionally has no learned hierarchy and no teacher/student
 curriculum. The controller is a scripted "next incomplete task" evaluator.
@@ -25,7 +25,7 @@ from demo_dataset import build_or_load_demo_dataset, sample_oracle_prefix_states
 from env_wrapper import FrankaKitchenImageWrapper
 from online_finetune import run_online_finetuning
 from specialist import SkillAgent, train_offline_skills
-from utils import format_time, save_video
+from utils import format_time, rng_isolated, save_video
 
 
 SEP = "=" * 76
@@ -72,6 +72,7 @@ def task_order(agent: SkillAgent, mode: str) -> List[int]:
     return list(range(agent.n_tasks))
 
 
+@rng_isolated
 def evaluate_single_task(agent: SkillAgent,
                          config: Config,
                          n_episodes: int,
@@ -172,6 +173,7 @@ def evaluate_single_task(agent: SkillAgent,
     return results
 
 
+@rng_isolated
 def evaluate_scripted_chain(agent: SkillAgent,
                             config: Config,
                             n_episodes: int,
@@ -280,6 +282,7 @@ def evaluate_scripted_chain(agent: SkillAgent,
     return out
 
 
+@rng_isolated
 def evaluate_prefix(agent: SkillAgent,
                     config: Config,
                     prefix_tasks: Sequence[str],
@@ -362,6 +365,7 @@ def evaluate_prefix(agent: SkillAgent,
     return out
 
 
+@rng_isolated
 def evaluate_chain_context_skills(agent: SkillAgent,
                                   config: Config,
                                   n_states: int) -> Dict[str, float]:
@@ -474,61 +478,33 @@ def print_banner(config: Config, log_path: str):
           f"chunk={config.worker.action_chunk_len}")
     print(f"  Optimizer      : actor_lr={config.worker.actor_lr}  critic_lr={config.worker.critic_lr}  "
           f"gamma={config.worker.gamma}")
-    print(f"  Train steps    : bc={config.specialist.n_teacher_bc_steps}  "
-          f"offline_rl={config.specialist.n_offline_rl_steps}  bet={config.specialist.bet_steps}  "
+    print(f"  Train steps    : flow_bc={config.specialist.n_flow_bc_steps}  "
+          f"offline_rl={config.specialist.n_offline_rl_steps}  "
           f"batch={config.specialist.batch_size}")
     print(f"  Option budget  : subgoal_horizon={config.manager.subgoal_horizon}  "
           f"max_high_level_steps={config.manager.max_high_level_steps}")
     print(f"  TB log interval: every {config.specialist.log_interval} optimizer steps")
-    print(f"  IQL params     : expectile={config.specialist.iql_expectile}  "
-          f"adv_beta={config.specialist.iql_adv_beta}  max_weight={config.specialist.iql_max_weight}  "
-          f"adv_norm={config.specialist.iql_normalize_advantage}  "
-          f"value_target={config.specialist.iql_use_value_target}  "
-          f"value_target_tau={config.specialist.iql_value_target_tau}  "
-          f"prefix_eval_interval={config.specialist.iql_eval_interval}  "
-          f"prefix_eval_states={config.specialist.iql_eval_prefix_states}")
-    print(f"  LQL params     : enabled={config.specialist.lql_enabled}  "
-          f"lambda_lb={config.specialist.lql_lambda_lb}  "
-          f"n_transitions={config.specialist.lql_n_transitions}  "
-          f"min_gap={config.specialist.lql_min_gap}")
-    print(f"  TD3+BC params  : alpha={config.specialist.td3bc_alpha}  tau={config.specialist.td3bc_tau}  "
-          f"policy_noise={config.specialist.td3bc_policy_noise}  noise_clip={config.specialist.td3bc_noise_clip}  "
-          f"policy_freq={config.specialist.td3bc_policy_freq}")
-    print(f"  AWR params     : temperature={config.specialist.awr_temperature}  "
-          f"max_weight={config.specialist.awr_max_weight}")
-    print(f"  BeT params     : steps={config.specialist.bet_steps}  bins={config.specialist.bet_num_bins}  "
-          f"offset_weight={config.specialist.bet_offset_weight}")
+    print(f"  QC-FQL params  : flow_steps={config.specialist.flow_steps}  "
+          f"alpha={config.specialist.fql_alpha}  normalize_q={config.specialist.fql_normalize_q}  "
+          f"best_of_n={config.specialist.best_of_n}  target_tau={config.specialist.target_tau}  "
+          f"layernorm={config.specialist.use_layernorm}  dropout={config.specialist.dropout}")
+    print(f"  Critic backup  : Q(s,a_chunk) = R_disc + gamma^nstep * (1-done) * minQ_target(s', onestep(s'))")
+    print(f"  Actor loss     : flow_bc + alpha*||onestep(s,z)-flow_ode(s,z)||^2 - Q(s,onestep(s,z))")
     print(f"  Dense reward   : progress={config.worker.progress_weight}  "
           f"completion={config.worker.completion_bonus}  action_cost={config.worker.action_cost}  "
-          f"sigma={config.worker.sigma}")
-    print(f"  Reward eqn     : r = {config.worker.progress_weight}*(gamma*phi(s')-phi(s)) "
-          f"+ {config.worker.completion_bonus}*done "
-          f"- {config.worker.action_cost}*||a||^2   "
-          f"phi(s)=exp(-(e/eps)/sigma)")
-    print(f"  Eval episodes  : single={config.eval.n_single_task_episodes}  chain={config.eval.n_eval_episodes}  "
-          f"prefix_states={config.training.prefix_eval_n_states}")
+          f"sigma={config.worker.sigma}  (chunk return discounted by gamma)")
+    print(f"  Prefix-val     : interval={config.specialist.eval_interval}  "
+          f"states={config.specialist.eval_prefix_states}")
+    print(f"  Eval episodes  : single={config.eval.n_single_task_episodes}  chain={config.eval.n_eval_episodes}")
     print(f"  Chain-context  : enabled={config.eval.chain_context_eval}  "
           f"states={config.eval.chain_context_eval_states}")
     print(f"  Video          : record={config.training.record_video}  n={config.training.video_n_episodes}  "
           f"fps={config.training.video_fps}")
-    print(f"  Online AWAC    : enabled={config.online.enabled}  steps={config.online.total_env_steps}  "
-          f"mode={config.online.mode}  updates_per_env_step={config.online.updates_per_env_step}  "
-          f"batch={config.online.batch_size}")
-    print(f"  Online replay  : demo_fraction={config.online.demo_fraction_start}->{config.online.demo_fraction_end}  "
-          f"demo_decay={config.online.demo_fraction_decay_steps}  "
-          f"bc_anchor={config.online.bc_anchor_weight}->{config.online.bc_anchor_weight_end}  "
-          f"anchor_decay={config.online.bc_anchor_decay_steps}  "
-          f"awac_temp={config.online.awac_temperature}  max_weight={config.online.awac_max_weight}")
-    print(f"  Online collect : exploration_noise={config.online.exploration_noise}  "
-          f"failure_priority={config.online.failure_priority}  eval_interval={config.online.eval_interval_steps}")
-    print(f"  Online repair  : freeze_threshold={config.online.freeze_success_threshold}  "
-          f"next_skill_threshold={config.online.next_skill_collection_threshold}  "
-          f"collect_next_on_success={config.online.collect_next_on_success}  "
-          f"actor_success_only={config.online.actor_success_only}  "
-          f"actor_high_return_fallback={config.online.actor_include_high_return_failures}  "
-          f"min_actor_success={config.online.min_actor_success_samples}  "
-          f"critic_huber={config.online.critic_huber_loss}  "
-          f"huber_delta={config.online.critic_huber_delta}  "
+    print(f"  Online QC-FQL  : enabled={config.online.enabled}  steps={config.online.total_env_steps}  "
+          f"updates_per_env_step={config.online.updates_per_env_step}  "
+          f"demo_fraction={config.online.demo_fraction}  "
+          f"exploration_noise={config.online.exploration_noise}  "
+          f"eval_interval={config.online.eval_interval_steps}  "
           f"rollback_drop={config.online.rollback_drop_tolerance}")
     if config.online.load_checkpoint:
         print(f"  Load checkpoint: {config.online.load_checkpoint}  skip_offline={config.online.skip_offline_training}")
@@ -745,90 +721,62 @@ def train(config: Config):
 
 
 def parse_args() -> Config:
-    parser = argparse.ArgumentParser(description="Lean per-skill BC/IQL for FrankaKitchen")
+    parser = argparse.ArgumentParser(description="Per-skill QC-FQL for FrankaKitchen / OGBench")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--encoder", type=str, default="r3m", choices=["r3m", "dinov2", "dinov3"])
+    parser.add_argument("--encoder", type=str, default="dinov3", choices=["r3m", "dinov2", "dinov3"])
     parser.add_argument("--dinov3_model", type=str, default=None)
     parser.add_argument("--dinov3_weights", type=str, default=None)
     parser.add_argument("--dinov3_repo_or_dir", type=str, default=None)
     parser.add_argument("--dinov3_source", type=str, default=None, choices=["github", "local"])
-    parser.add_argument("--log_dir", type=str, default="logs/lean_skills")
+    parser.add_argument("--log_dir", type=str, default="logs/qc_fql")
     parser.add_argument("--tasks", nargs="+", default=None)
     parser.add_argument("--demo_datasets", nargs="+", default=None)
     parser.add_argument("--demo_source", type=str, default=None, choices=["auto", "minari", "d4rl"])
     parser.add_argument("--demo_cache_dir", type=str, default=None)
     parser.add_argument("--rebuild_demo_cache", action="store_true")
-    parser.add_argument("--bc_steps", "--teacher_bc_steps", dest="bc_steps", type=int, default=None)
-    parser.add_argument("--iql_steps", "--teacher_iql_steps", "--offline_rl_steps", dest="offline_rl_steps", type=int, default=None)
-    parser.add_argument("--offline_algo", type=str, default=None,
-                        choices=["bc", "bc_iql", "iql", "td3bc", "td3_bc", "awr", "bet", "behavior_transformer", "sequence_bc"])
-    parser.add_argument("--batch_size", "--specialist_batch_size", dest="batch_size", type=int, default=None)
+
+    # Offline algorithm.
+    parser.add_argument("--offline_algo", type=str, default=None, choices=["flow_bc", "qc_fql"])
+    parser.add_argument("--flow_bc_steps", type=int, default=None)
+    parser.add_argument("--offline_rl_steps", "--qc_fql_steps", dest="offline_rl_steps", type=int, default=None)
+    parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--hidden_dim", type=int, default=None)
     parser.add_argument("--n_layers", type=int, default=None)
     parser.add_argument("--action_chunk", "--action_chunk_len", dest="action_chunk", type=int, default=None)
     parser.add_argument("--subgoal_horizon", type=int, default=None)
     parser.add_argument("--max_high_level_steps", type=int, default=None)
-    parser.add_argument("--iql_expectile", type=float, default=None)
-    parser.add_argument("--iql_adv_beta", type=float, default=None)
-    parser.add_argument("--iql_max_weight", type=float, default=None)
-    parser.add_argument("--iql_use_value_target", action="store_true")
-    parser.add_argument("--iql_value_target_tau", type=float, default=None)
-    parser.add_argument("--iql_normalize_advantage", "--iql_adv_normalize", action="store_true")
-    parser.add_argument("--iql_eval_interval", type=int, default=None)
-    parser.add_argument("--iql_eval_prefix_states", type=int, default=None)
-    parser.add_argument("--no_lql", action="store_true",
-                        help="Disable the LQL lower-bound critic penalty (A/B baseline).")
-    parser.add_argument("--lql_lambda_lb", type=float, default=None)
-    parser.add_argument("--lql_n_transitions", type=int, default=None)
-    parser.add_argument("--lql_min_gap", type=int, default=None)
-    parser.add_argument("--td3bc_alpha", type=float, default=None)
-    parser.add_argument("--awr_temperature", type=float, default=None)
-    parser.add_argument("--awr_max_weight", type=float, default=None)
-    parser.add_argument("--bet_steps", type=int, default=None)
-    parser.add_argument("--bet_num_bins", type=int, default=None)
-    parser.add_argument("--bet_offset_weight", type=float, default=None)
+
+    # QC-FQL knobs.
+    parser.add_argument("--flow_steps", type=int, default=None)
+    parser.add_argument("--fql_alpha", type=float, default=None)
+    parser.add_argument("--no_normalize_q", action="store_true")
+    parser.add_argument("--best_of_n", type=int, default=None)
+    parser.add_argument("--target_tau", type=float, default=None)
+    parser.add_argument("--dropout", type=float, default=None)
+    parser.add_argument("--no_layernorm", action="store_true")
+    parser.add_argument("--eval_interval", type=int, default=None)
+    parser.add_argument("--eval_prefix_states", type=int, default=None)
     parser.add_argument("--log_interval", type=int, default=None)
+
+    # Evaluation.
     parser.add_argument("--single_task_eval_episodes", type=int, default=None)
     parser.add_argument("--chain_eval_episodes", type=int, default=None)
     parser.add_argument("--final_eval_repeats", type=int, default=None)
     parser.add_argument("--controller_order_mode", type=str, default=None, choices=["given_order", "stage_a_rank"])
-    parser.add_argument("--prefix_eval_only", action="store_true")
-    parser.add_argument("--prefix_target_task", type=str, default="")
-    parser.add_argument("--prefix_condition_tasks", nargs="*", default=None)
-    parser.add_argument("--prefix_eval_states", type=int, default=None)
     parser.add_argument("--chain_context_eval_states", type=int, default=None)
     parser.add_argument("--no_chain_context_eval", action="store_true")
     parser.add_argument("--no_video", action="store_true")
+
+    # Online QC-FQL.
     parser.add_argument("--online_finetune", action="store_true")
-    parser.add_argument("--online_mode", type=str, default=None, choices=["skill_repair", "chain"])
     parser.add_argument("--online_steps", type=int, default=None)
     parser.add_argument("--online_eval_interval", type=int, default=None)
-    parser.add_argument("--online_log_interval_episodes", type=int, default=None)
     parser.add_argument("--online_updates_per_env_step", type=float, default=None)
     parser.add_argument("--online_batch_size", type=int, default=None)
-    parser.add_argument("--online_buffer_capacity_per_skill", type=int, default=None)
-    parser.add_argument("--online_demo_fraction_start", type=float, default=None)
-    parser.add_argument("--online_demo_fraction_end", type=float, default=None)
-    parser.add_argument("--online_demo_fraction_decay_steps", type=int, default=None)
-    parser.add_argument("--online_awac_temperature", type=float, default=None)
-    parser.add_argument("--online_awac_max_weight", type=float, default=None)
-    parser.add_argument("--online_bc_anchor_weight", type=float, default=None)
-    parser.add_argument("--online_bc_anchor_weight_end", type=float, default=None)
-    parser.add_argument("--online_bc_anchor_decay_steps", type=int, default=None)
-    parser.add_argument("--online_critic_target_tau", type=float, default=None)
-    parser.add_argument("--online_no_critic_huber", action="store_true")
-    parser.add_argument("--online_critic_huber_delta", type=float, default=None)
-    parser.add_argument("--online_normalize_advantage", action="store_true")
-    parser.add_argument("--online_actor_all_attempts", action="store_true")
-    parser.add_argument("--online_actor_high_return_fallback", action="store_true")
-    parser.add_argument("--online_no_collect_next_on_success", action="store_true")
-    parser.add_argument("--online_min_actor_success_samples", type=int, default=None)
-    parser.add_argument("--online_freeze_success_threshold", type=float, default=None)
-    parser.add_argument("--online_next_skill_collection_threshold", type=float, default=None)
-    parser.add_argument("--online_rollback_drop_tolerance", type=float, default=None)
+    parser.add_argument("--online_demo_fraction", type=float, default=None)
     parser.add_argument("--online_exploration_noise", type=float, default=None)
-    parser.add_argument("--online_failure_priority", type=float, default=None)
+    parser.add_argument("--online_rollback_drop_tolerance", type=float, default=None)
     parser.add_argument("--load_checkpoint", type=str, default="")
     parser.add_argument("--skip_offline_training", action="store_true")
     args = parser.parse_args()
@@ -858,13 +806,13 @@ def parse_args() -> Config:
         cfg.warmup.cache_dir = args.demo_cache_dir
     if args.rebuild_demo_cache:
         cfg.warmup.rebuild_cache = True
-    if args.bc_steps is not None:
-        cfg.specialist.n_teacher_bc_steps = args.bc_steps
-    if args.offline_rl_steps is not None:
-        cfg.specialist.n_offline_rl_steps = args.offline_rl_steps
-        cfg.specialist.n_teacher_iql_steps = args.offline_rl_steps
+
     if args.offline_algo is not None:
         cfg.specialist.offline_algo = args.offline_algo
+    if args.flow_bc_steps is not None:
+        cfg.specialist.n_flow_bc_steps = args.flow_bc_steps
+    if args.offline_rl_steps is not None:
+        cfg.specialist.n_offline_rl_steps = args.offline_rl_steps
     if args.batch_size is not None:
         cfg.specialist.batch_size = args.batch_size
     if args.hidden_dim is not None:
@@ -877,44 +825,28 @@ def parse_args() -> Config:
         cfg.manager.subgoal_horizon = args.subgoal_horizon
     if args.max_high_level_steps is not None:
         cfg.manager.max_high_level_steps = args.max_high_level_steps
-    if args.iql_expectile is not None:
-        cfg.specialist.iql_expectile = args.iql_expectile
-    if args.iql_adv_beta is not None:
-        cfg.specialist.iql_adv_beta = args.iql_adv_beta
-    if args.iql_max_weight is not None:
-        cfg.specialist.iql_max_weight = args.iql_max_weight
-    if args.iql_use_value_target:
-        cfg.specialist.iql_use_value_target = True
-    if args.iql_value_target_tau is not None:
-        cfg.specialist.iql_value_target_tau = args.iql_value_target_tau
-    if args.iql_normalize_advantage:
-        cfg.specialist.iql_normalize_advantage = True
-    if args.iql_eval_interval is not None:
-        cfg.specialist.iql_eval_interval = args.iql_eval_interval
-    if args.iql_eval_prefix_states is not None:
-        cfg.specialist.iql_eval_prefix_states = args.iql_eval_prefix_states
-    if args.no_lql:
-        cfg.specialist.lql_enabled = False
-    if args.lql_lambda_lb is not None:
-        cfg.specialist.lql_lambda_lb = args.lql_lambda_lb
-    if args.lql_n_transitions is not None:
-        cfg.specialist.lql_n_transitions = args.lql_n_transitions
-    if args.lql_min_gap is not None:
-        cfg.specialist.lql_min_gap = args.lql_min_gap
-    if args.td3bc_alpha is not None:
-        cfg.specialist.td3bc_alpha = args.td3bc_alpha
-    if args.awr_temperature is not None:
-        cfg.specialist.awr_temperature = args.awr_temperature
-    if args.awr_max_weight is not None:
-        cfg.specialist.awr_max_weight = args.awr_max_weight
-    if args.bet_steps is not None:
-        cfg.specialist.bet_steps = args.bet_steps
-    if args.bet_num_bins is not None:
-        cfg.specialist.bet_num_bins = args.bet_num_bins
-    if args.bet_offset_weight is not None:
-        cfg.specialist.bet_offset_weight = args.bet_offset_weight
+
+    if args.flow_steps is not None:
+        cfg.specialist.flow_steps = args.flow_steps
+    if args.fql_alpha is not None:
+        cfg.specialist.fql_alpha = args.fql_alpha
+    if args.no_normalize_q:
+        cfg.specialist.fql_normalize_q = False
+    if args.best_of_n is not None:
+        cfg.specialist.best_of_n = args.best_of_n
+    if args.target_tau is not None:
+        cfg.specialist.target_tau = args.target_tau
+    if args.dropout is not None:
+        cfg.specialist.dropout = args.dropout
+    if args.no_layernorm:
+        cfg.specialist.use_layernorm = False
+    if args.eval_interval is not None:
+        cfg.specialist.eval_interval = args.eval_interval
+    if args.eval_prefix_states is not None:
+        cfg.specialist.eval_prefix_states = args.eval_prefix_states
     if args.log_interval is not None:
         cfg.specialist.log_interval = args.log_interval
+
     if args.single_task_eval_episodes is not None:
         cfg.eval.n_single_task_episodes = args.single_task_eval_episodes
     if args.chain_eval_episodes is not None:
@@ -923,76 +855,29 @@ def parse_args() -> Config:
         cfg.eval.final_eval_repeats = args.final_eval_repeats
     if args.controller_order_mode is not None:
         cfg.training.controller_order_mode = args.controller_order_mode
-    if args.prefix_eval_only:
-        cfg.training.prefix_eval_only = True
-        cfg.training.prefix_target_task = args.prefix_target_task
-        cfg.training.prefix_condition_tasks = args.prefix_condition_tasks or []
-    if args.prefix_eval_states is not None:
-        cfg.training.prefix_eval_n_states = args.prefix_eval_states
     if args.chain_context_eval_states is not None:
         cfg.eval.chain_context_eval_states = args.chain_context_eval_states
     if args.no_chain_context_eval:
         cfg.eval.chain_context_eval = False
     if args.no_video:
         cfg.training.record_video = False
+
     if args.online_finetune:
         cfg.online.enabled = True
-    if args.online_mode is not None:
-        cfg.online.mode = args.online_mode
     if args.online_steps is not None:
         cfg.online.total_env_steps = args.online_steps
     if args.online_eval_interval is not None:
         cfg.online.eval_interval_steps = args.online_eval_interval
-    if args.online_log_interval_episodes is not None:
-        cfg.online.log_interval_episodes = args.online_log_interval_episodes
     if args.online_updates_per_env_step is not None:
         cfg.online.updates_per_env_step = args.online_updates_per_env_step
     if args.online_batch_size is not None:
         cfg.online.batch_size = args.online_batch_size
-    if args.online_buffer_capacity_per_skill is not None:
-        cfg.online.online_buffer_capacity_per_skill = args.online_buffer_capacity_per_skill
-    if args.online_demo_fraction_start is not None:
-        cfg.online.demo_fraction_start = args.online_demo_fraction_start
-    if args.online_demo_fraction_end is not None:
-        cfg.online.demo_fraction_end = args.online_demo_fraction_end
-    if args.online_demo_fraction_decay_steps is not None:
-        cfg.online.demo_fraction_decay_steps = args.online_demo_fraction_decay_steps
-    if args.online_awac_temperature is not None:
-        cfg.online.awac_temperature = args.online_awac_temperature
-    if args.online_awac_max_weight is not None:
-        cfg.online.awac_max_weight = args.online_awac_max_weight
-    if args.online_bc_anchor_weight is not None:
-        cfg.online.bc_anchor_weight = args.online_bc_anchor_weight
-    if args.online_bc_anchor_weight_end is not None:
-        cfg.online.bc_anchor_weight_end = args.online_bc_anchor_weight_end
-    if args.online_bc_anchor_decay_steps is not None:
-        cfg.online.bc_anchor_decay_steps = args.online_bc_anchor_decay_steps
-    if args.online_critic_target_tau is not None:
-        cfg.online.critic_target_tau = args.online_critic_target_tau
-    if args.online_no_critic_huber:
-        cfg.online.critic_huber_loss = False
-    if args.online_critic_huber_delta is not None:
-        cfg.online.critic_huber_delta = args.online_critic_huber_delta
-    if args.online_normalize_advantage:
-        cfg.online.normalize_advantage = True
-    if args.online_actor_all_attempts:
-        cfg.online.actor_success_only = False
-    if args.online_actor_high_return_fallback:
-        cfg.online.actor_include_high_return_failures = True
-    if args.online_no_collect_next_on_success:
-        cfg.online.collect_next_on_success = False
-    if args.online_min_actor_success_samples is not None:
-        cfg.online.min_actor_success_samples = args.online_min_actor_success_samples
-    if args.online_freeze_success_threshold is not None:
-        cfg.online.freeze_success_threshold = args.online_freeze_success_threshold
-    if args.online_next_skill_collection_threshold is not None:
-        cfg.online.next_skill_collection_threshold = args.online_next_skill_collection_threshold
-    if args.online_rollback_drop_tolerance is not None:
-        cfg.online.rollback_drop_tolerance = args.online_rollback_drop_tolerance
+    if args.online_demo_fraction is not None:
+        cfg.online.demo_fraction = args.online_demo_fraction
     if args.online_exploration_noise is not None:
         cfg.online.exploration_noise = args.online_exploration_noise
-    if args.online_failure_priority is not None:
-        cfg.online.failure_priority = args.online_failure_priority
+    if args.online_rollback_drop_tolerance is not None:
+        cfg.online.rollback_drop_tolerance = args.online_rollback_drop_tolerance
     if args.load_checkpoint:
         cfg.online.load_checkpoint = args.load_checkpoint
     if args.skip_offline_training:

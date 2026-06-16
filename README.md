@@ -1,11 +1,20 @@
-# Embodied-HRL: Lean Skill Learning Branch
+# Embodied-HRL: Skill Learning Q Chunking Flow QL Branch
+## Skill-Conditioned QC-FQL
 
-This branch intentionally drops the learned hierarchy and teacher/student
-curriculum. The current research path is simpler:
+This branch replaces the Gaussian-actor + IQL/LQL stack with **per-skill QC-FQL**:
+an expressive **flow-matching** policy class (Flow Q-Learning) trained with a
+**chunked, unbiased n-step critic** (Q-chunking). The skill-transfer vision is
+unchanged — still one goal-conditioned expert per task, chained by a scripted
+controller, fine-tuned online.
 
-```text
-FrankaKitchen demos -> replay labels -> rendered images -> per-task BC/IQL skills -> scripted chaining eval
-```
+References:
+- Flow Q-Learning (FQL) — Park, Li, Levine, **ICML 2025**, arXiv:2502.02538
+- Reinforcement Learning with Action Chunking (QC) — Li, Zhou, Levine, **NeurIPS 2025**, arXiv:2507.07969
+
+
+The per-skill learner is **QC-FQL** (Q-chunking + Flow Q-Learning). See
+[QCFQL.md](QCFQL.md) for the architecture, equations, and staged experiments.
+
 ---
 
 # How to set the environment
@@ -171,30 +180,27 @@ wget -c -O dinov3_vits16plus_pretrain_lvd1689m.pth 'PASTE_THE_LINK_INSIDE'
 ```
 
 
----
-
-
----
-
 ## Active Files
 
 ```text
-config.py        Dataclass config
-demo_dataset.py  D4RL/Minari loading, replay labels, render/encode cache
-encoder.py       Frozen R3M, DINOv2, or DINOv3 image encoder
-env_wrapper.py   FrankaKitchen image/state wrapper
-networks.py      Minimal MLP helper
-specialist.py    One visual BC/IQL policy per task
-train.py         Main training/evaluation entrypoint
-plots.py         TensorBoard-to-PNG diagnostics
-utils.py         task indices, goals, eval helpers, video saving
+config.py            Dataclass config
+demo_dataset.py      D4RL/Minari loading, replay labels, render/encode cache
+encoder.py           Frozen R3M, DINOv2, or DINOv3 image encoder
+env_wrapper.py       FrankaKitchen image/state wrapper
+networks.py          FlowActor (flow BC + one-step actor) and TwinQ chunk critic
+specialist.py        One visual QC-FQL policy per task
+offline_algorithms.py  FlowBCAlgorithm + QCFQLAlgorithm (+ prefix-val selection)
+online_finetune.py   Online QC-FQL fine-tuning on a mixed demo+online replay
+train.py             Main training/evaluation entrypoint
+plots.py             TensorBoard-to-PNG diagnostics
+utils.py             task indices, goals, eval helpers, video saving
 ```
 
 ## What Is Trained
 
-For each configured task, the code trains a separate visual policy.
+For each configured task, the code trains a separate visual QC-FQL policy.
 
-Input:
+Input (conditioning feature):
 
 ```text
 image latent z + normalized proprio + task goal/current/delta/mask
@@ -203,16 +209,16 @@ image latent z + normalized proprio + task goal/current/delta/mask
 Output:
 
 ```text
-9-D Franka action, or H x 9 if action_chunk > 1
+H x 9 Franka action chunk (action_chunk=H, env action is 9-D)
 ```
 
 Training:
 
 ```text
-1. BC on replay-labelled demo segments
-2. Optional IQL on the same demo transitions
-3. Deterministic single-task evaluation
-4. Deterministic scripted-chain evaluation
+1. flow_bc : flow-matching BC on replay-labelled demo segments
+2. qc_fql  : chunked twin critic + flow BC + one-step Q-maximizing actor
+3. Prefix-state validation for per-skill checkpoint selection
+4. Single-task and scripted-chain evaluation (optionally online fine-tuning)
 ```
 
 There is no learned manager in this branch.
@@ -234,90 +240,65 @@ Encoder choices:
 
 DINOv3 can also read the checkpoint from `DINOV3_WEIGHTS`. Rebuild demo caches when switching between encoders or DINOv3 model variants.
 
-## Using shell
+## Staged experiments
 
-### Online RL Finetuning
-Recommended first run, end-to-end offline `BC+IQL+Value_Target_0.05` + online AWAC:
+Validate on **partial / mixed** data. On near-expert `complete` data QC-FQL ≈
+flow BC ≈ BC, so the headroom only appears where the data is suboptimal.
+
+**0. Pre-flight (seconds, CPU, no env/encoder):**
 ```bash
-bash run.sh --offline_algo bc_iql \
-  --seed 2000 \
-  --log_dir logs/online_awac_seed2000 \
-  --iql_use_value_target \
-  --iql_value_target_tau 0.05 \
-  --online_finetune \
-  --online_steps 200000 \
-  --online_eval_interval 25000 \
-  --chain_eval_episodes 50
+python test.py
 ```
-If you already have the best offline checkpoint and want to skip offline retraining:
+
+**1. Does an expressive policy class alone beat the old Gaussian BC? (flow BC)**
 ```bash
-bash run.sh --offline_algo bc_iql \
-  --seed 2000 \
-  --log_dir logs/online_awac_from_ckpt_seed2000 \
-  --iql_use_value_target \
-  --iql_value_target_tau 0.05 \
+bash run.sh --offline_algo flow_bc --demo_datasets franka-partial \
+  --log_dir logs/flowbc_partial_seed0 --seed 0 --no_video
+```
+
+**2. Does QC-FQL improve over flow BC? (Q-guidance + chunked critic)**
+```bash
+bash run.sh --offline_algo qc_fql --demo_datasets franka-partial \
+  --log_dir logs/qcfql_partial_seed0 --seed 0 --no_video
+```
+Watch `03_qc_diagnostics.png`: `qc_q_mean` should settle near the reward scale
+(a few × completion_bonus), **not** blow up.
+
+**3. Online QC-FQL fine-tuning (only after offline is confirmed):**
+```bash
+bash run.sh --offline_algo qc_fql --online_finetune \
+  --online_steps 200000 --online_eval_interval 25000 \
+  --log_dir logs/qcfql_online_seed0 --seed 0
+```
+Resume from a saved offline checkpoint instead of retraining:
+```bash
+bash run.sh --offline_algo qc_fql --online_finetune \
   --load_checkpoint logs/YOUR_OFFLINE_RUN/checkpoints/checkpoint_final.pt \
   --skip_offline_training \
-  --online_finetune \
-  --online_steps 200000 \
-  --online_eval_interval 25000 \
-  --chain_eval_episodes 50
+  --online_steps 200000 --online_eval_interval 25000 \
+  --log_dir logs/qcfql_online_from_ckpt_seed0 --seed 0
 ```
 
-### Running Offline Pretraining
-Baseline offline runs
-```bash
-# 1. Previous best baseline: no target value, no advantage norm
-bash run.sh --offline_algo bc_iql --seed 42 --log_dir logs/bc_iql_baseline_seed42
+Tuning order if needed: `--fql_alpha` (start 10, lower to loosen the behavior
+constraint), then `--best_of_n` (e.g. 4–8 at eval), then `--flow_steps`.
 
-# 2. Advantage normalization only
-bash run.sh --offline_algo bc_iql --seed 42 --log_dir logs/bc_iql_advnorm_seed42 --iql_normalize_advantage
-
-# 3. (Best offline performance) Target value only, larger tau 
-bash run.sh --offline_algo bc_iql --seed 42 --log_dir logs/bc_iql_vtarget_tau005_seed42 --iql_use_value_target --iql_value_target_tau 0.05
-
-# 4. Target value + advantage normalization
-bash run.sh --offline_algo bc_iql --seed 42 --log_dir logs/bc_iql_vtarget_tau005_advnorm_seed42 --iql_use_value_target --iql_value_target_tau 0.05 --iql_normalize_advantage
-```
-
-Important: `--iql_value_target_tau 0.05` alone does nothing unless you also pass `--iql_use_value_target.`
-
-
-Trying different offline algo
-```bash
-bash run.sh --offline_algo bc
-bash run.sh --offline_algo bc_iql
-bash run.sh --offline_algo td3bc
-bash run.sh --offline_algo awr
-bash run.sh --offline_algo bet
-```
-You can also pass extra train.py args through the script 
-```bash
-bash run.sh --offline_algo bc_iql --rebuild_demo_cache
-bash run.sh --offline_algo td3bc --td3bc_alpha 2.0
-bash run.sh --offline_algo awr --awr_temperature 0.5
-bash run.sh --offline_algo bet --bet_num_bins 128 --bet_steps 100000
-bash run.sh --offline_algo bc_iql --chain_eval_episodes 100 --no_video
-```
-
-## From the terminal
-### Running offline pretraining 
+## From the terminal (no shell wrapper)
 
 ```bash
 python train.py \
   --seed 42 \
   --device cuda \
-  --encoder dinov2 \
-  --bc_steps 30000 \
-  --iql_steps 100000 \
+  --encoder dinov3 \
+  --offline_algo qc_fql \
+  --flow_bc_steps 30000 \
+  --offline_rl_steps 100000 \
   --batch_size 256 \
-  --single_task_eval_episodes 20 \
-  --chain_eval_episodes 15 \
+  --single_task_eval_episodes 100 \
+  --chain_eval_episodes 100 \
   --log_interval 500 \
-  --rebuild_demo_cache \
   --demo_datasets franka-complete franka-mixed franka-partial \
   --tasks microwave kettle "light switch" "slide cabinet" \
-  --log_dir logs/lean_skills_sparse_dominant_dinov2 
+  --log_dir logs/qcfql_dinov3
 ```
 
 ## Prefix-State Diagnostic
@@ -326,9 +307,8 @@ python train.py \
 python train.py \
   --seed 42 \
   --device cuda \
-  --encoder r3m \
-  --bc_steps 30000 \
-  --iql_steps 100000 \
+  --encoder dinov3 \
+  --offline_algo qc_fql \
   --prefix_eval_only \
   --prefix_target_task "light switch" \
   --prefix_condition_tasks microwave kettle \
@@ -341,9 +321,8 @@ python train.py \
 ## Plotting
 
 ```bash
-python plots.py --log_dir logs/lean_skills_sparse_dominant --smooth 15
-python plots.py --log_dir logs/prefix_light_sparse_dominant --smooth 15
-python plots.py --log_dir logs/prefix_slide_sparse_dominant --smooth 15
+python plots.py --log_dir logs/qcfql_dinov3 --smooth 15
+python plots.py --log_dir logs/flowbc_partial_seed0 --smooth 15
 ```
 
 ## What To Watch
@@ -354,7 +333,8 @@ Primary metrics:
 single_task/<task>_success_rate
 eval/full_task_success_rate
 eval/mean_tasks_completed
-prefix/success_rate
+skill/<task>/prefix_success_rate
+qc_q_mean   (inflation watch — should stay near the reward scale)
 ```
 
 If microwave/kettle work but light switch/cabinet fail, the bottleneck is

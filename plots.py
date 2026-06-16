@@ -2,8 +2,8 @@
 plots.py — Diagnostic plots for lean FrankaKitchen skill-learning runs.
 
 Reads TensorBoard event files (with train_log text fallback) and generates
-PNG plots covering offline BC/IQL+LQL training health, prefix-state model
-selection, and online AWAC fine-tuning.
+PNG plots covering offline flow-BC / QC-FQL training health, prefix-state model
+selection, and online QC-FQL fine-tuning.
 
 Usage:
     python plots.py --log_dir logs/lean_skills/
@@ -14,11 +14,11 @@ Output files:
     00_overview_dashboard.png     — 6-panel summary; look here first
     01_eval_success.png           — chain eval success rates over time
     02_training_episode.png       — online per-episode reward / options / tasks
-    03_lql_diagnostics.png        — LQL lower-bound penalty health per skill
-    04_prefix_validation.png      — IQL prefix-state validation per skill
+    03_qc_diagnostics.png         — QC-FQL critic + flow actor health per skill
+    04_prefix_validation.png      — prefix-state validation per skill
     07_skill_losses.png           — per-skill offline optimisation losses
     08_skill_eval.png             — final per-skill eval bar charts
-    09_online_awac.png            — online AWAC fine-tuning diagnostics
+    09_online_qcfql.png           — online QC-FQL fine-tuning diagnostics
     comparison.png                — multi-run overlay (--compare mode)
 """
 import os
@@ -431,16 +431,16 @@ def plot_overview(data: dict, out_dir: str, sw: int = 15):
         ylabel='Tasks', color=COLORS['gold'],
         smooth_window=1, ymin=0, ymax=4.1)
 
-    _plot_skill_family(axes[3], data, 'iql_prefix_success_rate',
-                       title='[4]  IQL Prefix-Val Success (model selection)',
+    _plot_skill_family(axes[3], data, 'prefix_success_rate',
+                       title='[4]  Prefix-Val Success (model selection)',
                        ylabel='%', sw=1, pct=True, ymin=0, ymax=105)
 
-    _plot_skill_family(axes[4], data, 'iql_critic_loss',
-                       title='[5]  IQL Critic TD Loss', ylabel='MSE', sw=sw)
+    _plot_skill_family(axes[4], data, 'qc_critic_loss',
+                       title='[5]  QC-FQL Critic TD Loss', ylabel='MSE', sw=sw)
 
-    _plot_skill_family(axes[5], data, 'iql_lb_active_frac',
-                       title='[6]  LQL Active Pair Fraction',
-                       ylabel='fraction', sw=sw, ymin=0, ymax=1.05)
+    _plot_skill_family(axes[5], data, 'qc_q_mean',
+                       title='[6]  QC-FQL Q(s,a) Mean (inflation watch)',
+                       ylabel='Q', sw=sw)
 
     fig.tight_layout()
     _save(fig, out_dir, '00_overview_dashboard.png')
@@ -508,71 +508,64 @@ def plot_training_episode(data: dict, out_dir: str, sw: int = 15):
 
 
 # =============================================================================
-# Plot 03 — LQL lower-bound penalty diagnostics
+# Plot 03 — QC-FQL training diagnostics
 # =============================================================================
 
-def plot_lql_diagnostics(data: dict, out_dir: str, sw: int = 15):
-    """Health of the LQL lower-bound critic penalty.
+def plot_qc_diagnostics(data: dict, out_dir: str, sw: int = 15):
+    """Health of the QC-FQL critic + flow actor.
 
     What to look for:
-      * active_frac should settle in a moderate band (~5-40%). Pinned at 0%
-        means chains never fire (sampler/data bug); pinned near 100% means the
-        critic is persistently below the demo returns (slow propagation or
-        lambda too small).
-      * lb_loss should decay as Q absorbs the bounds.
-      * target_q_mean / q_mean climbing without bound => Q inflation; lower
-        lambda_lb.
+      * qc_critic_loss should decay and stay bounded.
+      * qc_q_mean / qc_target_q_mean should settle near the reward scale
+        (a few * completion_bonus), NOT climb without bound (Q inflation).
+      * qc_distill_loss should fall as the one-step actor matches the flow.
+      * qc_bc_flow_loss should fall (the BC flow is learning the action dist).
     """
-    has_lql = any('/iql_lb_' in k for k in data)
-    if not has_lql:
+    has_qc = any('/qc_' in k for k in data)
+    if not has_qc:
         return
     fig, axes = plt.subplots(2, 3, figsize=(20, 10))
     axes = axes.flatten()
-    fig.suptitle('LQL Lower-Bound Penalty Diagnostics',
+    fig.suptitle('QC-FQL Training Diagnostics',
                  fontsize=STYLE['suptitle_fs'], fontweight='bold')
 
-    _plot_skill_family(axes[0], data, 'iql_lb_loss',
-                       title='LB Penalty (mean hinge^2)', ylabel='Loss', sw=sw)
-    _plot_skill_family(axes[1], data, 'iql_lb_active_frac',
-                       title='Active Pair Fraction (hinge > 0)',
-                       ylabel='fraction', sw=sw, ymin=0, ymax=1.05)
-    _plot_skill_family(axes[2], data, 'iql_lb_hinge_mean',
-                       title='Mean Hinge Magnitude (active pairs)',
-                       ylabel='Q underestimate', sw=sw)
-    _plot_skill_family(axes[3], data, 'iql_lb_chain_len_mean',
-                       title='Mean Sampled Chain Length',
-                       ylabel='chunk transitions', sw=sw)
-    _plot_skill_family(axes[4], data, 'iql_target_q_mean',
-                       title='TD Target Q Mean (inflation watch)',
-                       ylabel='Q', sw=sw)
-    _plot_skill_family(axes[5], data, 'iql_q_mean',
-                       title='Q(s,a) Mean on Demo Batch',
-                       ylabel='Q', sw=sw)
+    _plot_skill_family(axes[0], data, 'qc_critic_loss',
+                       title='Critic TD Loss', ylabel='MSE', sw=sw)
+    _plot_skill_family(axes[1], data, 'qc_q_mean',
+                       title='Q(s,a) Mean (inflation watch)', ylabel='Q', sw=sw)
+    _plot_skill_family(axes[2], data, 'qc_target_q_mean',
+                       title='TD Target Q Mean', ylabel='Q', sw=sw)
+    _plot_skill_family(axes[3], data, 'qc_bc_flow_loss',
+                       title='Flow BC Loss', ylabel='loss', sw=sw)
+    _plot_skill_family(axes[4], data, 'qc_distill_loss',
+                       title='One-Step Distillation Loss', ylabel='MSE', sw=sw)
+    _plot_skill_family(axes[5], data, 'qc_actor_loss',
+                       title='Actor Total Loss', ylabel='loss', sw=sw)
 
     fig.tight_layout()
-    _save(fig, out_dir, '03_lql_diagnostics.png')
+    _save(fig, out_dir, '03_qc_diagnostics.png')
 
 
 # =============================================================================
-# Plot 04 — IQL prefix-state validation (model selection signal)
+# Plot 04 — Prefix-state validation (model selection signal)
 # =============================================================================
 
-def plot_prefix_validation(data: dict, out_dir: str):
+def plot_prefix_validation(data: dict, out_dir: str, sw: int = 15):
     skills = _skill_names(data)
-    has_prefix = any(f'skill/{s}/iql_prefix_success_rate' in data for s in skills)
+    has_prefix = any(f'skill/{s}/prefix_success_rate' in data for s in skills)
     if not has_prefix:
         return
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    fig.suptitle('IQL Prefix-State Validation (checkpoint selection)',
+    fig.suptitle('Prefix-State Validation (checkpoint selection)',
                  fontsize=STYLE['suptitle_fs'], fontweight='bold')
 
-    _plot_skill_family(axes[0], data, 'iql_prefix_success_rate',
+    _plot_skill_family(axes[0], data, 'prefix_success_rate',
                        title='Prefix-Val Success Rate', ylabel='%',
                        sw=1, pct=True, ymin=0, ymax=105)
-    _plot_skill_family(axes[1], data, 'iql_prefix_mean_final_error',
+    _plot_skill_family(axes[1], data, 'prefix_mean_final_error',
                        title='Prefix-Val Final Task Error', ylabel='error', sw=1)
-    _plot_skill_family(axes[2], data, 'iql_prefix_mean_options',
-                       title='Prefix-Val Options Used', ylabel='options', sw=1)
+    _plot_skill_family(axes[2], data, 'qc_q_mean',
+                       title='Q(s,a) Mean', ylabel='Q', sw=sw)
 
     fig.tight_layout()
     _save(fig, out_dir, '04_prefix_validation.png')
@@ -588,28 +581,19 @@ def plot_skill_losses(data: dict, out_dir: str, sw: int = 15):
     fig.suptitle('Per-Skill Offline Optimisation',
                  fontsize=STYLE['suptitle_fs'], fontweight='bold')
 
-    _plot_skill_family(axes[0], data, 'bc_loss',
-                       title='BC Action MSE', ylabel='MSE', sw=sw)
     _plot_skill_family_first_available(
-        axes[1], data,
-        ['iql_value_loss', 'awr_value_loss', 'bet_cls_loss'],
-        title='Value / Classification Loss', ylabel='Loss', sw=sw)
-    _plot_skill_family_first_available(
-        axes[2], data,
-        ['iql_critic_loss', 'td3bc_critic_loss', 'awr_critic_loss', 'bet_residual_loss'],
-        title='Critic / Residual Loss', ylabel='Loss', sw=sw)
-    _plot_skill_family_first_available(
-        axes[3], data,
-        ['iql_actor_loss', 'td3bc_actor_loss', 'awr_actor_loss', 'bet_loss'],
-        title='Actor / Total Loss', ylabel='Loss', sw=sw)
-    _plot_skill_family_first_available(
-        axes[4], data,
-        ['iql_adv_mean', 'td3bc_bc_loss', 'awr_weight_mean'],
-        title='Advantage / BC / Weight', ylabel='Value', sw=sw)
-    _plot_skill_family_first_available(
-        axes[5], data,
-        ['iql_weight_mean', 'td3bc_lambda'],
-        title='Policy Weight / Lambda', ylabel='Weight', sw=sw)
+        axes[0], data, ['qc_bc_flow_loss', 'flow_bc_loss'],
+        title='Flow BC Loss', ylabel='MSE', sw=sw)
+    _plot_skill_family(axes[1], data, 'qc_critic_loss',
+                       title='Critic TD Loss', ylabel='Loss', sw=sw)
+    _plot_skill_family(axes[2], data, 'qc_distill_loss',
+                       title='One-Step Distillation Loss', ylabel='MSE', sw=sw)
+    _plot_skill_family(axes[3], data, 'qc_actor_loss',
+                       title='Actor Total Loss', ylabel='Loss', sw=sw)
+    _plot_skill_family(axes[4], data, 'qc_q_mean',
+                       title='Q(s,a) Mean', ylabel='Q', sw=sw)
+    _plot_skill_family(axes[5], data, 'qc_target_q_mean',
+                       title='TD Target Q Mean', ylabel='Q', sw=sw)
 
     fig.tight_layout()
     _save(fig, out_dir, '07_skill_losses.png')
@@ -667,16 +651,16 @@ def plot_skill_eval(data: dict, out_dir: str):
 
 
 # =============================================================================
-# Plot 09 — Online AWAC diagnostics
+# Plot 09 — Online QC-FQL diagnostics
 # =============================================================================
 
-def plot_online_awac(data: dict, out_dir: str, sw: int = 15):
+def plot_online_qcfql(data: dict, out_dir: str, sw: int = 15):
     has_online = any(k.startswith('online/') or k.startswith('online_eval/') for k in data)
     if not has_online:
         return
-    fig, axes = plt.subplots(2, 4, figsize=(24, 10))
+    fig, axes = plt.subplots(2, 3, figsize=(20, 10))
     axes = axes.flatten()
-    fig.suptitle('Online Chain-Context AWAC Fine-Tuning',
+    fig.suptitle('Online QC-FQL Fine-Tuning',
                  fontsize=STYLE['suptitle_fs'], fontweight='bold')
 
     _plot(axes[0], data, 'online_eval/eval/full_task_success_rate',
@@ -685,65 +669,18 @@ def plot_online_awac(data: dict, out_dir: str, sw: int = 15):
     _plot(axes[1], data, 'online_eval/eval/mean_tasks_completed',
           title='Online Eval Mean Tasks Completed',
           ylabel='Tasks', color=COLORS['gold'], smooth_window=1, ymin=0, ymax=4.1)
-    if 'online/demo_fraction' in data or 'online/bc_anchor_weight' in data:
-        for tag, label, color in [
-            ('online/demo_fraction', 'demo fraction', COLORS['gray']),
-            ('online/bc_anchor_weight', 'BC anchor', COLORS['red']),
-        ]:
-            if tag not in data:
-                continue
-            steps, values = data[tag]
-            axes[2].plot(steps, values, alpha=STYLE['raw_alpha'], color=color, linewidth=STYLE['raw_lw'])
-            axes[2].plot(steps, smooth(values, sw), alpha=STYLE['smooth_alpha'],
-                         color=color, linewidth=STYLE['smooth_lw'], label=label)
-        axes[2].set_title('Demo Fraction / BC Anchor',
-                          fontsize=STYLE['title_fs'], fontweight='bold')
-        axes[2].set_xlabel('Environment Steps', fontsize=STYLE['label_fs'])
-        axes[2].set_ylabel('value', fontsize=STYLE['label_fs'])
-        axes[2].legend(fontsize=STYLE['tick_fs'])
-        _style_ax(axes[2])
-    else:
-        _plot(axes[2], data, 'online/demo_fraction',
-              title='Demo Replay Fraction',
-              ylabel='fraction', color=COLORS['gray'], smooth_window=sw, ymin=0, ymax=1.05)
-    _plot_online_skill_family(axes[3], data, 'online_critic_loss',
-                              title='Per-Skill Online Critic Loss', ylabel='MSE', sw=sw)
-    _plot_online_skill_family(axes[4], data, 'online_bc_anchor_loss',
-                              title='Per-Skill Demo BC Anchor Loss', ylabel='MSE', sw=sw)
-    _plot_online_skill_family(axes[5], data, 'online_weight_mean',
-                              title='Per-Skill AWAC Weight Mean', ylabel='weight', sw=sw)
-    for tag, label, color in [
-        ('online/actor_source/demo_only_fallback_total', 'demo-only fallback', COLORS['orange']),
-        ('online/actor_source/success_online_total', 'success-online actor', COLORS['green']),
-        ('online/actor_source/all_attempt_total', 'all-attempt actor', COLORS['purple']),
-    ]:
-        if tag not in data:
-            continue
-        steps, values = data[tag]
-        axes[6].plot(steps, values, alpha=STYLE['raw_alpha'], color=color, linewidth=STYLE['raw_lw'])
-        axes[6].plot(steps, smooth(values, sw), alpha=STYLE['smooth_alpha'],
-                     color=color, linewidth=STYLE['smooth_lw'], label=label)
-    axes[6].set_title('Actor Update Source Counts',
-                      fontsize=STYLE['title_fs'], fontweight='bold')
-    axes[6].set_xlabel('Environment Steps', fontsize=STYLE['label_fs'])
-    axes[6].set_ylabel('updates', fontsize=STYLE['label_fs'])
-    if axes[6].has_data():
-        axes[6].legend(fontsize=STYLE['tick_fs'])
-    else:
-        axes[6].text(0.5, 0.5, 'No actor-source data',
-                     ha='center', va='center', transform=axes[6].transAxes,
-                     color='gray', fontsize=STYLE['label_fs'])
-    _style_ax(axes[6])
-    _plot_first_available(
-        axes[7], data,
-        ['online/replay/light_switch_actor_quality_size',
-         'online/replay/light_switch_quality_size',
-         'online/replay_total'],
-        title='Actor-Quality Replay Size',
-        ylabel='samples', color=COLORS['blue'], smooth_window=sw)
+    _plot(axes[2], data, 'online/replay_total',
+          title='Online Replay Size', ylabel='transitions', color=COLORS['blue'], smooth_window=sw)
+    _plot(axes[3], data, 'online/qc_critic_loss',
+          title='Online Critic TD Loss', ylabel='MSE', color=COLORS['red'], smooth_window=sw)
+    _plot(axes[4], data, 'online/qc_q_mean',
+          title='Online Q(s,a) Mean', ylabel='Q', color=COLORS['purple'], smooth_window=sw)
+    _plot(axes[5], data, 'online/tasks_done',
+          title='Collected Episode Tasks Done', ylabel='tasks', color=COLORS['teal'],
+          smooth_window=sw, ymin=0, ymax=4.1)
 
     fig.tight_layout()
-    _save(fig, out_dir, '09_online_awac.png')
+    _save(fig, out_dir, '09_online_qcfql.png')
 
 
 # =============================================================================
@@ -756,7 +693,7 @@ def plot_comparison(run_dirs, run_labels, out_dir: str, sw: int = 15):
         ('eval/any_task_success_rate',              'Eval Any-Task Success (%)',    True),
         ('eval/mean_tasks_completed',               'Eval Mean Tasks Completed',    False),
         ('online_eval/eval/full_task_success_rate', 'Online Full-Task Success (%)', True),
-        ('skill/light_switch/iql_prefix_success_rate', 'Light-Switch Prefix-Val (%)', True),
+        ('skill/light_switch/prefix_success_rate', 'Light-Switch Prefix-Val (%)', True),
         ('train/ep_env_reward',                     'Train Episode Env Reward',     False),
     ]
 
@@ -832,11 +769,11 @@ def main():
     plot_overview(data, out_dir, sw=sw)
     plot_eval_success(data, out_dir, sw=1)
     plot_training_episode(data, out_dir, sw=sw)
-    plot_lql_diagnostics(data, out_dir, sw=sw)
-    plot_prefix_validation(data, out_dir)
+    plot_qc_diagnostics(data, out_dir, sw=sw)
+    plot_prefix_validation(data, out_dir, sw=sw)
     plot_skill_losses(data, out_dir, sw=sw)
     plot_skill_eval(data, out_dir)
-    plot_online_awac(data, out_dir, sw=sw)
+    plot_online_qcfql(data, out_dir, sw=sw)
 
     print(f"\n{'-'*60}")
     print(f"  All plots saved to: {out_dir}/")
