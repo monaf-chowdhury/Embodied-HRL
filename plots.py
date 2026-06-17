@@ -327,6 +327,15 @@ def _plot_skill_family(ax, data: dict, metric: str, title: str, ylabel: str,
     skills = _skill_names(data)
     plotted = False
     palette = list(COLORS.values())
+    shared_tag = f'shared/{metric}'
+    if shared_tag in data:
+        steps, values = data[shared_tag]
+        y = values * 100.0 if pct else values
+        ys = smooth(y, sw)
+        ax.plot(steps, y, alpha=STYLE['raw_alpha'], color=COLORS['dark_blue'], linewidth=STYLE['raw_lw'])
+        ax.plot(steps, ys, alpha=STYLE['smooth_alpha'], color=COLORS['dark_blue'],
+                linewidth=STYLE['smooth_lw'], label='shared')
+        plotted = True
     for i, skill in enumerate(skills):
         tag = f'skill/{skill}/{metric}'
         if tag not in data:
@@ -357,7 +366,7 @@ def _plot_skill_family_first_available(ax, data: dict, metrics: list[str],
                                        title: str, ylabel: str, sw: int = 15):
     skills = _skill_names(data)
     for metric in metrics:
-        if any(f'skill/{skill}/{metric}' in data for skill in skills):
+        if f'shared/{metric}' in data or any(f'skill/{skill}/{metric}' in data for skill in skills):
             return _plot_skill_family(ax, data, metric, title, ylabel, sw=sw)
     return _plot_skill_family(ax, data, metrics[0], title, ylabel, sw=sw)
 

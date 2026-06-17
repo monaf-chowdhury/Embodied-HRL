@@ -1,18 +1,19 @@
 # Embodied-HRL: Skill Learning Q Chunking Flow QL Branch
-## Skill-Conditioned QC-FQL
+## Shared Skill-Conditioned QC-FQL
 
-This branch replaces the Gaussian-actor + IQL/LQL stack with **per-skill QC-FQL**:
+This branch replaces the Gaussian-actor + IQL/LQL stack and the isolated
+per-task specialist design with **one shared skill-conditioned QC-FQL agent**:
 an expressive **flow-matching** policy class (Flow Q-Learning) trained with a
-**chunked, unbiased n-step critic** (Q-chunking). The skill-transfer vision is
-unchanged — still one goal-conditioned expert per task, chained by a scripted
-controller, fine-tuned online.
+**chunked, unbiased n-step critic** (Q-chunking). Task identity enters through
+goal/current/mask conditioning plus learned task-ID embeddings, and composition
+uses a fixed next-incomplete predicate planner.
 
 References:
 - Flow Q-Learning (FQL) — Park, Li, Levine, **ICML 2025**, arXiv:2502.02538
 - Reinforcement Learning with Action Chunking (QC) — Li, Zhou, Levine, **NeurIPS 2025**, arXiv:2507.07969
 
 
-The per-skill learner is **QC-FQL** (Q-chunking + Flow Q-Learning). See
+The shared learner is **QC-FQL** (Q-chunking + Flow Q-Learning). See
 [QCFQL.md](QCFQL.md) for the architecture, equations, and staged experiments.
 
 ---
@@ -242,8 +243,13 @@ DINOv3 can also read the checkpoint from `DINOV3_WEIGHTS`. Rebuild demo caches w
 
 ## Staged experiments
 
-Validate on **partial / mixed** data. On near-expert `complete` data QC-FQL ≈
-flow BC ≈ BC, so the headroom only appears where the data is suboptimal.
+**Train on all three datasets** (`franka-complete franka-mixed franka-partial`,
+the `run.sh` default). `complete` provides the canonical-order, fresh-start
+trajectories each per-skill policy needs to *initiate* its task; `partial`/`mixed`
+add suboptimal coverage. Training on `partial` alone starves the chain (light
+switch / slide cabinet are almost never demonstrated from a fresh kitchen there)
+and the scripted chain collapses even when each skill looks fine from oracle
+prefix states.
 
 **0. Pre-flight (seconds, CPU, no env/encoder):**
 ```bash
@@ -252,17 +258,17 @@ python test.py
 
 **1. Does an expressive policy class alone beat the old Gaussian BC? (flow BC)**
 ```bash
-bash run.sh --offline_algo flow_bc --demo_datasets franka-partial \
-  --log_dir logs/flowbc_partial_seed0 --seed 0 --no_video
+bash run.sh --offline_algo flow_bc --log_dir logs/flowbc_all_seed0 --seed 0 --no_video
 ```
 
 **2. Does QC-FQL improve over flow BC? (Q-guidance + chunked critic)**
 ```bash
-bash run.sh --offline_algo qc_fql --demo_datasets franka-partial \
-  --log_dir logs/qcfql_partial_seed0 --seed 0 --no_video
+bash run.sh --offline_algo qc_fql --log_dir logs/qcfql_all_seed0 --seed 0 --no_video
 ```
 Watch `03_qc_diagnostics.png`: `qc_q_mean` should settle near the reward scale
-(a few × completion_bonus), **not** blow up.
+(a few × completion_bonus), **not** blow up. Note: with success-segment labeling
+the one-step Q-actor can fall *below* flow BC (no critic contrast) — if so, that
+is the signal for the full per-skill relabel, not a tuning issue.
 
 **3. Online QC-FQL fine-tuning (only after offline is confirmed):**
 ```bash

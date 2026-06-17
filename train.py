@@ -1,8 +1,8 @@
 """
-Lean offline skill training for FrankaKitchen.
+Shared skill-conditioned offline training for FrankaKitchen.
 
 Pipeline:
-  demos -> replay labels/rendered images -> per-task QC-FQL -> evaluation.
+  demos -> replay labels/rendered images -> shared QC-FQL -> evaluation.
 
 This branch intentionally has no learned hierarchy and no teacher/student
 curriculum. The controller is a scripted "next incomplete task" evaluator.
@@ -460,13 +460,13 @@ def evaluate_chain_context_skills(agent: SkillAgent,
 
 def print_banner(config: Config, log_path: str):
     print(f"\n{SEP}")
-    print("  Lean Skill Learning — FrankaKitchen-v1")
+    print("  Shared Skill-Conditioned QC-FQL - FrankaKitchen-v1")
     print(f"  Started        : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  Seed           : {config.training.seed}  deterministic_torch={config.training.deterministic_torch}")
     print(f"  Encoder        : {config.encoder.name.upper()} ({config.encoder.raw_dim}-d, frozen)")
     print(f"  Image size     : {config.encoder.img_size}")
     print(f"  Tasks          : {config.training.tasks_to_complete}")
-    print(f"  Policy         : one visual policy per task")
+    print(f"  Policy         : one shared task-conditioned visual policy")
     print(f"  Controller     : scripted next-incomplete task")
     print(SEP2)
     print(f"  Demos          : {config.warmup.dataset_ids}")
@@ -474,8 +474,8 @@ def print_banner(config: Config, log_path: str):
     print(f"  Cache          : {config.warmup.cache_dir}  rebuild={config.warmup.rebuild_cache}")
     print(f"  Render batch   : {config.warmup.render_batch_size}  max_eps_per_dataset={config.warmup.max_episodes_per_dataset}")
     print(f"  Offline algo   : {config.specialist.offline_algo}")
-    print(f"  Skill net      : hidden={config.specialist.hidden_dim}  layers={config.specialist.n_layers}  "
-          f"chunk={config.worker.action_chunk_len}")
+    print(f"  Shared net     : hidden={config.specialist.hidden_dim}  layers={config.specialist.n_layers}  "
+          f"chunk={config.worker.action_chunk_len}  task_emb={config.specialist.task_embedding_dim}")
     print(f"  Optimizer      : actor_lr={config.worker.actor_lr}  critic_lr={config.worker.critic_lr}  "
           f"gamma={config.worker.gamma}")
     print(f"  Train steps    : flow_bc={config.specialist.n_flow_bc_steps}  "
@@ -545,7 +545,8 @@ def train(config: Config):
             print("  [Stage A] Skipping offline optimizer steps; preparing demo replay only.")
             ds, stats = build_or_load_demo_dataset(agent, config, verbose=True)
             agent.demo_dataset = ds
-            agent.proprio_norm.fit(ds.w_p)
+            norm_source = ds.c_p if getattr(ds, "c_p", np.zeros((0, agent.proprio_dim))).shape[0] > 0 else ds.w_p
+            agent.proprio_norm.fit(norm_source)
             if not config.online.load_checkpoint:
                 raise ValueError("--skip_offline_training requires --load_checkpoint.")
         else:
@@ -721,7 +722,7 @@ def train(config: Config):
 
 
 def parse_args() -> Config:
-    parser = argparse.ArgumentParser(description="Per-skill QC-FQL for FrankaKitchen / OGBench")
+    parser = argparse.ArgumentParser(description="Shared skill-conditioned QC-FQL for FrankaKitchen")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--encoder", type=str, default="dinov3", choices=["r3m", "dinov2", "dinov3"])
@@ -729,7 +730,7 @@ def parse_args() -> Config:
     parser.add_argument("--dinov3_weights", type=str, default=None)
     parser.add_argument("--dinov3_repo_or_dir", type=str, default=None)
     parser.add_argument("--dinov3_source", type=str, default=None, choices=["github", "local"])
-    parser.add_argument("--log_dir", type=str, default="logs/qc_fql")
+    parser.add_argument("--log_dir", type=str, default="logs/shared_qc_fql")
     parser.add_argument("--tasks", nargs="+", default=None)
     parser.add_argument("--demo_datasets", nargs="+", default=None)
     parser.add_argument("--demo_source", type=str, default=None, choices=["auto", "minari", "d4rl"])
@@ -737,12 +738,18 @@ def parse_args() -> Config:
     parser.add_argument("--rebuild_demo_cache", action="store_true")
 
     # Offline algorithm.
-    parser.add_argument("--offline_algo", type=str, default=None, choices=["flow_bc", "qc_fql"])
+    parser.add_argument(
+        "--offline_algo",
+        type=str,
+        default=None,
+        choices=["shared_flow_bc_positive", "shared_qc_fql", "flow_bc", "qc_fql"],
+    )
     parser.add_argument("--flow_bc_steps", type=int, default=None)
     parser.add_argument("--offline_rl_steps", "--qc_fql_steps", dest="offline_rl_steps", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--hidden_dim", type=int, default=None)
     parser.add_argument("--n_layers", type=int, default=None)
+    parser.add_argument("--task_embedding_dim", type=int, default=None)
     parser.add_argument("--action_chunk", "--action_chunk_len", dest="action_chunk", type=int, default=None)
     parser.add_argument("--subgoal_horizon", type=int, default=None)
     parser.add_argument("--max_high_level_steps", type=int, default=None)
@@ -782,7 +789,7 @@ def parse_args() -> Config:
     args = parser.parse_args()
 
     cfg = Config()
-    cfg.training.mode = "lean_skills"
+    cfg.training.mode = "shared_skills"
     cfg.training.seed = args.seed
     cfg.training.device = args.device
     cfg.training.log_dir = args.log_dir
@@ -819,6 +826,8 @@ def parse_args() -> Config:
         cfg.specialist.hidden_dim = args.hidden_dim
     if args.n_layers is not None:
         cfg.specialist.n_layers = args.n_layers
+    if args.task_embedding_dim is not None:
+        cfg.specialist.task_embedding_dim = args.task_embedding_dim
     if args.action_chunk is not None:
         cfg.worker.action_chunk_len = args.action_chunk
     if args.subgoal_horizon is not None:

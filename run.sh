@@ -13,21 +13,22 @@ Algorithms:
            one-step Q-maximizing actor. Staged experiment 2.
 
 Examples:
-  bash run.sh --offline_algo flow_bc --demo_datasets franka-partial
-  bash run.sh --offline_algo qc_fql  --demo_datasets franka-partial
-  bash run.sh --offline_algo qc_fql  --fql_alpha 3.0 --best_of_n 4
+  bash run.sh --offline_algo flow_bc
+  bash run.sh --offline_algo qc_fql
+  bash run.sh --offline_algo qc_fql  --fql_alpha 30.0 --best_of_n 4
   bash run.sh --offline_algo qc_fql  --online_finetune --online_steps 200000
   bash run.sh --offline_algo qc_fql  --rebuild_demo_cache
   bash run.sh --offline_algo qc_fql  --chain_eval_episodes 100 --no_video
 
 Notes:
-  - Defaults: DINOv3 + action chunk 4 + all four tasks.
+  - Defaults: DINOv3 + action chunk 4 + all four tasks + all three datasets
+    (complete + mixed + partial). Keep all three: `complete` gives the
+    canonical-order, fresh-start trajectories the skills need to INITIATE each
+    task. Training on partial alone collapses the scripted chain.
   - Extra args are passed straight through to train.py.
   - Rebuild the cache (--rebuild_demo_cache) only when the encoder, action chunk,
     tasks, image size, or reward weights (progress/completion/action_cost/sigma)
     change. The offline algorithm choice alone never requires a rebuild.
-  - Validate on partial/mixed data: on near-expert "complete" data QC-FQL ~ flow
-    BC ~ BC, so the headroom only shows up where the data is suboptimal.
 EOF
 }
 

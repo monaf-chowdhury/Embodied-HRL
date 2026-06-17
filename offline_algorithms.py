@@ -1,27 +1,19 @@
-"""Offline per-skill training algorithms (QC-FQL branch).
+"""Offline shared skill-conditioned training algorithms.
 
-Two algorithms only:
-  * FlowBCAlgorithm  — flow-matching behavior cloning (staged experiment 1:
-                       "does an expressive policy class alone beat the Gaussian?")
-  * QCFQLAlgorithm   — full Q-chunking + Flow Q-Learning (chunked twin critic,
-                       flow BC, one-step Q-maximizing actor).
+Two algorithms are intentionally kept:
+  * shared_flow_bc_positive -- diagnostic flow BC on positive skill rows only.
+  * shared_qc_fql           -- shared task-conditioned QC-FQL on relabeled rows.
 
-Both use the same prefix-state validation for model selection: every
-`eval_interval` steps the current policy is rolled out from oracle prefix
-states and the best-by-success checkpoint (flow + critic) is kept.
-
-References:
-  Flow Q-Learning — Park, Li, Levine, ICML 2025 (arXiv:2502.02538)
-  RL with Action Chunking — Li, Zhou, Levine, NeurIPS 2025 (arXiv:2507.07969)
+Both train one shared model and use chain-context prefix validation for model
+selection. Legacy aliases `flow_bc` and `qc_fql` map to the shared variants.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import torch
-import torch.nn as nn
 
 from demo_dataset import sample_oracle_prefix_states
 from env_wrapper import FrankaKitchenImageWrapper
@@ -35,36 +27,18 @@ except Exception:  # pragma: no cover
         return range(*args)
 
 
-def clone_state_dict_cpu(module: nn.Module) -> Dict[str, torch.Tensor]:
-    return {k: v.detach().cpu().clone() for k, v in module.state_dict().items()}
-
-
-def restore_state_dict(module: nn.Module, state: Dict[str, torch.Tensor], device: str):
-    module.load_state_dict({k: v.to(device) for k, v in state.items()})
-
-
 def set_postfix(iterator, **kwargs):
     if hasattr(iterator, "set_postfix"):
         iterator.set_postfix(**kwargs)
 
 
 def _prefix_tasks_for(agent, task_id: int) -> List[str]:
-    """Scripted chain prefix (tasks before `task_id`) for task-conditioned eval."""
     return [agent.tasks[k] for k in range(int(task_id))]
 
 
 @rng_isolated
-def _prefix_actor_eval(agent,
-                       config,
-                       samples: Sequence[Dict[str, np.ndarray]],
-                       target_id: int) -> Dict[str, float]:
-    """Roll out the current skill from fixed oracle prefix states.
-
-    Success uses the environment completion bit (matches the chain metric).
-    Seeded + RNG-isolated so model-selection rollouts (including the flow
-    policy's latent samples) are reproducible across steps and do not perturb
-    the offline training noise stream.
-    """
+def _prefix_actor_eval(agent, config, samples: Sequence[Dict[str, np.ndarray]], target_id: int) -> Dict[str, float]:
+    """Roll the shared policy from fixed oracle prefix states for one task."""
     if not samples:
         return {"success_rate": 0.0, "mean_final_error": float("inf"), "mean_options": 0.0}
 
@@ -91,12 +65,19 @@ def _prefix_actor_eval(agent,
             completion = np.asarray(sample["completion"], dtype=np.float32).copy()
             done = False
             n_opts = 0
-            while (not done
-                   and completion[int(target_id)] < 0.5
-                   and n_opts < config.manager.max_high_level_steps):
+            while (
+                not done
+                and completion[int(target_id)] < 0.5
+                and n_opts < config.manager.max_high_level_steps
+            ):
                 result = agent.execute_option(
-                    env=env, task_id=int(target_id), start_img=img, start_state=state,
-                    start_z=z, completion=completion, deterministic_worker=True,
+                    env=env,
+                    task_id=int(target_id),
+                    start_img=img,
+                    start_state=state,
+                    start_z=z,
+                    completion=completion,
+                    deterministic_worker=True,
                     collect_frames=False,
                 )
                 state = result.proprio_end
@@ -134,12 +115,6 @@ class OfflineAlgorithm:
         self.verbose = verbose
         self.log_interval = max(1, int(config.specialist.log_interval))
 
-    def sample(self, ds, task_id: int) -> Dict[str, np.ndarray]:
-        return ds.sample_worker_task_batch(
-            task_id, self.config.specialist.batch_size,
-            proprio_normalizer=self.agent.normalize_proprio,
-        )
-
     def scalar(self, tag: str, value: float, step: int):
         if self.writer is not None and np.isfinite(float(value)):
             self.writer.add_scalar(tag, float(value), int(step))
@@ -147,135 +122,181 @@ class OfflineAlgorithm:
     def should_log(self, step: int, total_steps: int) -> bool:
         return step == 1 or step % self.log_interval == 0 or step == total_steps
 
-    # -- shared prefix-validation model selection ------------------------------
+    def sample_positive(self, ds) -> Dict[str, np.ndarray]:
+        return ds.sample_positive_shared_batch(
+            self.config.specialist.batch_size,
+            spec=self.agent.spec,
+            proprio_normalizer=self.agent.normalize_proprio,
+        )
 
-    def _load_prefix_samples(self, task_id: int, task_name: str):
-        eval_interval = int(self.config.specialist.eval_interval)
+    def sample_relabel(self, ds) -> Dict[str, np.ndarray]:
+        return ds.sample_shared_relabel_batch(
+            self.config.specialist.batch_size,
+            spec=self.agent.spec,
+            proprio_normalizer=self.agent.normalize_proprio,
+        )
+
+    def _load_prefix_samples(self) -> Dict[int, Tuple[Sequence[Dict[str, np.ndarray]], Dict[str, float]]]:
         n_states = int(self.config.specialist.eval_prefix_states)
-        if eval_interval <= 0 or n_states <= 0:
-            return [], eval_interval
-        try:
-            samples, stats = sample_oracle_prefix_states(
-                agent=self.agent, config=self.config,
-                prefix_tasks=_prefix_tasks_for(self.agent, task_id),
-                target_task=task_name, max_states=n_states, verbose=False,
-            )
-            if self.verbose:
-                print(f"    prefix-val states={len(samples)} "
-                      f"matches={int(stats.get('matching_segments', 0.0))}")
-            return samples, eval_interval
-        except Exception as exc:
-            if self.verbose:
-                print(f"    prefix-val disabled for {task_name}: {exc}")
-            return [], eval_interval
+        if int(self.config.specialist.eval_interval) <= 0 or n_states <= 0:
+            return {}
+        out = {}
+        for task_id, task_name in enumerate(self.agent.tasks):
+            try:
+                samples, stats = sample_oracle_prefix_states(
+                    agent=self.agent,
+                    config=self.config,
+                    prefix_tasks=_prefix_tasks_for(self.agent, task_id),
+                    target_task=task_name,
+                    max_states=n_states,
+                    verbose=False,
+                )
+                out[task_id] = (samples, stats)
+                if self.verbose:
+                    print(
+                        f"    prefix-val {task_name:<14} states={len(samples)} "
+                        f"matches={int(stats.get('matching_segments', 0.0))}"
+                    )
+            except Exception as exc:
+                if self.verbose:
+                    print(f"    prefix-val disabled for {task_name}: {exc}")
+        return out
 
-    def _snapshot(self, skill):
-        return {
-            "flow": clone_state_dict_cpu(skill.flow),
-            "critic": clone_state_dict_cpu(skill.critic),
-            "critic_target": clone_state_dict_cpu(skill.critic_target),
-        }
+    def _eval_prefixes(
+        self,
+        prefix_samples: Dict[int, Tuple[Sequence[Dict[str, np.ndarray]], Dict[str, float]]],
+        step: int,
+    ) -> Dict[str, float]:
+        successes, errors = [], []
+        out: Dict[str, float] = {}
+        for task_id, task_name in enumerate(self.agent.tasks):
+            if task_id not in prefix_samples:
+                continue
+            samples, _stats = prefix_samples[task_id]
+            ev = _prefix_actor_eval(self.agent, self.config, samples, task_id)
+            safe = task_name.replace(" ", "_")
+            self.scalar(f"skill/{safe}/prefix_success_rate", ev["success_rate"], step)
+            self.scalar(f"skill/{safe}/prefix_mean_final_error", ev["mean_final_error"], step)
+            out[f"prefix_success/{safe}"] = ev["success_rate"]
+            out[f"prefix_error/{safe}"] = ev["mean_final_error"]
+            successes.append(ev["success_rate"])
+            errors.append(ev["mean_final_error"])
+        out["prefix_success/mean"] = float(np.mean(successes)) if successes else 0.0
+        out["prefix_error/mean"] = float(np.mean(errors)) if errors else float("inf")
+        self.scalar("shared/prefix_success_mean", out["prefix_success/mean"], step)
+        self.scalar("shared/prefix_error_mean", out["prefix_error/mean"], step)
+        return out
 
-    def _restore(self, skill, snap):
-        restore_state_dict(skill.flow, snap["flow"], self.agent.device)
-        restore_state_dict(skill.critic, snap["critic"], self.agent.device)
-        restore_state_dict(skill.critic_target, snap["critic_target"], self.agent.device)
+    def _finalize_metrics(
+        self,
+        metrics_list: List[Dict[str, float]],
+        best_step: int,
+        best_eval: Dict[str, float],
+    ) -> AlgorithmResult:
+        out: Dict[str, float] = {}
+        if metrics_list:
+            tail = metrics_list[-min(100, len(metrics_list)):]
+            for key in metrics_list[-1].keys():
+                out[f"{key}/final"] = float(np.mean([m[key] for m in tail]))
+        if best_step > 0:
+            out["prefix_success/mean_best"] = float(best_eval.get("prefix_success/mean", 0.0))
+            out["prefix_error/mean_best"] = float(best_eval.get("prefix_error/mean", float("inf")))
+            out["prefix_best_step"] = float(best_step)
+            for task_name in self.agent.tasks:
+                safe = task_name.replace(" ", "_")
+                if f"prefix_success/{safe}" in best_eval:
+                    out[f"prefix_success/{safe}_best"] = float(best_eval[f"prefix_success/{safe}"])
+                    out[f"prefix_error/{safe}_best"] = float(best_eval[f"prefix_error/{safe}"])
+        return AlgorithmResult(metrics=out)
 
-    def train_task(self, ds, task_id: int, task_name: str) -> AlgorithmResult:
+    def train(self, ds) -> AlgorithmResult:
         raise NotImplementedError
 
 
-class FlowBCAlgorithm(OfflineAlgorithm):
-    """Flow-matching BC only (no critic)."""
+class SharedFlowBCPositiveAlgorithm(OfflineAlgorithm):
+    """Diagnostic shared flow BC on positive skill rows only."""
 
-    def train_task(self, ds, task_id: int, task_name: str) -> AlgorithmResult:
-        safe = task_name.replace(" ", "_")
+    def train(self, ds) -> AlgorithmResult:
         n_steps = int(self.config.specialist.n_flow_bc_steps)
         if n_steps <= 0:
             return AlgorithmResult(metrics={})
-        skill = self.agent.skills[task_id]
-        prefix_samples, eval_interval = self._load_prefix_samples(task_id, task_name)
-        best_success, best_error, best_step, best_snap = -1.0, float("inf"), 0, None
-        metrics_list = []
+        prefix_samples = self._load_prefix_samples()
+        eval_interval = int(self.config.specialist.eval_interval)
+        best_score, best_error, best_step = -1.0, float("inf"), 0
+        best_snap, best_eval = None, {}
+        metrics_list: List[Dict[str, float]] = []
 
-        iterator = trange(n_steps, desc=f"FlowBC/{task_name}", leave=False, disable=not self.verbose)
+        iterator = trange(n_steps, desc="SharedFlowBC", leave=False, disable=not self.verbose)
         for i in iterator:
             step = i + 1
-            metrics = self.agent.flow_bc_step(task_id, self.sample(ds, task_id))
+            metrics = self.agent.flow_bc_step(self.sample_positive(ds))
             metrics_list.append(metrics)
-            if prefix_samples and (step % eval_interval == 0 or step == n_steps):
-                ev = _prefix_actor_eval(self.agent, self.config, prefix_samples, task_id)
-                self.scalar(f"skill/{safe}/prefix_success_rate", ev["success_rate"], step)
-                if ev["success_rate"] > best_success or (
-                        ev["success_rate"] == best_success and ev["mean_final_error"] < best_error):
-                    best_success, best_error, best_step = ev["success_rate"], ev["mean_final_error"], step
-                    best_snap = self._snapshot(skill)
+            if prefix_samples and eval_interval > 0 and (step % eval_interval == 0 or step == n_steps):
+                ev = self._eval_prefixes(prefix_samples, step)
+                score, err = ev["prefix_success/mean"], ev["prefix_error/mean"]
+                if score > best_score or (score == best_score and err < best_error):
+                    best_score, best_error, best_step = score, err, step
+                    best_snap, best_eval = self.agent.snapshot(), ev
             if self.should_log(step, n_steps):
                 for key, value in metrics.items():
-                    self.scalar(f"skill/{safe}/{key}", value, step)
+                    self.scalar(f"shared/{key}", value, step)
             if self.verbose:
                 set_postfix(iterator, bc=f"{metrics['flow_bc_loss']:.4f}")
 
         if best_snap is not None:
-            self._restore(skill, best_snap)
-        out = {f"{k}/{safe}_final": float(np.mean([m[k] for m in metrics_list[-100:]]))
-               for k in metrics_list[-1].keys()}
-        if best_step > 0:
-            out[f"prefix_success/{safe}_best"] = float(best_success)
-            out[f"prefix_error/{safe}_best"] = float(best_error)
-            out[f"prefix_best_step/{safe}"] = float(best_step)
-        return AlgorithmResult(metrics=out)
+            self.agent.restore_snapshot(best_snap)
+        return self._finalize_metrics(metrics_list, best_step, best_eval)
 
 
-class QCFQLAlgorithm(OfflineAlgorithm):
-    """Q-chunking + Flow Q-Learning (chunked critic + flow BC + one-step actor)."""
+class SharedQCFQLAlgorithm(OfflineAlgorithm):
+    """Shared task-conditioned Q-chunking + Flow Q-Learning."""
 
-    def train_task(self, ds, task_id: int, task_name: str) -> AlgorithmResult:
-        safe = task_name.replace(" ", "_")
+    def train(self, ds) -> AlgorithmResult:
         n_steps = int(self.config.specialist.n_offline_rl_steps)
         if n_steps <= 0:
             return AlgorithmResult(metrics={})
-        skill = self.agent.skills[task_id]
-        prefix_samples, eval_interval = self._load_prefix_samples(task_id, task_name)
-        best_success, best_error, best_step, best_snap = -1.0, float("inf"), 0, None
-        metrics_list = []
+        prefix_samples = self._load_prefix_samples()
+        eval_interval = int(self.config.specialist.eval_interval)
+        best_score, best_error, best_step = -1.0, float("inf"), 0
+        best_snap, best_eval = None, {}
+        metrics_list: List[Dict[str, float]] = []
 
-        iterator = trange(n_steps, desc=f"QC-FQL/{task_name}", leave=False, disable=not self.verbose)
+        iterator = trange(n_steps, desc="SharedQC-FQL", leave=False, disable=not self.verbose)
         for i in iterator:
             step = i + 1
-            metrics = self.agent.qc_fql_step(task_id, self.sample(ds, task_id))
+            metrics = self.agent.qc_fql_step(
+                batch=self.sample_relabel(ds),
+                critic_batch=self.sample_relabel(ds),
+            )
             metrics_list.append(metrics)
-            if prefix_samples and (step % eval_interval == 0 or step == n_steps):
-                ev = _prefix_actor_eval(self.agent, self.config, prefix_samples, task_id)
-                self.scalar(f"skill/{safe}/prefix_success_rate", ev["success_rate"], step)
-                self.scalar(f"skill/{safe}/prefix_mean_final_error", ev["mean_final_error"], step)
-                if ev["success_rate"] > best_success or (
-                        ev["success_rate"] == best_success and ev["mean_final_error"] < best_error):
-                    best_success, best_error, best_step = ev["success_rate"], ev["mean_final_error"], step
-                    best_snap = self._snapshot(skill)
+            if prefix_samples and eval_interval > 0 and (step % eval_interval == 0 or step == n_steps):
+                ev = self._eval_prefixes(prefix_samples, step)
+                score, err = ev["prefix_success/mean"], ev["prefix_error/mean"]
+                if score > best_score or (score == best_score and err < best_error):
+                    best_score, best_error, best_step = score, err, step
+                    best_snap, best_eval = self.agent.snapshot(), ev
             if self.should_log(step, n_steps):
                 for key, value in metrics.items():
-                    self.scalar(f"skill/{safe}/{key}", value, step)
+                    self.scalar(f"shared/{key}", value, step)
             if self.verbose:
-                set_postfix(iterator, q=f"{metrics['qc_critic_loss']:.3f}",
-                            distill=f"{metrics['qc_distill_loss']:.4f}")
+                set_postfix(
+                    iterator,
+                    q=f"{metrics['qc_critic_loss']:.3f}",
+                    distill=f"{metrics['qc_distill_loss']:.4f}",
+                )
 
-        # Fall back to the final policy if prefix validation was unavailable.
         if best_snap is not None:
-            self._restore(skill, best_snap)
-        out = {f"{k}/{safe}_final": float(np.mean([m[k] for m in metrics_list[-100:]]))
-               for k in metrics_list[-1].keys()}
-        if best_step > 0:
-            out[f"prefix_success/{safe}_best"] = float(best_success)
-            out[f"prefix_error/{safe}_best"] = float(best_error)
-            out[f"prefix_best_step/{safe}"] = float(best_step)
-        return AlgorithmResult(metrics=out)
+            self.agent.restore_snapshot(best_snap)
+        return self._finalize_metrics(metrics_list, best_step, best_eval)
 
 
 def make_offline_algorithm(name: str, agent, config, writer=None, verbose: bool = True) -> OfflineAlgorithm:
-    name = name.lower().replace("-", "_")
-    if name == "flow_bc":
-        return FlowBCAlgorithm(agent, config, writer, verbose)
-    if name == "qc_fql":
-        return QCFQLAlgorithm(agent, config, writer, verbose)
-    raise ValueError(f"Unknown offline algorithm '{name}' (use 'flow_bc' or 'qc_fql').")
+    key = name.lower().replace("-", "_")
+    if key in {"flow_bc", "shared_flow_bc_positive"}:
+        return SharedFlowBCPositiveAlgorithm(agent, config, writer, verbose)
+    if key in {"qc_fql", "shared_qc_fql"}:
+        return SharedQCFQLAlgorithm(agent, config, writer, verbose)
+    raise ValueError(
+        f"Unknown offline algorithm '{name}' "
+        "(use 'shared_qc_fql' or 'shared_flow_bc_positive')."
+    )

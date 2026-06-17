@@ -32,49 +32,106 @@ import torch
 
 
 _BATCH_KEYS = (
-    "z", "proprio", "task_target", "task_cur", "task_mask",
+    "z", "proprio", "task_target", "task_cur", "task_mask", "task_id",
     "action", "reward", "done", "nstep", "z_next", "proprio_next", "task_cur_next",
 )
 
 
 class OnlineReplay:
-    """Per-skill ring buffer of chunk transitions (dicts of np arrays)."""
+    """Shared raw chunk replay, relabeled by sampled task id at batch time."""
 
     def __init__(self, n_tasks: int, capacity_per_skill: int):
-        self.capacity = int(capacity_per_skill)
-        self.buf: List[List[Dict[str, np.ndarray]]] = [[] for _ in range(n_tasks)]
+        self.n_tasks = int(n_tasks)
+        self.capacity = int(capacity_per_skill) * self.n_tasks
+        self.buf: List[Dict[str, np.ndarray]] = []
 
-    def add(self, task_id: int, tr: Dict[str, np.ndarray]):
-        b = self.buf[int(task_id)]
-        b.append(tr)
-        if len(b) > self.capacity:
-            b.pop(0)
-
-    def size(self, task_id: int) -> int:
-        return len(self.buf[int(task_id)])
+    def add(self, tr: Dict[str, np.ndarray]):
+        self.buf.append(tr)
+        if len(self.buf) > self.capacity:
+            self.buf.pop(0)
 
     def __len__(self) -> int:
-        return int(sum(len(b) for b in self.buf))
+        return int(len(self.buf))
 
-    def sample(self, task_id: int, n: int) -> Dict[str, np.ndarray]:
-        b = self.buf[int(task_id)]
-        idx = np.random.randint(0, len(b), size=int(n))
-        return {k: np.stack([b[i][k] for i in idx], axis=0).astype(np.float32) for k in _BATCH_KEYS}
+    def sample(self, agent: SkillAgent, n: int) -> Dict[str, np.ndarray]:
+        if len(self.buf) == 0:
+            raise RuntimeError("Cannot sample an empty online replay.")
+        valid = [
+            i for i, row in enumerate(self.buf)
+            if np.any(np.asarray(row["task_complete_vec"], dtype=np.float32) < 0.5)
+        ]
+        if valid:
+            idx = np.asarray(valid, dtype=np.int64)[
+                np.random.randint(0, len(valid), size=int(n))]
+        else:
+            idx = np.random.randint(0, len(self.buf), size=int(n))
+        rows = [self.buf[i] for i in idx]
+        complete = np.stack([r["task_complete_vec"] for r in rows], axis=0).astype(np.float32)
+        task_id = self._sample_incomplete_task_ids(complete)
+        p_raw = np.stack([r["proprio_raw"] for r in rows], axis=0).astype(np.float32)
+        p_next_raw = np.stack([r["proprio_next_raw"] for r in rows], axis=0).astype(np.float32)
+        tt = np.zeros((len(rows), agent.max_goal_dim), dtype=np.float32)
+        tc = np.zeros_like(tt)
+        tm = np.zeros_like(tt)
+        tc_next = np.zeros_like(tt)
+        for k in np.unique(task_id):
+            mask = task_id == int(k)
+            idx_k = agent.spec.indices(int(k))
+            tt[mask] = agent.spec.goal_vec_padded[int(k)]
+            tm[mask] = agent.spec.goal_mask_padded[int(k)]
+            cur = p_raw[mask][:, idx_k]
+            nxt = p_next_raw[mask][:, idx_k]
+            tc[mask, :cur.shape[1]] = cur
+            tc_next[mask, :nxt.shape[1]] = nxt
+        p = np.stack([agent.normalize_proprio(row) for row in p_raw], axis=0)
+        p_next = np.stack([agent.normalize_proprio(row) for row in p_next_raw], axis=0)
+        reward = np.asarray([rows[i]["reward_vec"][task_id[i]] for i in range(len(rows))], dtype=np.float32)
+        task_done = np.asarray([rows[i]["task_done_vec"][task_id[i]] for i in range(len(rows))], dtype=np.float32)
+        env_done = np.asarray([rows[i]["env_done"] for i in range(len(rows))], dtype=np.float32)
+        return {
+            "z": np.stack([r["z"] for r in rows], axis=0).astype(np.float32),
+            "proprio": p.astype(np.float32),
+            "task_target": tt,
+            "task_cur": tc,
+            "task_mask": tm,
+            "task_id": task_id,
+            "action": np.stack([r["action"] for r in rows], axis=0).astype(np.float32),
+            "reward": reward,
+            "done": np.maximum(env_done, task_done).astype(np.float32),
+            "nstep": np.asarray([r["nstep"] for r in rows], dtype=np.float32),
+            "z_next": np.stack([r["z_next"] for r in rows], axis=0).astype(np.float32),
+            "proprio_next": p_next.astype(np.float32),
+            "task_cur_next": tc_next.astype(np.float32),
+        }
+
+    def _sample_incomplete_task_ids(self, complete: np.ndarray) -> np.ndarray:
+        task_id = np.random.randint(0, self.n_tasks, size=complete.shape[0]).astype(np.int64)
+        bad = complete[np.arange(complete.shape[0]), task_id] > 0.5
+        for _ in range(8):
+            if not np.any(bad):
+                break
+            task_id[bad] = np.random.randint(0, self.n_tasks, size=int(np.sum(bad)))
+            bad = complete[np.arange(complete.shape[0]), task_id] > 0.5
+        if np.any(bad):
+            for row in np.where(bad)[0]:
+                avail = np.where(complete[row] < 0.5)[0]
+                task_id[row] = int(np.random.choice(avail)) if len(avail) else int(np.random.randint(0, self.n_tasks))
+        return task_id.astype(np.int64)
 
 
 def _mixed_batch(agent: SkillAgent, ds, replay: OnlineReplay,
-                 task_id: int, batch_size: int, demo_fraction: float) -> Dict[str, np.ndarray]:
+                 batch_size: int, demo_fraction: float) -> Dict[str, np.ndarray]:
     """Concatenate a demo sub-batch and an online sub-batch into one QC-FQL batch."""
-    if replay.size(task_id) > 0:
+    if len(replay) > 0:
         n_demo = int(round(batch_size * float(demo_fraction)))
     else:
         n_demo = batch_size
     n_demo = int(np.clip(n_demo, 0, batch_size))
     n_online = batch_size - n_demo
 
-    demo = (ds.sample_worker_task_batch(task_id, n_demo, proprio_normalizer=agent.normalize_proprio)
+    demo = (ds.sample_shared_relabel_batch(n_demo, spec=agent.spec, proprio_normalizer=agent.normalize_proprio)
             if n_demo > 0 else None)
-    onl = replay.sample(task_id, n_online) if n_online > 0 else None
+    onl = replay.sample(agent, n_online) if n_online > 0 else None
 
     out: Dict[str, np.ndarray] = {}
     for k in _BATCH_KEYS:
@@ -91,10 +148,9 @@ def _onestep_chunk(agent: SkillAgent, z: np.ndarray, state: np.ndarray,
                    task_id: int, noise_scale: float) -> np.ndarray:
     """One-step actor chunk with exploration noise; returns (H, env_action_dim)."""
     x = agent._input_from_state(z, state, task_id)
-    skill = agent.skills[task_id]
     with torch.no_grad():
         noise = float(noise_scale) * torch.randn(1, agent.action_dim, device=agent.device)
-        a = skill.flow.onestep_action(x, noise).clamp(-1.0, 1.0)
+        a = agent.flow.onestep_action(x, noise).clamp(-1.0, 1.0)
     return a.cpu().numpy().reshape(agent.H_chunk, agent.env_action_dim)
 
 
@@ -120,7 +176,6 @@ def collect_chain_episode(agent: SkillAgent, config: Config,
                and n_opts < config.manager.max_high_level_steps):
             remaining = [k for k in order if completion[k] < 0.5]
             task_id = int(remaining[0]) if remaining else int(order[0])
-            chosen_name = agent.tasks[task_id]
             n_opts += 1
             steps_in_opt = 0
             chosen_completed = False
@@ -128,7 +183,10 @@ def collect_chain_episode(agent: SkillAgent, config: Config,
                 chunk = _onestep_chunk(agent, z, state, task_id, noise_scale)
                 z_t = np.asarray(z, dtype=np.float32).copy()
                 state_t = np.asarray(state, dtype=np.float64).copy()
-                R, nstep, skill_done, env_done = 0.0, 0, False, False
+                completion_t = completion.astype(np.float32).copy()
+                R_vec = np.zeros(agent.n_tasks, dtype=np.float32)
+                task_done_vec = np.zeros(agent.n_tasks, dtype=np.float32)
+                nstep, skill_done, env_done = 0, False, False
                 for h in range(agent.H_chunk):
                     if steps_in_opt >= config.manager.subgoal_horizon:
                         break
@@ -136,14 +194,16 @@ def collect_chain_episode(agent: SkillAgent, config: Config,
                     next_img, _env_reward, done_env, info = env.step(a_step)
                     next_state = np.asarray(info["state"], dtype=np.float64)
                     names = info.get("tasks_completed_names", [])
-                    newly = (chosen_name in names) and (completion[task_id] < 0.5)
-                    err_before = agent.spec.task_error(state, task_id)
-                    err_after = agent.spec.task_error(next_state, task_id)
-                    R += (gamma ** nstep) * agent._worker_step_reward(
-                        err_before, err_after, a_step, newly, task_id)
+                    raw_completion = agent.spec.completion_mask_from_names(names)
+                    newly_vec = np.maximum(raw_completion - completion, 0.0)
+                    for k in range(agent.n_tasks):
+                        err_before = agent.spec.task_error(state, k)
+                        err_after = agent.spec.task_error(next_state, k)
+                        R_vec[k] += (gamma ** nstep) * agent._worker_step_reward(
+                            err_before, err_after, a_step, bool(newly_vec[k] > 0.5), k)
+                    task_done_vec = np.maximum(task_done_vec, newly_vec.astype(np.float32))
                     nstep += 1
-                    completion = np.maximum(
-                        completion, agent.spec.completion_mask_from_names(names))
+                    completion = np.maximum(completion, raw_completion)
                     state = next_state
                     z = agent.encoder.encode_numpy(next_img).squeeze()
                     env_steps += 1
@@ -167,19 +227,17 @@ def collect_chain_episode(agent: SkillAgent, config: Config,
                 if n_exec < agent.H_chunk:
                     pad = np.repeat(exec_chunk[-1:], agent.H_chunk - n_exec, axis=0)
                     exec_chunk = np.concatenate([exec_chunk, pad], axis=0)
-                replay.add(task_id, {
+                replay.add({
                     "z": z_t,
-                    "proprio": agent.normalize_proprio(state_t),
-                    "task_target": agent.spec.padded_goal_for(task_id).astype(np.float32),
-                    "task_cur": agent.spec.padded_state_slice_for(state_t, task_id).astype(np.float32),
-                    "task_mask": agent.spec.padded_mask_for(task_id).astype(np.float32),
+                    "proprio_raw": state_t.astype(np.float32),
                     "action": exec_chunk.reshape(-1).astype(np.float32),
-                    "reward": np.float32(R),
-                    "done": np.float32(1.0 if (skill_done or env_done) else 0.0),
+                    "reward_vec": R_vec.astype(np.float32),
+                    "task_done_vec": task_done_vec.astype(np.float32),
+                    "task_complete_vec": completion_t.astype(np.float32),
+                    "env_done": np.float32(1.0 if env_done else 0.0),
                     "nstep": np.float32(max(1, nstep)),
                     "z_next": np.asarray(z, dtype=np.float32).copy(),
-                    "proprio_next": agent.normalize_proprio(state),
-                    "task_cur_next": agent.spec.padded_state_slice_for(state, task_id).astype(np.float32),
+                    "proprio_next_raw": np.asarray(state, dtype=np.float32).copy(),
                 })
     finally:
         env.close()
@@ -210,8 +268,6 @@ def run_online_finetuning(agent: SkillAgent,
     batch_size = int(config.online.batch_size)
     demo_fraction = float(config.online.demo_fraction)
     tol = float(config.online.rollback_drop_tolerance)
-    trainable = list(range(agent.n_tasks))
-
     baseline_full = float(initial_eval.get("eval/full_task_success_rate", 0.0)) if initial_eval else 0.0
     best_full = baseline_full
     ckpt_dir = os.path.join(config.training.log_dir, "checkpoints")
@@ -241,12 +297,11 @@ def run_online_finetuning(agent: SkillAgent,
         last_metrics: Dict[str, float] = {}
         while update_credit >= 1.0:
             update_credit -= 1.0
-            avail = [k for k in trainable if replay.size(k) > 0]
-            if not avail:
+            if len(replay) <= 0:
                 break
-            task = int(np.random.choice(avail))
-            batch = _mixed_batch(agent, ds, replay, task, batch_size, demo_fraction)
-            last_metrics = agent.qc_fql_step(task, batch)
+            batch = _mixed_batch(agent, ds, replay, batch_size, demo_fraction)
+            critic_batch = _mixed_batch(agent, ds, replay, batch_size, demo_fraction)
+            last_metrics = agent.qc_fql_step(batch, critic_batch)
             n_updates += 1
 
         if writer is not None:
@@ -287,7 +342,7 @@ def run_online_finetuning(agent: SkillAgent,
                     print(f"  [Rollback] confirmed full SR {full*100:.1f}% vs best "
                           f"{best_full*100:.1f}%; restoring best checkpoint.")
                 agent.load(best_path)
-                agent.reset_optimizers(trainable)
+                agent.reset_optimizers()
 
     final_path = os.path.join(ckpt_dir, "checkpoint_online_final.pt")
     agent.save(final_path)

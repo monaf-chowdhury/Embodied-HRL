@@ -1,4 +1,4 @@
-"""Configuration for the lean FrankaKitchen skill-learning branch."""
+"""Configuration for the shared skill-conditioned FrankaKitchen branch."""
 from dataclasses import dataclass, field
 from typing import List
 
@@ -72,7 +72,7 @@ class EvalConfig:
 
 @dataclass
 class SpecialistConfig:
-    """Per-skill QC-FQL: chunked twin critic + flow BC policy + one-step actor.
+    """Shared skill-conditioned QC-FQL.
 
     Q-chunking (Li, Zhou, Levine; NeurIPS 2025, arXiv:2507.07969) +
     Flow Q-Learning (Park, Li, Levine; ICML 2025, arXiv:2502.02538).
@@ -83,9 +83,12 @@ class SpecialistConfig:
     use_layernorm: bool = True
     dropout: float = 0.0
 
-    # "flow_bc"  -> flow-matching BC only (no critic; staged experiment 1)
-    # "qc_fql"   -> full QC-FQL (chunked critic + flow BC + one-step Q actor)
-    offline_algo: str = "qc_fql"
+    task_embedding_dim: int = 16
+
+    # "shared_flow_bc_positive" -> diagnostic BC on positive skill rows only
+    # "shared_qc_fql"           -> shared task-conditioned QC-FQL
+    # Legacy aliases "flow_bc" and "qc_fql" are accepted by the CLI/trainer.
+    offline_algo: str = "shared_qc_fql"
 
     n_flow_bc_steps: int = 30_000      # flow-BC steps (and total for flow_bc mode)
     n_offline_rl_steps: int = 100_000  # QC-FQL joint steps
@@ -94,7 +97,7 @@ class SpecialistConfig:
     flow_steps: int = 10           # Euler integration steps for the BC flow ODE
     fql_alpha: float = 10.0        # distillation / behavior-constraint coefficient
     fql_normalize_q: bool = True   # scale-invariant Q term (alpha is the real dial)
-    best_of_n: int = 1             # >1: sample N one-step actions, pick argmax Q at eval
+    best_of_n: int = 8             # sample N one-step actions, pick argmax Q at eval
     target_tau: float = 0.005      # critic target soft-update rate
 
     # Per-skill prefix-state validation (model selection during training).

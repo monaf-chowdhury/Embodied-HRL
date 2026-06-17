@@ -33,7 +33,7 @@ _DATASET_ALIASES: Dict[str, List[str]] = {
     "d4rl/kitchen/partial-v2": ["D4RL/kitchen/partial-v2", "kitchen-partial-v0"],
 }
 
-_CACHE_VERSION = "v9_qcfql_discounted_chunk_return"
+_CACHE_VERSION = "v11_shared_qcfql_incomplete_relabel"
 
 
 @dataclass
@@ -79,6 +79,23 @@ class DemoPretrainDataset:
             np.zeros(0, dtype=np.int64) for _ in range(n_tasks)
         ]
 
+        # --- Full-corpus critic transitions (per-skill offline RL) ----------
+        # Every chunk in every episode, task-agnostically. Per-skill reward and
+        # task-completion are stored as (N, n_tasks) columns; task conditioning
+        # is computed on the fly at sample time (no per-skill row duplication).
+        # This gives the critic the off-support / suboptimal contrast that the
+        # success-segment actor data lacks.
+        self.c_z: List[np.ndarray] = []
+        self.c_p: List[np.ndarray] = []          # raw start state (59-d)
+        self.c_a: List[np.ndarray] = []
+        self.c_z_next: List[np.ndarray] = []
+        self.c_p_next: List[np.ndarray] = []     # raw end state (59-d)
+        self.c_nstep: List[int] = []
+        self.c_env_done: List[float] = []
+        self.c_reward: List[np.ndarray] = []     # (n_tasks,) per-skill chunk return
+        self.c_task_done: List[np.ndarray] = []  # (n_tasks,) task-k completes in chunk
+        self.c_task_complete: List[np.ndarray] = []  # (n_tasks,) task-k complete before chunk
+
     def add_worker(self, z, p, tt, tc, tm, tid, a_flat, reward,
                    z_next, p_next, tc_next, done, nstep: int = 1):
         self.w_z.append(np.asarray(z, dtype=np.float16))
@@ -96,6 +113,22 @@ class DemoPretrainDataset:
         self.w_nstep.append(int(nstep))   # env steps in this chunk (for gamma^nstep backup)
         self.worker_task_counts[int(tid)] += 1
 
+    def add_critic(self, z, p, a_flat, z_next, p_next, nstep, env_done,
+                   reward_vec, task_done_vec, task_complete_vec):
+        self.c_z.append(np.asarray(z, dtype=np.float16))
+        self.c_p.append(np.asarray(p, dtype=np.float32))
+        self.c_a.append(np.asarray(a_flat, dtype=np.float32))
+        self.c_z_next.append(np.asarray(z_next, dtype=np.float16))
+        self.c_p_next.append(np.asarray(p_next, dtype=np.float32))
+        self.c_nstep.append(int(nstep))
+        self.c_env_done.append(float(env_done))
+        self.c_reward.append(np.asarray(reward_vec, dtype=np.float32))
+        self.c_task_done.append(np.asarray(task_done_vec, dtype=np.float32))
+        self.c_task_complete.append(np.asarray(task_complete_vec, dtype=np.float32))
+
+    def n_critic(self) -> int:
+        return len(self.c_z)
+
     def extend(self, other: "DemoPretrainDataset"):
         self.w_z.extend(other.w_z)
         self.w_p.extend(other.w_p)
@@ -110,6 +143,17 @@ class DemoPretrainDataset:
         self.w_z_next.extend(other.w_z_next)
         self.w_p_next.extend(other.w_p_next)
         self.w_tc_next.extend(other.w_tc_next)
+
+        self.c_z.extend(other.c_z)
+        self.c_p.extend(other.c_p)
+        self.c_a.extend(other.c_a)
+        self.c_z_next.extend(other.c_z_next)
+        self.c_p_next.extend(other.c_p_next)
+        self.c_nstep.extend(other.c_nstep)
+        self.c_env_done.extend(other.c_env_done)
+        self.c_reward.extend(other.c_reward)
+        self.c_task_done.extend(other.c_task_done)
+        self.c_task_complete.extend(other.c_task_complete)
 
         self.worker_task_counts += other.worker_task_counts
 
@@ -129,7 +173,7 @@ class DemoPretrainDataset:
                      if self.w_tm else np.zeros((0, self.max_goal_dim), dtype=np.float32))
         self.w_id = np.asarray(self.w_id, dtype=np.int64)
         self.w_a = (np.stack(self.w_a).astype(np.float32)
-                    if self.w_a else np.zeros((0, self.action_dim * self.H), dtype=np.float32))
+                    if self.w_a else np.zeros((0, self.action_dim), dtype=np.float32))
         self.w_r = np.asarray(self.w_r, dtype=np.float32)
         self.w_done = np.asarray(self.w_done, dtype=np.float32)
         self.w_nstep = np.asarray(self.w_nstep, dtype=np.float32)
@@ -139,6 +183,25 @@ class DemoPretrainDataset:
                          if self.w_p_next else np.zeros((0, self.proprio_dim), dtype=np.float32))
         self.w_tc_next = (np.stack(self.w_tc_next).astype(np.float32)
                           if self.w_tc_next else np.zeros((0, self.max_goal_dim), dtype=np.float32))
+
+        self.c_z = (np.stack(self.c_z).astype(np.float16)
+                    if self.c_z else np.zeros((0, self.z_dim), dtype=np.float16))
+        self.c_p = (np.stack(self.c_p).astype(np.float32)
+                    if self.c_p else np.zeros((0, self.proprio_dim), dtype=np.float32))
+        self.c_a = (np.stack(self.c_a).astype(np.float32)
+                    if self.c_a else np.zeros((0, self.action_dim), dtype=np.float32))
+        self.c_z_next = (np.stack(self.c_z_next).astype(np.float16)
+                         if self.c_z_next else np.zeros((0, self.z_dim), dtype=np.float16))
+        self.c_p_next = (np.stack(self.c_p_next).astype(np.float32)
+                         if self.c_p_next else np.zeros((0, self.proprio_dim), dtype=np.float32))
+        self.c_nstep = np.asarray(self.c_nstep, dtype=np.float32)
+        self.c_env_done = np.asarray(self.c_env_done, dtype=np.float32)
+        self.c_reward = (np.stack(self.c_reward).astype(np.float32)
+                         if self.c_reward else np.zeros((0, self.n_tasks), dtype=np.float32))
+        self.c_task_done = (np.stack(self.c_task_done).astype(np.float32)
+                            if self.c_task_done else np.zeros((0, self.n_tasks), dtype=np.float32))
+        self.c_task_complete = (np.stack(self.c_task_complete).astype(np.float32)
+                                if self.c_task_complete else np.zeros((0, self.n_tasks), dtype=np.float32))
 
         self.worker_indices_by_task = [
             np.where(self.w_id == k)[0].astype(np.int64)
@@ -179,6 +242,178 @@ class DemoPretrainDataset:
             "done": self.w_done[idx],
             "nstep": self.w_nstep[idx],
         }
+
+    def sample_critic_task_batch(self,
+                                 task_id: int,
+                                 batch_size: int,
+                                 spec,
+                                 proprio_normalizer=None) -> Dict[str, np.ndarray]:
+        """Full-corpus critic batch for skill `task_id`.
+
+        Samples uniformly over ALL chunks (every episode, task-agnostic), scores
+        them with skill-`task_id`'s reward and `done = env_done OR task-k
+        completes in chunk`, and builds the skill-k task conditioning on the fly.
+        Returns the same keys as the actor batch so qc_fql_step can consume it.
+        """
+        k = int(task_id)
+        n = self.c_z.shape[0]
+        if n == 0:
+            raise RuntimeError("No critic transitions; rebuild the demo cache.")
+        idx = self._sample_indices_incomplete_for_task(k, int(batch_size))
+        p = self.c_p[idx]
+        p_next = self.c_p_next[idx]
+        tc = self._padded_slice_batch(p, spec.indices(k))
+        tc_next = self._padded_slice_batch(p_next, spec.indices(k))
+        if proprio_normalizer is not None:
+            p = np.stack([proprio_normalizer(row) for row in p], axis=0)
+            p_next = np.stack([proprio_normalizer(row) for row in p_next], axis=0)
+        b = idx.shape[0]
+        tt = np.repeat(spec.goal_vec_padded[k][None, :], b, axis=0).astype(np.float32)
+        tm = np.repeat(spec.goal_mask_padded[k][None, :], b, axis=0).astype(np.float32)
+        done = np.maximum(self.c_env_done[idx], self.c_task_done[idx, k]).astype(np.float32)
+        return {
+            "z": self.c_z[idx].astype(np.float32),
+            "proprio": p.astype(np.float32),
+            "task_target": tt,
+            "task_cur": tc,
+            "task_mask": tm,
+            "task_id": np.full(b, k, dtype=np.int64),
+            "action": self.c_a[idx],
+            "reward": self.c_reward[idx, k].astype(np.float32),
+            "z_next": self.c_z_next[idx].astype(np.float32),
+            "proprio_next": p_next.astype(np.float32),
+            "task_cur_next": tc_next.astype(np.float32),
+            "done": done,
+            "nstep": self.c_nstep[idx],
+        }
+
+    def sample_shared_relabel_batch(self,
+                                    batch_size: int,
+                                    spec,
+                                    proprio_normalizer=None) -> Dict[str, np.ndarray]:
+        """Task-balanced relabeled batch from the full raw corpus.
+
+        Samples a raw chunk uniformly and a task id uniformly for each row.
+        The same physical transition is then scored/conditioned as task `k`.
+        This is the shared-policy replacement for per-task replay buffers.
+        """
+        n = self.c_z.shape[0]
+        if n == 0:
+            raise RuntimeError("No full-corpus critic transitions; rebuild the demo cache.")
+        b = int(batch_size)
+        if self.c_task_complete.shape[0] > 0:
+            valid_rows = np.where(np.any(self.c_task_complete < 0.5, axis=1))[0].astype(np.int64)
+            if len(valid_rows) > 0:
+                idx = np.random.choice(valid_rows, size=b, replace=True).astype(np.int64)
+            else:
+                idx = np.random.randint(0, n, size=b).astype(np.int64)
+        else:
+            idx = np.random.randint(0, n, size=b).astype(np.int64)
+        task_id = self._sample_incomplete_task_ids(idx)
+
+        p = self.c_p[idx]
+        p_next = self.c_p_next[idx]
+        tt, tc, tm, tc_next = self._task_condition_from_states(p, p_next, task_id, spec)
+        if proprio_normalizer is not None:
+            p = np.stack([proprio_normalizer(row) for row in p], axis=0)
+            p_next = np.stack([proprio_normalizer(row) for row in p_next], axis=0)
+        done = np.maximum(self.c_env_done[idx], self.c_task_done[idx, task_id]).astype(np.float32)
+        return {
+            "z": self.c_z[idx].astype(np.float32),
+            "proprio": p.astype(np.float32),
+            "task_target": tt,
+            "task_cur": tc,
+            "task_mask": tm,
+            "task_id": task_id,
+            "action": self.c_a[idx],
+            "reward": self.c_reward[idx, task_id].astype(np.float32),
+            "z_next": self.c_z_next[idx].astype(np.float32),
+            "proprio_next": p_next.astype(np.float32),
+            "task_cur_next": tc_next,
+            "done": done,
+            "nstep": self.c_nstep[idx],
+        }
+
+    def sample_positive_shared_batch(self,
+                                     batch_size: int,
+                                     spec,
+                                     proprio_normalizer=None) -> Dict[str, np.ndarray]:
+        """Task-balanced positive skill batch for diagnostic FlowBC.
+
+        Each row is sampled from the success/progress segment of the same task
+        used for conditioning. This stream is intentionally not the main
+        QC-FQL actor stream; it is retained as a clean BC sanity check.
+        """
+        if self.w_z.shape[0] == 0:
+            raise RuntimeError("No positive worker transitions found in demo cache.")
+        b = int(batch_size)
+        chosen_tasks = np.random.randint(0, self.n_tasks, size=b).astype(np.int64)
+        idx = np.zeros(b, dtype=np.int64)
+        for i, k in enumerate(chosen_tasks):
+            pool = self.worker_indices_by_task[int(k)]
+            if len(pool) == 0:
+                idx[i] = int(np.random.randint(0, self.w_z.shape[0]))
+            else:
+                idx[i] = int(pool[np.random.randint(0, len(pool))])
+        return self._worker_batch_from_indices(idx, proprio_normalizer=proprio_normalizer)
+
+    def _padded_slice_batch(self, states: np.ndarray, idx_k: np.ndarray) -> np.ndarray:
+        out = np.zeros((states.shape[0], self.max_goal_dim), dtype=np.float32)
+        sl = states[:, idx_k]
+        out[:, :sl.shape[1]] = sl
+        return out
+
+    def _sample_incomplete_task_ids(self, idx: np.ndarray) -> np.ndarray:
+        """Uniform task labels, rejecting tasks already complete at chunk start."""
+        task_id = np.random.randint(0, self.n_tasks, size=idx.shape[0]).astype(np.int64)
+        if self.c_task_complete.shape[0] == 0:
+            return task_id
+        complete = self.c_task_complete[idx]
+        bad = complete[np.arange(idx.shape[0]), task_id] > 0.5
+        # A few vectorized rejection rounds preserve near-uniform labels while
+        # avoiding post-terminal relabels for tasks already complete.
+        for _ in range(8):
+            if not np.any(bad):
+                break
+            task_id[bad] = np.random.randint(0, self.n_tasks, size=int(np.sum(bad)))
+            bad = complete[np.arange(idx.shape[0]), task_id] > 0.5
+        if np.any(bad):
+            for row in np.where(bad)[0]:
+                avail = np.where(complete[row] < 0.5)[0]
+                task_id[row] = int(np.random.choice(avail)) if len(avail) else int(np.random.randint(0, self.n_tasks))
+        return task_id.astype(np.int64)
+
+    def _sample_indices_incomplete_for_task(self, task_id: int, batch_size: int) -> np.ndarray:
+        n = self.c_z.shape[0]
+        if self.c_task_complete.shape[0] == 0:
+            return np.random.randint(0, n, size=int(batch_size)).astype(np.int64)
+        valid = np.where(self.c_task_complete[:, int(task_id)] < 0.5)[0].astype(np.int64)
+        if len(valid) == 0:
+            return np.random.randint(0, n, size=int(batch_size)).astype(np.int64)
+        return np.random.choice(valid, size=int(batch_size), replace=True).astype(np.int64)
+
+    def _task_condition_from_states(self,
+                                    states: np.ndarray,
+                                    next_states: np.ndarray,
+                                    task_ids: np.ndarray,
+                                    spec) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        b = int(states.shape[0])
+        tt = np.zeros((b, self.max_goal_dim), dtype=np.float32)
+        tc = np.zeros((b, self.max_goal_dim), dtype=np.float32)
+        tm = np.zeros((b, self.max_goal_dim), dtype=np.float32)
+        tc_next = np.zeros((b, self.max_goal_dim), dtype=np.float32)
+        for k in np.unique(task_ids):
+            mask = task_ids == int(k)
+            idx_k = spec.indices(int(k))
+            goal = spec.goal_vec_padded[int(k)]
+            goal_mask = spec.goal_mask_padded[int(k)]
+            tt[mask] = goal
+            tm[mask] = goal_mask
+            cur = states[mask][:, idx_k]
+            nxt = next_states[mask][:, idx_k]
+            tc[mask, :cur.shape[1]] = cur
+            tc_next[mask, :nxt.shape[1]] = nxt
+        return tt, tc, tm, tc_next
 
 
 def build_or_load_demo_dataset(agent,
@@ -226,6 +461,7 @@ def build_or_load_demo_dataset(agent,
                 part = _load_cached_dataset(cache_path, merged)
                 part_stats = {
                     "worker_samples": float(part.n_worker()),
+                    "critic_samples": float(part.n_critic()),
                     "cache_hit": 1.0,
                 }
                 if verbose:
@@ -267,6 +503,7 @@ def build_or_load_demo_dataset(agent,
 
     merged.finalize()
     stats["demo_worker_samples"] = float(merged.n_worker())
+    stats["demo_critic_samples"] = float(merged.n_critic())
     if total_replay_weight > 0:
         stats["replay_mean_state_l2"] = float(replay_mean_accum / total_replay_weight)
         stats["replay_max_state_l2"] = float(replay_max)
@@ -551,41 +788,81 @@ def _build_dataset_from_episodes(agent,
             episode,
             config.warmup.min_segment_len,
         )
-        valid = np.where(labels >= 0)[0]
-        if valid.size == 0:
-            continue
-        stats["episodes_with_labels"] += 1.0
-        stats["completion_events"] += float(event_count)
         if replay_errors.size > 0:
             replay_state_errors.append(replay_errors)
+        stats["completion_events"] += float(event_count)
+
+        H = agent.H_chunk
+        n_steps = len(episode.actions)
+        gamma = float(agent.config.worker.gamma)
+        disc = (gamma ** np.arange(H)).astype(np.float32)
+
+        # The full-corpus z is encoded ONCE and reused by both the critic
+        # (episode-bounded chunks, all timesteps) and the actor (segment-bounded
+        # chunks, success timesteps) below.
+        z_cur_all = _encode_states(
+            agent=agent, render_env=render_env,
+            states=cur_states, batch_size=config.warmup.render_batch_size,
+        )
+
+        # ---- Critic: full-corpus per-skill transitions ---------------------
+        # Every chunk in every episode (even those with no configured
+        # completion). Per-step per-skill shaped rewards -> discounted chunk
+        # returns; done = env_done OR task-k completes in the chunk. This is the
+        # off-support / suboptimal contrast the success-segment actor data lacks.
+        step_r = _per_step_skill_rewards(
+            agent, cur_states, next_states, episode.actions, completion_event_task)
+        crit_ends = np.minimum(np.arange(n_steps) + H - 1, n_steps - 1).astype(np.int64)
+        z_cnext_all = _encode_states(
+            agent=agent, render_env=render_env,
+            states=next_states[crit_ends], batch_size=config.warmup.render_batch_size,
+        )
+        for t in range(n_steps):
+            e = int(crit_ends[t])
+            m = e - t + 1
+            reward_vec = (disc[:m, None] * step_r[t:e + 1, :]).sum(axis=0)
+            task_done_vec = np.zeros(agent.n_tasks, dtype=np.float32)
+            seg_events = completion_event_task[t:e + 1]
+            for kk in seg_events[seg_events >= 0]:
+                task_done_vec[int(kk)] = 1.0
+            env_done = bool(
+                episode.terminations[min(e, len(episode.terminations) - 1)]
+                or episode.truncations[min(e, len(episode.truncations) - 1)]
+            )
+            ds.add_critic(
+                z=z_cur_all[t],
+                p=cur_states[t],
+                a_flat=_chunk_actions(episode.actions, t, e, H),
+                z_next=z_cnext_all[t],
+                p_next=next_states[e],
+                nstep=m,
+                env_done=float(env_done),
+                reward_vec=reward_vec,
+                task_done_vec=task_done_vec,
+                task_complete_vec=completion_masks[t],
+            )
+
+        # ---- Actor: success-segment chunks (behavior cloning target) -------
+        valid = np.where(labels >= 0)[0]
+        if valid.size == 0:
+            if verbose and (ep_i + 1) % 50 == 0:
+                print(f"  [Demo] Processed {ep_i + 1}/{len(episodes)} episodes  "
+                      f"actor={ds.n_worker():,} critic={ds.n_critic():,}")
+            continue
+        stats["episodes_with_labels"] += 1.0
 
         _, seg_end = _segment_bounds(labels)
-        z_valid = _encode_states(
-            agent=agent,
-            render_env=render_env,
-            states=cur_states[valid],
-            batch_size=config.warmup.render_batch_size,
+        # Actor chunk end is bounded by the SKILL segment (not the episode), so
+        # its s_{t+H} visual feature is encoded from that segment-bounded end.
+        actor_ends = np.array([min(t + H - 1, seg_end[t]) for t in valid], dtype=np.int64)
+        z_anext = _encode_states(
+            agent=agent, render_env=render_env,
+            states=next_states[actor_ends], batch_size=config.warmup.render_batch_size,
         )
-        # A worker transition spans the full action chunk: its next state is
-        # next_states[chunk_end] (s_{t+H}), so the next VISUAL feature must be
-        # encoded from that same chunk-end state. Encoding next_states[valid]
-        # (s_{t+1}) here would pair a 1-step-ahead image with an H-step-ahead
-        # proprio in every chunked TD bootstrap input.
-        chunk_next_states = np.stack([
-            next_states[min(t + agent.H_chunk - 1, seg_end[t])]
-            for t in valid
-        ], axis=0)
-        z_next_valid = _encode_states(
-            agent=agent,
-            render_env=render_env,
-            states=chunk_next_states,
-            batch_size=config.warmup.render_batch_size,
-        )
-
         for local_idx, t in enumerate(valid):
             task_id = int(labels[t])
-            chunk_end = min(t + agent.H_chunk - 1, seg_end[t])
-            action_flat = _chunk_actions(episode.actions, t, chunk_end, agent.H_chunk)
+            chunk_end = int(actor_ends[local_idx])
+            action_flat = _chunk_actions(episode.actions, t, chunk_end, H)
             state_t = cur_states[t]
             next_state = next_states[chunk_end]
             reward, nstep = _chunk_reward(
@@ -598,17 +875,8 @@ def _build_dataset_from_episodes(agent,
                 start=t,
                 end=chunk_end,
             )
-
-            # Skill-MDP termination: each per-task critic models "run task k
-            # until it completes", so completing the task is terminal for the
-            # skill even though the env episode continues into the next task.
             # skill_done pairs the completion bonus and the terminal flag on
-            # exactly the same chunks (_chunk_reward awards the bonus iff the
-            # chunk covers this task's completion event). Without it the chunked
-            # critic would bootstrap min_i Q_target(post-completion states) that
-            # the policy never visits under skill k, whose extrapolated value
-            # self-reinforces toward bonus/(1-gamma). Online replay already uses
-            # these semantics (done or chunk_success).
+            # exactly the chunks covering this task's completion event.
             env_done = bool(
                 episode.terminations[min(chunk_end, len(episode.terminations) - 1)]
                 or episode.truncations[min(chunk_end, len(episode.truncations) - 1)]
@@ -616,7 +884,7 @@ def _build_dataset_from_episodes(agent,
             skill_done = bool(np.any(completion_event_task[t:chunk_end + 1] == task_id))
 
             ds.add_worker(
-                z=z_valid[local_idx],
+                z=z_cur_all[t],
                 p=state_t,
                 tt=agent.spec.padded_goal_for(task_id),
                 tc=agent.spec.padded_state_slice_for(state_t, task_id),
@@ -624,7 +892,7 @@ def _build_dataset_from_episodes(agent,
                 tid=task_id,
                 a_flat=action_flat,
                 reward=reward,
-                z_next=z_next_valid[local_idx],
+                z_next=z_anext[local_idx],
                 p_next=next_state,
                 tc_next=agent.spec.padded_state_slice_for(next_state, task_id),
                 done=float(env_done or skill_done),
@@ -633,10 +901,11 @@ def _build_dataset_from_episodes(agent,
 
         if verbose and (ep_i + 1) % 50 == 0:
             print(f"  [Demo] Processed {ep_i + 1}/{len(episodes)} episodes  "
-                  f"worker={ds.n_worker():,}")
+                  f"actor={ds.n_worker():,} critic={ds.n_critic():,}")
 
     ds.finalize()
     stats["worker_samples"] = float(ds.n_worker())
+    stats["critic_samples"] = float(ds.n_critic())
     if replay_state_errors:
         all_errors = np.concatenate(replay_state_errors, axis=0)
         stats["replay_mean_state_l2"] = float(np.mean(all_errors))
@@ -771,6 +1040,33 @@ def _chunk_reward(agent,
     return float(reward), int(end - start + 1)
 
 
+def _per_step_skill_rewards(agent,
+                            cur_states: np.ndarray,
+                            next_states: np.ndarray,
+                            actions: np.ndarray,
+                            completion_events: np.ndarray) -> np.ndarray:
+    """Per-step shaped reward for EVERY (timestep, skill) pair: shape (n, n_tasks).
+
+    Used to build the full-corpus critic's discounted chunk returns. Uses the
+    same per-step reward as `_chunk_reward`, so a skill's reward on a chunk is
+    identical whether it comes from the actor (segment) or critic (full-corpus)
+    path when the chunk bounds coincide.
+    """
+    n = len(actions)
+    out = np.zeros((n, agent.n_tasks), dtype=np.float32)
+    for t in range(n):
+        action_t = np.asarray(actions[t], dtype=np.float32)
+        for k in range(agent.n_tasks):
+            err_before = agent.spec.task_error(cur_states[t], k)
+            err_after = agent.spec.task_error(next_states[t], k)
+            out[t, k] = agent._worker_step_reward(
+                err_before, err_after, action_t,
+                completion_bit_flipped=bool(completion_events[t] == k),
+                task_id=k,
+            )
+    return out
+
+
 def _encode_states(agent,
                    render_env: FrankaKitchenImageWrapper,
                    states: np.ndarray,
@@ -824,6 +1120,16 @@ def _save_cached_dataset(path: str, ds: DemoPretrainDataset):
         w_p_next=ds.w_p_next,
         w_tc_next=ds.w_tc_next,
         worker_task_counts=ds.worker_task_counts,
+        c_z=ds.c_z,
+        c_p=ds.c_p,
+        c_a=ds.c_a,
+        c_z_next=ds.c_z_next,
+        c_p_next=ds.c_p_next,
+        c_nstep=ds.c_nstep,
+        c_env_done=ds.c_env_done,
+        c_reward=ds.c_reward,
+        c_task_done=ds.c_task_done,
+        c_task_complete=ds.c_task_complete,
     )
 
 
@@ -851,6 +1157,16 @@ def _load_cached_dataset(path: str, like: DemoPretrainDataset) -> DemoPretrainDa
     ds.w_p_next = cache["w_p_next"]
     ds.w_tc_next = cache["w_tc_next"]
     ds.worker_task_counts = cache["worker_task_counts"]
+    ds.c_z = cache["c_z"]
+    ds.c_p = cache["c_p"]
+    ds.c_a = cache["c_a"]
+    ds.c_z_next = cache["c_z_next"]
+    ds.c_p_next = cache["c_p_next"]
+    ds.c_nstep = cache["c_nstep"]
+    ds.c_env_done = cache["c_env_done"]
+    ds.c_reward = cache["c_reward"]
+    ds.c_task_done = cache["c_task_done"]
+    ds.c_task_complete = cache["c_task_complete"]
     ds.worker_indices_by_task = [
         np.where(ds.w_id == k)[0].astype(np.int64)
         for k in range(ds.n_tasks)

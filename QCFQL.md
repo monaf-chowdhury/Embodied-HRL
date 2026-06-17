@@ -1,239 +1,128 @@
-# Skill-Conditioned QC-FQL
+# Shared Skill-Conditioned QC-FQL
 
-This branch replaces the Gaussian-actor + IQL/LQL stack with **per-skill QC-FQL**:
-an expressive **flow-matching** policy class (Flow Q-Learning) trained with a
-**chunked, unbiased n-step critic** (Q-chunking). The skill-transfer vision is
-unchanged — still one goal-conditioned expert per task, chained by a scripted
-controller, fine-tuned online.
+This branch pivots from isolated per-task specialists to **one shared,
+task-conditioned action-chunk policy and critic**.
 
-References:
-- Flow Q-Learning (FQL) — Park, Li, Levine, **ICML 2025**, arXiv:2502.02538
-- Reinforcement Learning with Action Chunking (QC) — Li, Zhou, Levine, **NeurIPS 2025**, arXiv:2507.07969
+The research thesis is:
 
-## Why the switch
-
-The Gaussian actor + IQL advantage-weighting collapsed to BC on near-expert,
-low-within-state-diversity demos (`exp(beta*adv) ≈ 1`). QC-FQL fixes the
-*extraction* problem at its root:
-
-- The **flow policy** models the full (multimodal) behavior action distribution
-  instead of averaging modes into mush.
-- The **one-step actor** is improved by gradient-ascending Q through a
-  differentiable policy (DDPG-style), regularized toward the flow — this needs
-  only a usable critic gradient, **not** within-state action diversity in the data.
-- **Best-of-N** (optional, eval-time) samples N one-step candidates and lets the
-  critic pick — manufacturing candidate diversity the data lacks.
-- The **chunked n-step critic** propagates the sparse completion reward over the
-  whole chunk in one backup (what the LQL hinges were hacking at — now principled).
-
----
+> Learn reusable skill-conditioned generative policies from shared offline data,
+> then compose and repair them for long-horizon manipulation.
 
 ## Architecture
 
-Per skill `k`: `{ FlowActor, TwinQ critic, TwinQ critic_target }`. No value net,
-no Gaussian actor. All networks are MLPs (`LayerNorm + ReLU`, optional dropout).
+One shared model is used for every configured task:
 
-**Conditioning feature (state input to every net), unchanged:**
+- Frozen visual encoder: DINOv2, DINOv3, or R3M.
+- Learned actor task-ID embedding.
+- Learned critic task-ID embedding.
+- One `FlowActor`: flow-matching behavior prior plus one-step FQL actor.
+- One `TwinQ`: chunk critic over `Q(x_task, action_chunk)`.
+- One target critic plus target critic task embedding.
+
+The policy/critic conditioning vector is:
+
+```text
+x = [
+  z_image,
+  proprio_norm,
+  task_embedding,
+  task_goal_padded,
+  task_current_padded,
+  (task_goal_padded - task_current_padded) * task_mask,
+  task_mask
+]
 ```
-x = [ z(DINOv3) ‖ proprio_norm ‖ task_target ‖ task_cur ‖ (task_target-task_cur)*mask ‖ task_mask ]
+
+Actions are chunks:
+
+```text
+action_chunk in R^(H * env_action_dim)
+H = 4
+env_action_dim = 9
 ```
 
-**Chunk action:** `a ∈ R^{H*env_action_dim}` (H=4, env_action_dim=9 → 36-dim).
+## Data
 
-| Net | Input | Output |
-|---|---|---|
-| velocity field `v_θ(s, x_t, t)` | `[x ‖ x_t(36) ‖ t(1)]` | velocity `(36)` |
-| one-step actor `μ_ω(s, z)` | `[x ‖ z(36)]` | action chunk `(36)` |
-| twin critic `Q(s, a)` | `[x ‖ a(36)]` | `(q1, q2)` scalars |
+The cache stores raw chunk transitions once:
 
-### Equations
-
-**BC flow (rectified flow / conditional flow matching):**
+```text
+z_t, state_t, action_chunk, z_next, state_next, nstep,
+env_done, reward_vec[n_tasks], task_done_vec[n_tasks],
+task_complete_vec[n_tasks]
 ```
-x0 ~ N(0, I),  x1 = a,  x_t = (1-t) x0 + t x1,  t ~ U[0,1]
-L_flow = E || v_θ(s, x_t, t) - (x1 - x0) ||^2
+
+At sample time, the dataset samples:
+
+1. A raw chunk uniformly.
+2. A task ID uniformly.
+3. A task-conditioned view of that same transition.
+
+Rows where the sampled task was already complete at the chunk start are rejected,
+so the shared critic does not learn post-terminal behavior for completed skills.
+
+The main sampler is `sample_shared_relabel_batch`, used by shared QC-FQL. The
+positive skill-row sampler is retained only for the diagnostic
+`shared_flow_bc_positive` baseline.
+
+## Offline Objective
+
+Critic:
+
+```text
+R_k = sum_i gamma^i r_k(t+i)
+
+target =
+  R_k + gamma^nstep * (1 - done_k)
+        * min_j Q_target_j(x_next_k, mu_omega(x_next_k, noise))
+
+L_critic =
+  MSE(Q1(x_k, a_chunk), target)
+  + MSE(Q2(x_k, a_chunk), target)
 ```
-Action by Euler-integrating `dx/dt = v_θ(s, x, t)` from `t=0` to `t=1` (`flow_steps`).
 
-**Critic (Q-chunking, unbiased n-step backup):**
+Actor:
+
+```text
+L_actor =
+  L_flow
+  + alpha * || mu_omega(x_k, noise) - flow_ode_theta(x_k, noise).detach() ||^2
+  - normalized_Q(x_k, mu_omega(x_k, noise))
 ```
-a'      = μ_ω(s', z'),  z' ~ N(0, I)
-R_disc  = sum_{i=0}^{nstep-1} gamma^i r_{t+i}        (stored at data-build time)
-target  = R_disc + gamma^{nstep} * (1 - done) * min_i Q_target,i(s', a')
-L_critic = MSE(Q1, target) + MSE(Q2, target)
-```
-`nstep` is the actual env steps in the chunk (= H, or < H for a truncated /
-skill-completing chunk, which is terminal so the bootstrap drops out).
-**gamma is per env step (`gamma^nstep`), not per chunk** — the bug Codex flagged.
 
-**Actor (Flow Q-Learning, single joint update):**
-```
-L_actor = L_flow
-        + alpha * || μ_ω(s, z) - flow_ode(s, z).detach() ||^2     (distillation / behavior constraint)
-        - Q(s, μ_ω(s, z))                                          (Q-maximization; normalized if fql_normalize_q)
-```
-`alpha` is the behavior-constraint dial: large → stay near the flow (BC-like);
-small → aggressive Q-maximization. The Q term is divided by `|Q|.mean()` when
-`fql_normalize_q=True` so `alpha` is the dominant, scale-invariant knob.
+`best_of_n` defaults to `8` for evaluation. Flow/FQL policies are latent-sampled
+policies, so evaluating only zero noise is not a valid deterministic mean.
 
-**Target update:** Polyak `tau = target_tau` on the critic after each step.
+## Composition
 
-**Action selection (`get_worker_chunk`):**
-A flow / one-step policy *is* a map from a latent `z ~ N(0, I)` to an action —
-there is no closed-form "mean", so deployment **samples a latent** (this is FQL's
-`sample_actions`; zeroing the latent would evaluate one arbitrary, never-targeted
-slice of the policy). Evaluation reproducibility comes from seeding the RNG around
-each eval (see `rng_isolated`), not from zeroing the latent.
-- `flow_bc` mode → integrate the BC flow ODE from a sampled latent.
-- `qc_fql` mode → one-step actor on a sampled latent; if `best_of_n > 1`, sample
-  N latents and take `argmax_a min Q(s, a)`.
+The first version deliberately uses a fixed predicate planner:
 
----
+1. Read benchmark task completion bits.
+2. Pick the first incomplete task in the configured sequence.
+3. Condition the shared policy on that task.
+4. Execute action chunks until task completion, option budget, or environment termination.
 
-## Data pipeline changes (cache `v9_qcfql_discounted_chunk_return`)
+There is no learned manager in v1. This keeps the contribution focused on the
+shared reusable skill-conditioned policy.
 
-- Chunk reward is the **discounted return** `sum_i gamma^i r_{t+i}` (was a plain
-  sum), and each transition stores **`nstep`** (env steps in the chunk).
-- The visual `z_next` chunk-alignment fix (v6) and skill-completion termination
-  (v7) are retained.
-- The dead `w_seg_prog` field was dropped (it was stored and cached but never
-  read into a batch). This format change is the v8 → v9 cache bump.
-- **A cache rebuild is required** (it happens automatically on first run; ~2h
-  per encoder). Old caches are ignored by the version bump.
-- The data **build** (render → encode → label rewards) is unchanged in spirit
-  but the consumed surface is a single uniform per-skill sampler
-  (`sample_worker_task_batch`).
+## Algorithms
 
-### Per-skill labeling is success-segment based (design choice, not a bug)
+Use:
 
-`_label_episode_from_replay` labels the demo steps **leading up to each
-configured-task completion** with that task's id; transitions that never reach a
-configured completion stay unlabeled (`-1`) and are dropped. So each skill trains
-on the "approach that achieved task k" segments — this is the skill-transfer
-definition of a demonstration, and it is deliberately kept simple. The cost is
-weak *within-state action contrast* (the same thing that collapsed IQL); QC-FQL
-sidesteps that via the one-step Q-ascent + best-of-N, which need a Q **gradient**,
-not in-data action diversity. If experiment 2 shows `qc_fql ≈ flow_bc`, the next
-deliberate experiment is **full per-skill offline RL**: relabel *every*
-partial/mixed transition with the per-skill shaped reward (drop the success-only
-filter, mark `done` only on actual completion) to give the critic real
-suboptimal contrast. That is a different experiment and is intentionally not the
-default.
-
----
-
-## What was removed (dead in the QC-FQL branch)
-
-- IQL / LQL / AWR / TD3+BC / BeT algorithms and all their config + CLI.
-- Gaussian `SkillActor`, `ValueNet`, the value-expectile machinery, AWAC online.
-- The LQL chunk-chain code (`ensure_chain_links`, `sample_lql_segments`, …).
-- The complex weighted/focus/global worker samplers and **all manager data**
-  (`add_manager`, `m_*`, `sample_manager_batch`) — there is no learned manager.
-- `_parse_tb.py` (one-off LQL log parser).
-- `eval_replay.py` (standalone repeated-eval probe) — its purpose is now built
-  into `train.py` (`final_eval_repeats`: repeated disjoint-seed final eval,
-  reported as mean ± std).
-- The `BufferConfig` dataclass and the `w_seg_prog` dataset field (both unread).
-
-`plots.py` now plots QC-FQL tags (`03_qc_diagnostics.png`, `09_online_qcfql.png`).
-
----
-
-## Correctness fixes from code review
-
-These hardened the parts that silently invalidate experiments (eval / data):
-
-1. **Latent sampling at deployment.** `get_worker_chunk` previously used a
-   **zero** latent for "deterministic" eval, which evaluates one arbitrary slice
-   of a flow/one-step policy rather than the learned distribution. It now samples
-   `z ~ N(0, I)` (FQL `sample_actions`); reproducibility comes from RNG seeding.
-2. **Eval RNG isolation.** Every evaluator (`evaluate_*`, `_prefix_actor_eval`)
-   is wrapped with `@rng_isolated`: it seeds the global RNG internally (12345,
-   for a reproducible/comparable rollout) but restores the surrounding stream on
-   exit, so an eval can no longer reset the online/training RNG to the eval seed.
-   `_prefix_actor_eval` now seeds too, so model selection is comparable across
-   steps and does not perturb the offline noise stream.
-3. **Online chunk storage.** Truncated online chunks (skill completed / env
-   terminated mid-chunk) store only the **executed** actions, padded to `H` by
-   repeating the last executed step — matching the offline `_chunk_actions`
-   padding. The proposed-but-never-stepped tail no longer enters `Q(s, a_chunk)`.
-4. **Plotting.** `plot_prefix_validation` took `sw` without it being a parameter
-   (a `NameError` exactly when prefix data existed); fixed and the stale
-   `plot_lql_diagnostics` / `plot_online_awac` names were renamed.
-
----
-
-
-## Config knobs (`SpecialistConfig`)
-
-| Knob | Default | Meaning |
-|---|---|---|
-| `offline_algo` | `qc_fql` | `flow_bc` (BC only) or `qc_fql` |
-| `n_flow_bc_steps` | 30000 | flow-BC steps (also total in `flow_bc` mode) |
-| `n_offline_rl_steps` | 100000 | QC-FQL joint steps |
-| `flow_steps` | 10 | Euler steps for the BC flow ODE |
-| `fql_alpha` | 10.0 | distillation / behavior-constraint coefficient |
-| `fql_normalize_q` | True | scale-invariant Q term |
-| `best_of_n` | 1 | >1 → best-of-N action selection at eval |
-| `target_tau` | 0.005 | critic target soft-update |
-| `use_layernorm` / `dropout` | True / 0.0 | net regularization |
-| `eval_interval` / `eval_prefix_states` | 10000 / 100 | prefix-val model selection |
-
-Online (`OnlineConfig`): `updates_per_env_step`, `demo_fraction` (demo share of
-each batch), `exploration_noise` (one-step actor noise scale), `eval_interval_steps`,
-`rollback_drop_tolerance`.
-
----
-
-## Staged experiments (the questions this answers, in order)
-
-Validate on **partial / mixed** (suboptimal data) — not complete (near-expert),
-where any extraction method ≈ BC.
-
-**0. Pre-flight (seconds, no GPU/env):**
 ```bash
-python test.py
+python train.py --offline_algo shared_qc_fql --encoder dinov3 \
+  --demo_datasets franka-complete franka-mixed franka-partial \
+  --best_of_n 8 --log_dir logs/shared_qcfql_seed0 --seed 0 --no_video
 ```
 
-**1. Does an expressive policy class alone beat the Gaussian?  (flow BC)**
+Diagnostic BC baseline:
+
 ```bash
-python train.py --encoder dinov3 --offline_algo flow_bc --seed 0 \
-  --demo_datasets franka-partial --log_dir logs/flowbc_partial_seed0 --no_video
-```
-If light-switch prefix-val rises vs the old Gaussian BC → the policy class was a
-real bottleneck.
-
-**2. Does QC-FQL improve over flow BC?  (Q-guidance + chunked critic)**
-```bash
-python train.py --encoder dinov3 --offline_algo qc_fql --seed 0 \
-  --demo_datasets franka-partial --log_dir logs/qcfql_partial_seed0 --no_video
-```
-Watch `03_qc_diagnostics.png`: `qc_q_mean` should settle near the reward scale
-(a few × completion_bonus), **not** blow up. If QC-FQL > flow BC, the critic
-ranking is useful; if not, the critic lacks a useful ranking and the bottleneck
-is data coverage/recovery.
-
-**3. Online QC-FQL fine-tuning (after offline is confirmed):**
-```bash
-python train.py --encoder dinov3 --offline_algo qc_fql --seed 0 \
-  --online_finetune --log_dir logs/qcfql_online_seed0
+python train.py --offline_algo shared_flow_bc_positive --encoder dinov3 \
+  --demo_datasets franka-complete franka-mixed franka-partial \
+  --log_dir logs/shared_flowbc_positive_seed0 --seed 0 --no_video
 ```
 
-Tuning order if needed: `fql_alpha` (start 10, lower to loosen the behavior
-constraint), then `best_of_n` (e.g. 4–8 at eval), then `flow_steps`.
+Legacy aliases are accepted:
 
----
-
-## Risks / limitations (watch these)
-
-- **`fql_alpha` matters.** Too low → critic errors push the one-step actor
-  off-support; too high → pure BC. Start conservative (10), lower gradually.
-- **Q-inflation watch.** Even with the chunked backup, an over-eager Q term can
-  inflate `qc_q_mean`; the normalized Q term + behavior constraint guard against
-  it. Monitor the diagnostics plot.
-- **Near-expert ceiling.** On expert-only data (complete) QC-FQL ≈ flow BC ≈ BC.
-  Gains require suboptimal/multimodal data (partial/mixed, online).
-- **Fixed chunk length** `H=4` is a hyperparameter; too long hurts reactivity in
-  contact-rich phases (not expected to bite in kitchen).
-- **The online loop is new and not yet validated end-to-end.** Confirm offline
-  (experiments 1–2) before enabling `--online_finetune`.
+- `qc_fql` -> `shared_qc_fql`
+- `flow_bc` -> `shared_flow_bc_positive`
